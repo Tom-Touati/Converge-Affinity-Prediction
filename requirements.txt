@@ -1,0 +1,26 @@
+# Core stack. Versions are the ones the reported results were produced with.
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.15.3
+scikit-learn==1.7.2
+pyarrow==25.0.1
+PyYAML==6.0.3
+matplotlib==3.10.9
+tqdm==4.70.1
+biopython==1.88          # local Smith-Waterman identity, used by the homology clustering
+
+# Encoders. Install torch for your platform first; the CPU wheel is:
+#   pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
+#
+# torch is pinned to 2.4.1 for a concrete reason, not caution. torch >= 2.5 links against MSVC
+# runtime >= 14.40, and the development machine carries 14.28, which fails at import with
+# "WinError 1114 ... c10.dll". 2.4.1 is the newest release that loads against 14.28. On Linux,
+# or on Windows with a current VC++ redistributable, this pin can be lifted freely -- nothing in
+# the code depends on the version.
+torch==2.4.1
+fair-esm==2.0.0          # ESM-2 sequence encoders and ESM-IF1 inverse folding
+biotite==1.2.0           # structure IO required by ESM-IF1
+
+# ESM-IF1 additionally needs torch-geometric / torch-scatter / torch-sparse, which are installed
+# separately because their wheels are torch- and platform-specific. See README, "Structure
+# encoder". The pipeline degrades gracefully to ProteinMPNN if they are unavailable.
