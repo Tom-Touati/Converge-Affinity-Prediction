@@ -132,8 +132,25 @@ outward through rim to surface. **The surface result is correct behaviour, not f
 mutations have an SD of 0.37 kcal/mol, below the ~0.5 measurement noise floor, so there is
 genuinely nothing there to rank. INT is not interpretable at n=34.
 
-This is the clearest evidence that the structural features are doing real work rather than
-exploiting a dataset artefact.
+**That ordering alone does not establish the claim, because label spread runs in the same order**
+(SUP 1.98, COR 1.72, RIM 0.94, SUR 0.37; Spearman between spread and ρ across the five locations
+is +0.70). Ranking is mechanically easier when the things being ranked are further apart. The test
+that does establish it is an ablation — the same rows scored by a model with *no* structural
+features at all:
+
+| Location | n | chemistry only | full model | **gain from structure** |
+| --- | --- | --- | --- | --- |
+| SUP support | 120 | +0.166 | +0.511 | **+0.346** |
+| COR core | 295 | +0.121 | +0.435 | **+0.314** |
+| RIM rim | 168 | +0.137 | +0.319 | +0.182 |
+| SUR surface | 79 | −0.080 | −0.005 | +0.075 |
+| INT interior | 34 | −0.172 | −0.280 | −0.109 |
+
+The chemistry-only column is **flat** — 0.166, 0.121, 0.137 across slices whose label spreads
+differ by a factor of two. If variance drove the gradient, it would appear there too. It does not.
+The gradient appears only once structural features are added, and it appears where the partner
+buries the residue. SUP versus COR is *not* established — their intervals overlap heavily — only
+"interface yes, surface no".
 
 ## 6. The alanine artefact is real but does not account for performance
 
@@ -171,12 +188,23 @@ The remaining two: `2VIS_AB_C|IC89T` (true −4.91, predicted +1.34) sits in a c
 
 Ranked by what the evidence supports, not by what is most interesting to build.
 
-1. **Fix the compression before adding capacity.** The single largest error source is systematic
-   shrinkage driven by label imbalance and squared error, and no amount of attention over
-   residues addresses it. The direct remedies are a rank-based or pairwise objective (which the
-   headline metric already is, and which `BACKBONE_COMPARISON.md` finds moves results more than
-   any architecture change), or reweighting the tails, or quantile regression. This is cheap and
-   it targets the measured failure.
+1. **Correction: compression is a symptom, not the binding constraint.** An earlier version of
+   this document put a rank-based objective first, on the grounds that shrinkage was the dominant
+   error. That was wrong. Pearson (+0.376) and Spearman (+0.377) are *identical* on this model,
+   and Spearman is scale-invariant — if the model were merely squashing the truth monotonically,
+   the two would diverge. They do not, so compression costs RMSE and costs the headline metric
+   nothing. Two further measurements agree: target centering, a related objective change, scored
+   0.167 against 0.180; and deeper trees widened prediction spread from 0.747 to 0.768 while
+   leaving bias on stabilising rows at +2.27, so the shrinkage is not over-averaging either. The
+   limitation is informational, not one of scale or objective.
+
+   **Reverse-mutation augmentation is the intervention that does move it.** Training folds
+   doubled with reversed rows and flipped labels: predictions below zero 59 → 192 against a true
+   254, bias on stabilising rows +2.28 → +1.67, their rank correlation −0.19 → +0.10, balanced
+   sign accuracy 0.512 → 0.681. It costs per-complex ρ (0.487 → 0.416), so it is a choice about
+   what the model is *for* rather than a free improvement — a model that flags 192 of 254 affinity
+   improvements is more useful for antibody engineering than one that flags 59, even at a lower
+   ranking score.
 2. **The antibody side is the real gap.** ρ 0.15 against 0.62 on the antigen side. Antibody-
    specific representations — the *sequence* side, where AbBiBench measures CurrAb at +0.074 —
    target this directly. Note this cuts against AntiFold, which is antibody-specific on the

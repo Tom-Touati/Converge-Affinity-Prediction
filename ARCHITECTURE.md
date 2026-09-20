@@ -380,16 +380,25 @@ The objective is held fixed throughout, since it moves results more than any of 
 
 | Step | What | Params | Tests |
 | --- | --- | --- | --- |
-| **N0** ✓ | Random forest on rung-6 features | — | Label noise or capacity — **done: 0.475 [0.393, 0.552]**, +0.069 over GBT |
+| **N0** ✓ | Random forest on rung-6 features | — | Label noise or capacity — **done: 0.487 [0.402, 0.562]**, +0.069 over GBT |
+| **N1** ✗ | Plain MLP, same 33 features | 8,513 | **Done, and it fails: 0.351 against the forest's 0.470 over three seeds, Δ −0.120.** This was the gate; the rungs below are not built |
 | **N1** | MLP on rung-6 features | ~5k | Does *any* neural head beat trees on 33 scalars |
 | **N2** | Single cross-attention over the 48-residue neighbourhood | ~14k | Does attending to local structure beat pooled scalars |
 | **N3** | Add the with-partner / without-partner contrast to every token | +0 | Does the §2.1 contrast generalise from the LLR to the hidden states |
 | **N4** | Second cross-attention to a separately encoded epitope | +8k | Is the neighbourhood too small a view of the antigen |
 | **N5** | Bidirectional sequence ↔ geometry | +16k | Only if a sequence encoder ever shows signal |
 
-**N1 is not a formality.** If a plain MLP cannot beat gradient-boosted trees on the same 33
-features, attention over 48 residues will not either, and the ladder stops there with a reportable
-finding.
+**N1 was not a formality, and it failed.** A plain MLP — 8,513 trainable parameters against ~750
+training rows — scores 0.351 against the forest's 0.470, every seed losing to every seed. Attention
+over 48 residues would add roughly 14,000 more parameters to the losing side of that comparison,
+on the same data and the same label noise. **The ladder stops here.** N2 through N5 are not built,
+and the reason is a measurement rather than a budget.
+
+Why the forest wins, specifically rather than generically: the measurement floor is ~0.5 kcal/mol
+and bagging tolerates label noise where gradient descent on squared error chases it (the same
+effect gave RF +0.069 over boosted trees on identical features); the features are axis-aligned and
+interaction-heavy, which is what tree splits are for; and 750 rows is too few to estimate a dense
+layer's weights and its scaling.
 
 **N5 is gated on the sequence modality working.** With ESM-2 35M at −0.066 the gate is currently
 shut. The ESM-2 650M run is what opens it, if anything does.
