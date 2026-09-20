@@ -340,6 +340,39 @@ With `d=32` and ESM-2 reduced to 32 dims by PCA fitted on **training folds only*
 
 About **19 parameters per training example** — the same order as a modest MLP, and defensible.
 
+**Note: a GNN is the lighter version of the same mechanism, and may be the better trade here.**
+
+Cross-attention and message passing answer the same question — *which neighbours matter, and what
+do they contribute* — but they differ in how the neighbour set is restricted:
+
+| | Cross-attention | GNN (message passing) |
+| --- | --- | --- |
+| Which neighbours interact | all 48, weights *learned* | only those joined by an edge, edges *given* |
+| Distance prior | a learned bias added to logits | enforced by construction |
+| Params per layer/block at d=32 | 8d² + FFN ≈ **8,320** | ~3d² ≈ **3,100** |
+| Inspectable per prediction | yes, α is a 48-vector summing to 1 | only via edge gates, if added |
+
+Three arguments for the GNN at our size:
+
+1. **The sparsity is free regularisation.** Attention must *learn* that a residue 9 Å away on the
+   far side of the chain is irrelevant; a distance-cut graph never offers that edge. At 757 rows,
+   a prior enforced by construction costs nothing to estimate and a learned one costs data.
+2. **It matches the source representation.** ProteinMPNN *is* a k=48 graph network. Building our
+   head as a GNN over the same neighbourhood keeps the geometry of the two consistent rather than
+   re-deriving it under a different inductive bias.
+3. **Edge features are where our signal lives.** §2.1 showed the binding signal is a *contrast*
+   between with-partner and without-partner. In a GNN that is naturally an **edge** attribute —
+   same-side versus cross-side, distance, buried surface — and messages can be typed by it.
+   Attention has to reconstruct the same thing from node features plus a chain-role embedding.
+
+Against it: attention weights are directly readable per prediction, which matters for the error
+analysis, and a GNN's messages are not. A middle option is an **attention-gated GNN** (GAT-style):
+sparse edges from the distance cut, learned weights on the edges that survive. That keeps the
+inspectability and the sparsity, at roughly 4d² ≈ 4,100 per layer.
+
+Sequencing: if N1 passes, try the GNN before the attention block. It is cheaper, its prior is
+stronger, and if it fails the attention version is very unlikely to succeed.
+
 ### 5.4 The ladder
 
 Each step is kept only if it beats the one below by a paired-bootstrap Δ whose CI clears zero.
