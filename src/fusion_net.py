@@ -98,10 +98,18 @@ class FusionNet(nn.Module):
         return self.head(z).squeeze(-1)
 
 
+#: standardised inputs are clipped here. Trees threshold and are immune to outliers; a linear
+#: projection extrapolates, so one extreme input produces an enormous activation. Measured: a
+#: fold-2 test row sits 11 sd out on chem:n_to_gly, a count feature whose training sd is 0.179,
+#: and the untreated network answered -6872 kcal/mol against a true range of [-4.91, +7.94].
+#: Beyond 5 sd there is no reliable information at this sample size anyway.
+CLIP = 5.0
+
+
 def _standardise(tr: np.ndarray, *others):
     mu = tr.reshape(-1, tr.shape[-1]).mean(0)
     sd = tr.reshape(-1, tr.shape[-1]).std(0) + 1e-6
-    return [(a - mu) / sd for a in (tr, *others)]
+    return [np.clip((a - mu) / sd, -CLIP, CLIP) for a in (tr, *others)]
 
 
 def _fit(seq_tr, st_tr, sc_tr, y_tr, seq_va, st_va, sc_va, y_va, cfg, seed):
@@ -118,6 +126,9 @@ def _fit(seq_tr, st_tr, sc_tr, y_tr, seq_va, st_va, sc_va, y_va, cfg, seed):
 
     n = len(y_tr)
     yv = y_va.numpy()
+    yt = y_tr.numpy()
+    span = yt.max() - yt.min()
+    lo_ok, hi_ok = yt.min() - span, yt.max() + span
     # Select on validation SPEARMAN, not validation loss. Measured on this data: the network
     # overfits magnitudes hard (training Huber 1.43 -> 0.03) while validation loss is lowest at
     # epoch 1 and never beats it, so loss-based early stopping restores an untrained model --
@@ -142,6 +153,11 @@ def _fit(seq_tr, st_tr, sc_tr, y_tr, seq_va, st_va, sc_va, y_va, cfg, seed):
             pv = net(seq_va, st_va, sc_va).numpy()
         v = evaluate._safe_spearman(yv, pv)
         v = -np.inf if not np.isfinite(v) else v
+        # Spearman is scale-invariant, so selecting on it leaves nothing holding the outputs to
+        # a physical range. Reject any checkpoint whose validation predictions have wandered
+        # outside the training labels' own span with room to spare.
+        if not (lo_ok <= pv.min() and pv.max() <= hi_ok):
+            v = -np.inf
         if v > best + 1e-4:
             best, best_state, waited = v, {k: t.clone() for k, t in net.state_dict().items()}, 0
         else:
@@ -189,7 +205,8 @@ def run(cfg: dict, seeds=(0, 1, 2, 3, 4), verbose: bool = True) -> dict:
                 c_tr = c_va = c_te = None
             else:
                 mu, sd = scalars[tr].mean(0), scalars[tr].std(0) + 1e-6
-                c_tr, c_va, c_te = ((scalars[m] - mu) / sd for m in (tr, va, te))
+                c_tr, c_va, c_te = (np.clip((scalars[m] - mu) / sd, -CLIP, CLIP)
+                                    for m in (tr, va, te))
 
             net = _fit(s_tr, g_tr, c_tr, y[tr], s_va, g_va, c_va, y[va], cfg, seed)
             with torch.no_grad():
