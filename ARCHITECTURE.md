@@ -381,18 +381,46 @@ The objective is held fixed throughout, since it moves results more than any of 
 | Step | What | Params | Tests |
 | --- | --- | --- | --- |
 | **N0** ✓ | Random forest on rung-6 features | — | Label noise or capacity — **done: 0.487 [0.402, 0.562]**, +0.069 over GBT |
-| **N1** ✗ | Plain MLP, same 33 features | 8,513 | **Done, and it fails: 0.351 against the forest's 0.470 over three seeds, Δ −0.120.** This was the gate; the rungs below are not built |
+| **N1** ✗ | Plain MLP, same 33 features, 12 configurations | 561–8,513 | **Done, and it fails: best of 12 is 0.423 against the forest's 0.470; 0 of 12 cells reach it.** This was the gate; the rungs below are not built |
 | **N1** | MLP on rung-6 features | ~5k | Does *any* neural head beat trees on 33 scalars |
 | **N2** | Single cross-attention over the 48-residue neighbourhood | ~14k | Does attending to local structure beat pooled scalars |
 | **N3** | Add the with-partner / without-partner contrast to every token | +0 | Does the §2.1 contrast generalise from the LLR to the hidden states |
 | **N4** | Second cross-attention to a separately encoded epitope | +8k | Is the neighbourhood too small a view of the antigen |
 | **N5** | Bidirectional sequence ↔ geometry | +16k | Only if a sequence encoder ever shows signal |
 
-**N1 was not a formality, and it failed.** A plain MLP — 8,513 trainable parameters against ~750
-training rows — scores 0.351 against the forest's 0.470, every seed losing to every seed. Attention
-over 48 residues would add roughly 14,000 more parameters to the losing side of that comparison,
-on the same data and the same label noise. **The ladder stops here.** N2 through N5 are not built,
-and the reason is a measurement rather than a budget.
+**N1 was not a formality, and it failed.** The first configuration tried — (128, 32) with
+alpha=1.0, 8,513 parameters — scored 0.351, and that number was briefly reported as "the MLP".
+It was a bad draw: a twelve-cell ablation over width and regularisation (`src/mlp_ablation.py`)
+shows it is the **worst** of the twelve.
+
+| hidden | alpha | params | per-complex rho | seed sd |
+| --- | --- | --- | --- | --- |
+| (64,) | 10.0 | 2,241 | **0.423** | 0.012 |
+| (128, 32) | 10.0 | 8,513 | 0.418 | 0.014 |
+| (32,) | 10.0 | 1,121 | 0.417 | 0.007 |
+| (16,) | 10.0 | 561 | 0.414 | 0.004 |
+| three widths | 100.0 | 561–2,241 | 0.398–0.399 | 0.002 |
+| (16,) | 1.0 | 561 | 0.385 | 0.003 |
+| (64,) | 1.0 | 2,241 | 0.374 | 0.020 |
+| (128, 32) | 100.0 | 8,513 | 0.367 | 0.001 |
+| (32,) | 1.0 | 1,121 | 0.362 | 0.009 |
+| (128, 32) | 1.0 | 8,513 | 0.341 | 0.010 |
+| **random forest** | | | **0.470** | |
+
+**Zero of twelve reach the forest.** The honest margin is the best cell, 0.423 against 0.470 —
+about four seed-standard-deviations — not the −0.120 the first draw suggested. And 0.423 is itself
+optimistic, being the maximum over twelve configurations chosen by the outer-fold score, which is
+tuning on the test set; the unbiased expectation is lower.
+
+The pattern is as informative as the verdict. `alpha=10` dominates at every width (0.414–0.423),
+`alpha=1.0` is worst at every width (0.341–0.385), and once regularisation is right capacity
+barely matters: 561 parameters reach 0.414, 8,513 reach 0.418. That is a problem limited by data
+and label noise rather than by capacity — the same conclusion the random-forest-over-boosting
+result reached from a different direction.
+
+Which is what closes the ladder. Attention over 48 residues adds roughly 14,000 parameters to a
+family whose best member already ignores capacity and survives on regularisation. **N2 through N5
+are not built, and the reason is a measurement rather than a budget.**
 
 Why the forest wins, specifically rather than generically: the measurement floor is ~0.5 kcal/mol
 and bagging tolerates label noise where gradient descent on squared error chases it (the same
