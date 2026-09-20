@@ -23,7 +23,8 @@ Measured on the frozen split, 1,000-resample paired bootstrap over complexes.
 | 3b | ProteinMPNN (5) | 0.204 | [0.139, 0.269] |
 | 4 | chemistry + geometry (28) | 0.349 | [0.226, 0.452] |
 | 5 | chemistry + geometry + ESM-2 (33) | 0.333 | [0.236, 0.424] |
-| **6** | **chemistry + geometry + ProteinMPNN (33)** | **0.408** | **[0.307, 0.494]** |
+| 6 | chemistry + geometry + ProteinMPNN (33), GBT | 0.408 | [0.307, 0.494] |
+| **N0** | **same features, random forest** | **0.475** | **[0.393, 0.552]** |
 
 Two facts to carry forward:
 
@@ -58,8 +59,12 @@ Two facts to carry forward:
   inductive bias points away from the target. If a sequence arm is kept at all, it should be
   there to supply residue identity and local context to the fusion, not to contribute a
   likelihood score of its own.
-* **The best model has no learned encoder in its head at all.** 33 scalar features into
-  gradient-boosted trees. That is the number a neural model has to beat.
+* **The best model has no learned encoder in its head at all.** 33 scalar features into a random
+  forest. **0.475 is the number a neural model has to beat**, not 0.408.
+* **Label noise looks like the binding constraint.** The forest beats the boosted trees on
+  identical features by +0.069 [+0.002, +0.144] and is far steadier across folds. Bagging beating
+  boosting is what noisy targets look like, and it argues against spending the remaining budget on
+  capacity.
 
 ## 2. The three measurements that constrain the design
 
@@ -342,7 +347,7 @@ The objective is held fixed throughout, since it moves results more than any of 
 
 | Step | What | Params | Tests |
 | --- | --- | --- | --- |
-| **N0** | Random forest on rung-6 features | — | Is label noise or capacity the limit |
+| **N0** ✓ | Random forest on rung-6 features | — | Label noise or capacity — **done: 0.475 [0.393, 0.552]**, +0.069 over GBT |
 | **N1** | MLP on rung-6 features | ~5k | Does *any* neural head beat trees on 33 scalars |
 | **N2** | Single cross-attention over the 48-residue neighbourhood | ~14k | Does attending to local structure beat pooled scalars |
 | **N3** | Add the with-partner / without-partner contrast to every token | +0 | Does the §2.1 contrast generalise from the LLR to the hidden states |

@@ -23,7 +23,7 @@ Roughly 40 working hours, with about 40% on data, splits and evaluation, 25% on 
 | 2. Clustered splits | 5 | Frozen fold file committed; leakage checks pass | If clusters are too unbalanced for 5 folds, fall back to leave-one-cluster-out |
 | 3. Eval harness and trivial baselines | 4 | Report generator prints all metrics with CIs for mean and substitution-matrix baselines | None |
 | 4. Feature caching (PLM, structure) | 5 | Embeddings and structure features cached on disk, keyed by row id | If a structure model fights the install for over 1.5 h, swap it for the next option |
-| 5. Model ladder, rungs 2 to 6 | 12 | Each rung has a harness report and a one-line verdict | Max 2 h per rung, 4 h for the rung-6 attention module, before writing down the result as is |
+| 5. Model ladder, feature rungs 2-6 then learned rungs N0-N2 | 12 | Each rung has a harness report and a one-line verdict | Max 2 h per rung, 4 h for the N2 attention module, before writing down the result as is |
 | 6. Error analysis | 6 | Slice tables, residual plots, 10 hand-inspected worst cases | None; this is the graded part |
 | 7. README, results, next steps | 5 | A stranger can reproduce the headline table from the README | Freeze code 5 h before submission |
 
@@ -177,19 +177,26 @@ Each rung is one experiment on the frozen harness. A rung is kept only if it bea
 | 1 | Substitution features only (BLOSUM62 score, hydrophobicity Δ, volume Δ, charge Δ, is-proline, is-glycine) + gradient-boosted trees | How far does mutation chemistry alone get us, no protein context | minutes |
 | 2 | Sequence PLM: ESM-2 (8M then 35M), embedding difference wt vs mut at the mutated position + mean-pool, into a ridge/MLP head | Does a sequence model beat raw chemistry | 1 GPU-hour |
 | 3 | Structure only: ESM-IF1 or AntiFold inverse-folding log-likelihood ratio at the mutated position, plus rSASA and interface distance | Does structure alone beat sequence | 1–2 GPU-hr |
-| 4 | Late fusion: concatenate rung-2 and rung-3 features, one head | Does combining modalities help at all, and by how much. **The control that rung 6 must beat** | +minutes |
+| 4 | Late fusion: concatenate rung-2 and rung-3 features, one head | Does combining modalities help at all, and by how much. **The control the learned models must beat** | +minutes |
 | 5 | Fusion + explicit interface features (contacts across the antibody–antigen interface, Δ contacts on mutation) | Is the interface the missing signal | +1 GPU-hr |
-| 6 | **Cross-attention fusion**: the mutation queries the interface residues around it, distance-biased, frozen encoders | Does an architecture that models *which* residues the mutation interacts with beat flat concatenation | +3-4 h |
-| 6a | Uniform-attention control: mean-pool the same residue set | Was the gain the residue filter rather than attention | +minutes |
-| 6b | Distance-bias-only control: attention weights from geometry, no content | Was the gain the physical prior rather than learned content | +minutes |
+| N2 | **Cross-attention fusion**: the mutation queries the interface residues around it, distance-biased, frozen encoders | Does an architecture that models *which* residues the mutation interacts with beat flat concatenation | +3-4 h |
+| N2a | Uniform-attention control: mean-pool the same residue set | Was the gain the residue filter rather than attention | +minutes |
+| N2b | Distance-bias-only control: attention weights from geometry, no content | Was the gain the physical prior rather than learned content | +minutes |
 
 Mutation representation, decided up front: the difference vector between wild-type and mutant embeddings at the mutated residue, concatenated with the position's structural context. Difference vectors are the standard, cheap and strong choice for ΔΔG; whole-sequence pooling alone washes out a single-residue change. Multi-point mutations sum the per-position difference vectors as a first approximation. The paper's double-mutant cycles show this is only half true, 345 additive against 421 context-dependent, so the approximation gets tested rather than assumed.
 
-Head: gradient-boosted trees or a 2-layer MLP with dropout for rungs 1 to 5; the attention module below for rung 6. With this sample size a linear or tree head on good features is genuinely hard to beat, so rungs 1 to 5 stay deliberately simple and rung 6 has to earn its parameters against them rather than replacing them.
+Head: gradient-boosted trees or a 2-layer MLP with dropout for rungs 1 to 5; the attention module below for rung N2. With this sample size a linear or tree head on good features is genuinely hard to beat, so the feature rungs stay deliberately simple and N2 has to earn its parameters against them rather than replacing them.
 
 Antisymmetry: for every forward mutation the reverse should give −ΔΔG. We test this as an evaluation probe on rung 2 onward, and only if it fails badly do we add reverse mutations as augmentation (deferred below).
 
-## Cross-attention fusion (rung 6)
+## Cross-attention fusion (rung N2)
+
+> **Numbering.** Feature-concatenation rungs are 0-6; the learned fusion ladder is N0-N5. They
+> are separate sequences because `rung6_chem_geom_mpnn_gbt` on disk is a *feature* rung, not this.
+> [`ARCHITECTURE.md`](ARCHITECTURE.md) carries the implementation-level specification -- pipeline,
+> tensor shapes, parameter budget -- and supersedes this section wherever the two differ.
+>
+> **The target has moved.** N2 must beat **rungN0 at per-complex rho 0.475**, not rung 4 at 0.349.
 
 Concatenation is a weak model of what binding actually is. A mutation's effect on ΔΔG depends on
 *which residues it contacts across the interface*, and a concatenated feature vector has thrown
@@ -240,17 +247,17 @@ Rung 6 is kept only if it beats **rung 4** by a paired-bootstrap Δ whose CI cle
 if it also survives the two controls, which is where most of the honesty lives:
 
 - **6a, uniform attention.** Replace the learned weights with a plain mean over the same filtered
-  residue set. If this matches rung 6, the gain came from choosing the right residues, not from
+  residue set. If this matches N2, the gain came from choosing the right residues, not from
   attention, and the right conclusion is that a better *feature set* beat a better architecture.
 - **6b, distance-bias only.** Attention weights computed from geometry alone, with the content
-  term switched off. If this matches rung 6, the gain came from the physical prior we injected,
+  term switched off. If this matches N2, the gain came from the physical prior we injected,
   not from anything the model learned.
 
 The training objective is held fixed across rungs 4, 5, 6, 6a and 6b. Given how much the objective
 moves scores, varying it and the fusion mechanism together would make the comparison
 uninterpretable.
 
-**Stop rule: 4 hours.** If rung 6 does not clear rung 4, we report that, with the parameter count
+**Stop rule: 4 hours.** If N2 does not clear the best feature rung, we report that, with the parameter count
 and the seed variance, and the write-up argues from our own evidence that flat concatenation is
 sufficient at this sample size. That is a defensible finding, and a more useful one than a fragile
 win.
@@ -302,7 +309,7 @@ The whole point of the ladder and the slices is to attribute a disappointing sco
 | Split leakage | Random vs cluster-split gap | Large gap | Trust cluster split; the random number was the lie |
 | Sequence encoder | Rung 2 vs rung 1 Δ | Rung 2 barely beats chemistry | Bigger / antibody-specific PLM (AbLang2) |
 | Structure encoder | Rung 3 vs rung 2; residual vs interface features | Structure adds nothing where it should (COR mutations) | Better structure model, real interface geometry |
-| Fusion | Rung 4 vs max(rung 2, rung 3); then rung 6 vs rung 4 | Fusion ≤ best single modality, or cross-attention ≤ concatenation | Rung 6 is the fix, and rungs 6a/6b say whether it was the mechanism or the features |
+| Fusion | Rung 4 vs max(rung 2, rung 3); then N2 vs the best feature rung | Fusion ≤ best single modality, or cross-attention ≤ concatenation | N2 is the fix, and N2a/N2b say whether it was the mechanism or the features |
 | Optimisation / head | Train vs test gap; floor comparison | Overfitting, or not beating the mean | Stronger regularisation, simpler head |
 
 The rule: we do not touch a moving part until its diagnostic says it is the binding constraint. Early on the likely constraints are label noise and data volume, not fusion sophistication, which is exactly why fusion upgrades are deferred and the ladder starts at a substitution-matrix baseline.
