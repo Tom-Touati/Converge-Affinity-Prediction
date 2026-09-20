@@ -242,8 +242,12 @@ BASE = dict(heads=4, dropout=0.2, lr=3e-4, wd=1e-2, epochs=300, batch=64, patien
 def sweep_configs():
     C = []
     def add(name, **kw):
-        C.append(dict(BASE, name=name, hadamard=False, attn=False, mut_token=False,
-                      cats=False, scalars=False, **kw))
+        # build defaults first, then override -- passing both as kwargs to dict() hands it the
+        # same key twice and raises
+        cfg = dict(BASE, name=name, hadamard=False, attn=False, mut_token=False,
+                   cats=False, scalars=False)
+        cfg.update(kw)
+        C.append(cfg)
     # --- which mechanism carries the result? one at a time, then together ---
     add("arch_hadamard", hadamard=True)
     add("arch_attn", attn=True)
