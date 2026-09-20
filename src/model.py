@@ -47,6 +47,30 @@ def make_gbt(seed: int = 0):
     )
 
 
+def make_rf(seed: int = 0):
+    """Random forest. Not a formality -- it is a diagnostic for label noise.
+
+    Boosting and bagging fail in opposite directions. Gradient boosting fits residuals
+    sequentially, which reduces bias and lets it chase label noise; a random forest averages
+    decorrelated trees, which reduces variance and is markedly more robust to noisy targets.
+    With a measurement floor near 0.5 kcal/mol on this data, the GBT-vs-RF gap is informative in
+    itself: if the forest matches or beats the boosted trees, we are limited by label noise
+    rather than by model capacity, and reaching for a bigger model is the wrong response.
+
+    Fixed configuration, chosen in advance, no search.
+    """
+    from sklearn.ensemble import RandomForestRegressor
+
+    return RandomForestRegressor(
+        n_estimators=500,
+        max_features="sqrt",
+        min_samples_leaf=5,
+        max_depth=None,
+        n_jobs=-1,
+        random_state=seed,
+    )
+
+
 def make_ridge(seed: int = 0):
     """Linear head with an internal alpha sweep; the natural baseline for embedding features."""
     from sklearn.linear_model import RidgeCV
@@ -75,6 +99,7 @@ def make_mlp(seed: int = 0):
 MODELS = {
     "mean": lambda seed=0: MeanPredictor(),
     "gbt": make_gbt,
+    "rf": make_rf,
     "ridge": make_ridge,
     "mlp": make_mlp,
 }
