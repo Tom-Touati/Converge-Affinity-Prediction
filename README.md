@@ -122,6 +122,16 @@ exactly the homology the outer split exists to prevent.
 
 Deferred as drop-in swaps behind the cached-feature interface: AbLang2, AntiFold, SaProt.
 
+**Fusion mechanism.** Concatenation (rung 4) is the control; the target architecture is
+**cross-attention** (rung 6): the mutation is a query, the ~20–60 residues within 10 Å of it are
+keys and values, and attention logits carry a learned monotone distance bias so the module starts
+near "attend to what is close" and learns deviations. Encoders stay frozen, so roughly 50k
+parameters train. The point is to model *which* residues a mutation interacts with, which a
+concatenated feature vector has already discarded. Two controls — uniform attention over the same
+residue set, and distance-bias-only attention — separate "attention helped" from "we fed it
+interface geometry". Full rationale, including why this is the component our own evidence says
+matters least, is in [`PLAN.md`](PLAN.md#cross-attention-fusion-rung-6).
+
 ## Repo layout
 
 ```
@@ -192,7 +202,11 @@ Open defects, quantified, with the fix each one needs. Detail and decisions in
 1. Extract and cache the ESM-2 ladder and the inverse-folding log-likelihood ratios, plus a
    with/without-partner-chain ablation that isolates whether the structure model actually uses
    the interface.
-2. Rungs 2–5: sequence alone, structure alone, late fusion, fusion + explicit interface features.
+2. Rungs 2–6: sequence alone, structure alone, late fusion by concatenation, fusion + explicit
+   interface features, then **cross-attention fusion** — the mutation queries the interface
+   residues around it, with distance-biased attention over frozen encoders. Concatenation
+   (rung 4) is the control it must beat, and two further controls (uniform attention,
+   distance-bias only) separate "attention helped" from "we fed it interface geometry".
    Each kept only if a paired-bootstrap delta over the rung below has a CI clearing zero.
 3. Error analysis: alanine vs non-alanine, antibody-side vs antigen-side, interface location,
    additivity on the double-mutant cycles, and ten hand-inspected worst residuals.
