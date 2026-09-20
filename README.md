@@ -278,6 +278,8 @@ no-op on anything already computed.
 - [`notebooks/00_data_dictionary.ipynb`](notebooks/00_data_dictionary.ipynb) — column-by-column
   orientation to the raw file: meaning, literature use, value set and a plot for all 29 columns,
   plus the two ways of reading SKEMPI that fail silently
+- [`ERROR_ANALYSIS.md`](ERROR_ANALYSIS.md) — where the model fails and why, with every
+  slice guarded against the dataset's three imbalances
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — encoder pipeline, parameter budget, and what 750
   training rows can support
 - [`PLAN.md`](PLAN.md) — time budget, model ladder, bottleneck map, deferred ideas with triggers

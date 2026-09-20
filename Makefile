@@ -4,7 +4,7 @@ BOOT   ?= 1000
 DEVICE ?= auto
 ESM    ?= esm2_t12_35M_UR50D
 
-.PHONY: help data splits features geom esm mpnn \
+.PHONY: help data splits features geom esm mpnn errors \
         rung0 rung1 rung2a rung2b rung3 rung3b rung4 rung5 rung6 rungN0 \
         ladder figures test clean clean-features third-party
 
@@ -32,6 +32,7 @@ help:
 	@echo "  make ladder - every rung above, in order"
 	@echo ""
 	@echo "  make figures       - regenerate reports/figures/"
+	@echo "  make errors        - slice tables, probes and diagnostics for the best model"
 	@echo "  make test          - split-integrity and harness tests"
 	@echo "  make clean         - remove generated reports (keeps the frozen split)"
 
@@ -89,6 +90,9 @@ ladder: rung0 rung1 rung2a rung2b rung3 rung3b rung4 rung5 rung6 rungN0
 
 figures:
 	$(PYTHON) -m src.analysis labels
+
+errors:
+	$(PYTHON) -m src.error_analysis --run rungN0_chem_geom_mpnn_rf
 
 test:
 	$(PYTHON) -m pytest tests -q
