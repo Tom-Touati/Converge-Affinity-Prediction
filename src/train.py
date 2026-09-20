@@ -43,7 +43,7 @@ def _feature_block(name: str, df: pd.DataFrame) -> pd.DataFrame:
     if cache.exists():
         block = pd.read_parquet(cache)
     else:
-        builders = {"chem": "chem", "geom": "geometry"}
+        builders = {"chem": "chem", "geom": "geometry", "geomrev": "geom_rev"}
         if name not in builders:
             raise KeyError(
                 f"unknown feature block '{name}'. Cached blocks: "
@@ -87,7 +87,8 @@ def _git_sha() -> str:
 
 
 def run(model: str, features: list, name: str, seed: int = 0, min_group: int = 10,
-        n_boot: int = 1000, verbose: bool = True, center: bool = False) -> pd.DataFrame:
+        n_boot: int = 1000, verbose: bool = True, center: bool = False,
+        augment: bool = False) -> pd.DataFrame:
     t0 = time.perf_counter()
     df = splits.load()
     X = build_matrix(df, features)
@@ -95,10 +96,15 @@ def run(model: str, features: list, name: str, seed: int = 0, min_group: int = 1
     complexes = df["#Pdb"].to_numpy()
 
     preds = np.full(len(df), np.nan)
+    est_params = None
     for f in sorted(df["fold"].unique()):
         te = (df["fold"] == f).to_numpy()
         tr = ~te
         est = MODELS[model](seed)
+        if est_params is None:
+            # Record what the head actually is. Without this a report says only "rf" and the
+            # configuration that produced it is unrecoverable once model.py moves on.
+            est_params = {k: str(v) for k, v in getattr(est, "get_params", dict)().items()}
 
         if center:
             # Train on the within-complex deviation instead of the raw label.
@@ -118,7 +124,14 @@ def run(model: str, features: list, name: str, seed: int = 0, min_group: int = 1
             # to an uncentered run's -- only the rank metrics are.
             preds[te] = est.predict(X[te]) + y[tr].mean()
         else:
-            est.fit(X[tr], y[tr])
+            X_tr, y_tr = X[tr], y[tr]
+            if augment:
+                # Reverse-mutation augmentation, TRAINING FOLD ONLY. A reversed row is the same
+                # measurement with a flipped sign, so letting one reach a test fold whose source
+                # sat in training would leak as badly as duplicating the row.
+                from .augment import augment_training_fold
+                X_tr, y_tr = augment_training_fold(X_tr, y_tr, df[tr], features)
+            est.fit(X_tr, y_tr)
             preds[te] = est.predict(X[te])
     assert np.isfinite(preds).all(), "some rows never landed in a test fold"
 
@@ -138,7 +151,8 @@ def run(model: str, features: list, name: str, seed: int = 0, min_group: int = 1
     (d / "metrics.json").write_text(json.dumps({"metrics": m, "ci": ci}, indent=2, default=float))
     (d / "run.json").write_text(json.dumps({
         "name": name, "model": model, "features": features, "seed": seed,
-        "min_group": min_group, "n_boot": n_boot, "center": center,
+        "min_group": min_group, "n_boot": n_boot, "center": center, "augment": augment,
+        "estimator_params": est_params,
         "n_folds": int(df["fold"].nunique()),
         "n_rows": len(df), "n_features": X.shape[1], "git_sha": _git_sha(),
         "python": platform.python_version(), "machine": platform.processor(),
@@ -168,10 +182,12 @@ def main() -> None:
     p.add_argument("--n-boot", type=int, default=1000)
     p.add_argument("--center", action="store_true",
                    help="train on the within-complex deviation instead of the raw ddG")
+    p.add_argument("--augment", action="store_true",
+                   help="append each training row's reverse mutation with a flipped label")
     a = p.parse_args()
     feats = [f.strip() for f in a.features.split(",") if f.strip()]
     run(a.model, feats, a.name or f"{a.model}_{'+'.join(feats)}", a.seed, a.min_group,
-        a.n_boot, center=a.center)
+        a.n_boot, center=a.center, augment=a.augment)
 
 
 if __name__ == "__main__":
