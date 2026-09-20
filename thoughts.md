@@ -1,0 +1,4 @@
+we also have an imbalance in replaced amino acids. what can we do about that?
+in the reasoning doc we need to write down that we choosing classification into bins over regression because it neutralizes the measurement error. we want to test the test-retest error also in the eda. (distribution of differences between pairs of the same unique complex mutation pair). another augmentation can be rotating the 3d structure? also use a model that infers structure after mutation? and then use it as feature.
+we still need a base model comparison, clear literature, feature output from each model to be stored. how many of the proteins and antigens did the model actually previously see?
+I still need to understand every column.
