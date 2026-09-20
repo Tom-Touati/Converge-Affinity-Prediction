@@ -66,7 +66,8 @@ class Chain:
     keys: list = field(default_factory=list)    # residue keys, in sequence order
     index: dict = field(default_factory=dict)   # residue key -> offset into seq
     backbone: np.ndarray = field(default_factory=lambda: np.zeros((0, 3, 3), np.float32))
-    heavy: list = field(default_factory=list)   # per residue, (n_atoms, 3) heavy-atom coords
+    heavy: list = field(default_factory=list)      # per residue, (n_atoms, 3) heavy-atom coords
+    heavy_elem: list = field(default_factory=list)  # per residue, (n_atoms,) element symbols
 
     def __len__(self) -> int:
         return len(self.seq)
@@ -121,13 +122,17 @@ def parse_pdb(path: Path) -> Structure:
 
             ch, key = ln[21], (int(ln[22:26]), ln[26].strip())
             xyz = np.array([float(ln[30:38]), float(ln[38:46]), float(ln[46:54])], np.float32)
+            # The element column is optional in older files; fall back to the atom name, which
+            # for standard residues starts with the element after any leading digit.
+            elem = element or atom.lstrip("0123456789")[:1]
 
             res = raw.setdefault(ch, {})
             if key not in res:
                 res[key] = {}
                 order.setdefault(ch, []).append(key)
                 names.setdefault(ch, {})[key] = aa
-            res[key].setdefault(atom, xyz)
+            if atom not in res[key]:
+                res[key][atom] = (xyz, elem)
 
     chains = {}
     for ch, keys in order.items():
@@ -139,9 +144,14 @@ def parse_pdb(path: Path) -> Structure:
             atoms = raw[ch][k]
             for j, name in enumerate(BACKBONE):
                 if name in atoms:
-                    bb[i, j] = atoms[name]
+                    bb[i, j] = atoms[name][0]
             c.heavy.append(
-                np.stack(list(atoms.values())) if atoms else np.zeros((0, 3), np.float32)
+                np.stack([xyz for xyz, _ in atoms.values()]) if atoms
+                else np.zeros((0, 3), np.float32)
+            )
+            c.heavy_elem.append(
+                np.array([e for _, e in atoms.values()], dtype="<U2") if atoms
+                else np.zeros(0, dtype="<U2")
             )
         c.backbone = bb
         chains[ch] = c

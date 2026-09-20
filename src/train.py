@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -25,29 +26,45 @@ from . import evaluate, paths, splits
 from .model import MODELS
 
 
+#: embedding-vector columns, as written by features/esm2.py
+_VECTOR_COL = re.compile(r"^d\d+$")
+
+
 def _feature_block(name: str, df: pd.DataFrame) -> pd.DataFrame:
-    """Resolve a feature block by name, preferring a cached file over recomputation."""
+    """Resolve a feature block by name, preferring a cached file over recomputation.
+
+    A ``@scalars`` suffix drops the wide embedding-difference columns and keeps only the
+    summary scalars. With ~750 training rows a 480- or 1280-dimensional difference vector is
+    hopeless for a tree head but fine for ridge, so the two want different views of one cache.
+    """
+    name, _, view = name.partition("@")
     cache = paths.FEATURES / f"{name}.parquet"
+
     if cache.exists():
         block = pd.read_parquet(cache)
-        missing = set(df["row_id"]) - set(block.index)
-        if missing:
-            raise RuntimeError(
-                f"cached block '{name}' is missing {len(missing)} row_ids; delete "
-                f"{cache} and re-extract"
-            )
-        return block.loc[df["row_id"]]
-
-    if name == "chem":
-        from .features.chem import build
     else:
-        raise KeyError(
-            f"unknown feature block '{name}'. Cached blocks found: "
-            f"{sorted(p.stem for p in paths.FEATURES.glob('*.parquet'))}"
+        builders = {"chem": "chem", "geom": "geometry"}
+        if name not in builders:
+            raise KeyError(
+                f"unknown feature block '{name}'. Cached blocks: "
+                f"{sorted(p.stem for p in paths.FEATURES.glob('*.parquet'))}. "
+                f"ESM blocks are produced by `python -m src.features.esm2 --model ...`."
+            )
+        mod = __import__(f"src.features.{builders[name]}", fromlist=["build"])
+        block = mod.build(df)
+        paths.FEATURES.mkdir(parents=True, exist_ok=True)
+        block.to_parquet(cache)
+
+    missing = set(df["row_id"]) - set(block.index)
+    if missing:
+        raise RuntimeError(
+            f"cached block '{name}' is missing {len(missing)} row_ids; delete "
+            f"{cache} and re-extract"
         )
-    block = build(df)
-    paths.FEATURES.mkdir(parents=True, exist_ok=True)
-    block.to_parquet(cache)
+    if view == "scalars":
+        block = block[[c for c in block.columns if not _VECTOR_COL.match(c)]]
+    elif view:
+        raise KeyError(f"unknown view '@{view}' on block '{name}' (only '@scalars' exists)")
     return block.loc[df["row_id"]]
 
 
