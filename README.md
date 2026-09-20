@@ -68,11 +68,12 @@ Each run writes `reports/<name>/` containing `predictions.csv`, `per_complex.csv
 
 ## Key decisions, and why
 
-**The honest sample size is 997, not 1,211.** Eighty rows have no parsable affinity (non-binders
-and bounds — the SKEMPI paper notes the curator's choice between "non-binding" and "weaker than
-X" is arbitrary, which is why these are dropped rather than imputed), and a further 256 rows are
-repeat measurements of 122 (complex, mutation) pairs, aggregated by median. The spread within
-those repeats is retained: it is the subset's own label-noise estimate.
+**The honest sample size is 997, not 1,211.** Eighty rows record the mutant affinity as literal
+`n.b.` — a qualitative non-binder with no number to parse — and a further 256 rows are repeat
+measurements of 122 (complex, mutation) pairs, aggregated by median. The spread within those
+repeats is retained: it is the subset's own label-noise estimate. Bounded affinities (`<` / `>`)
+are a *separate* and currently unhandled case: SKEMPI parses them into bare numbers, so 86 of
+them survive into the table as if they were exact. See Limitations.
 
 **The split is by homology cluster, not by structure.** The field's convention (RDE-Network,
 DiffAffinity) splits by structure. That is not enough here — thirteen of the 54 complexes are
@@ -133,6 +134,7 @@ src/
   evaluate.py    THE harness: one predictions table -> every metric, with bootstrap CIs
   model.py       heads: mean, GBT, ridge, MLP
   train.py       one rung, one command, one reports/ directory
+  analysis.py    error-analysis and data-description figures
   features/chem.py   rung 1: substitution chemistry only
 tests/           split integrity and the harness contract
 notebooks/       01_eda.ipynb
@@ -162,6 +164,24 @@ no-op on anything already computed.
 - [`EDA_FINDINGS.md`](EDA_FINDINGS.md) — what the data audit found and what it changed
 - [`PRIOR_WORK.md`](PRIOR_WORK.md) — literature calibration: what "good" looks like here
 - [`AI_PROMPTS.md`](AI_PROMPTS.md) — prompt history
+
+## Limitations and known issues
+
+Open defects, quantified, with the fix each one needs. Detail and decisions in
+[`PLAN.md`](PLAN.md).
+
+- **86 censored affinities are trained on as exact measurements** (45 mutant, 41 wild-type).
+  SKEMPI parses `">1e-6"` into a bare number and `src/data.py` currently trusts it. That is 8.6%
+  of the dataset, and it should be fixed before the encoders are trained against these labels.
+- **80 qualitative non-binders (`n.b.`) are discarded**, losing the strongest destabilising
+  evidence in the set. Recoverable as ranking constraints rather than point labels.
+- **37 rows are exactly 0.000, and 22 of them sit in one complex** (`2JEL_LH_P`) -- a reporting
+  convention rather than 37 independent measurements of zero.
+- **Only 130 rows are clearly stabilising** (ddG < -0.5). Affinity *improvement* is what
+  antibody engineering wants predicted, and it is the class with the least evidence. Rung 1
+  already scores 0.586 balanced sign accuracy, which is near chance on direction.
+- **Half the complexes fall below the field's >=10-mutations rule**, so the headline metric is
+  computed on 27 of 54 complexes. Both variants are reported.
 
 ## What is next
 
