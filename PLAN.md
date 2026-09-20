@@ -244,10 +244,45 @@ Each of these is written into the "next steps" section of the submission with th
 | Antibody-specific encoders (AbLang2, AntiFold, IgFold) | Generic PLM/structure encoder is the weak rung | Drop-in swaps behind the cached-feature interface |
 | Ensemble / uncertainty | Only for the final report | Bootstrap ensemble gives per-prediction error bars, useful for a "which mutation to trust" story |
 
-| Pairwise within-complex ranking loss | Per-complex Spearman stalls while RMSE improves, or the censored/non-binder rows are wanted | Not augmentation -- 19,834 pairs from 997 rows is 19.9x the examples but zero new information. Real merits: it optimises the headline metric directly, cancels the per-complex offset exactly (a constant-per-fold predictor scores global rho -0.36, so the shortcut is live), and is invariant to per-complex rescaling, which matters when 47.7% of temperatures are assumed. Costs: the top 3 complexes hold 43.2% of pairs against 22.8% of rows, so pairs need 1/C(n,2) weighting; near-ties are noise, so filter to abs(delta) > 1, which keeps 10,703 pairs (54%); no kcal/mol scale, so pair it with the regression head rather than replacing it |
+| Pairwise within-complex ranking loss | Per-complex Spearman stalls while RMSE improves, or the censored/non-binder rows are wanted | Not augmentation -- 19,834 pairs from 997 rows is 19.9x the examples but zero new information. Real merits: it optimises the headline metric directly, cancels the per-complex offset exactly (a constant-per-fold predictor scores global rho -0.36, so the shortcut is live), and is invariant to per-complex rescaling, which matters when 47.7% of temperatures are assumed. Costs: the top 3 complexes hold 43.2% of pairs against 22.8% of rows, so pairs need 1/C(n,2) weighting; near-ties are noise, so filter to abs(delta) > 1, which keeps 10,703 pairs (54%); no kcal/mol scale, so pair it with the regression head rather than replacing it. **Efficiency argument tested and not supported** -- see the centering result below. The data-recovery argument (80 non-binders, 86 censored rows) is untouched by that test and still stands |
 | Reverse-mutation augmentation, revisited | Antisymmetry probe fails, or the stabilising slice stays at chance | The strongest lever for the *actual* deficiency: 544 destabilising rows (> +0.5) reversed give 544 synthetic clearly-stabilising examples against the 130 real ones, a 5x increase in the class the model is blind to. Known weakness: no mutant structure exists, so the wild-type backbone is reused |
 | Distal-neutral augmentation (mutate far from the interface, label ~0) | Only as a regulariser or a probe, not as bulk training data | The labelling assumption is validated by our own data: SUR mutations average +0.09 with sd 0.37, below measurement noise, and 86.1% are neutral. But it targets the wrong gap -- it grows the neutral class (already 32.4%) and adds nothing stabilising -- and 83.8% of the test set is interface proper, so it trains a region the test set barely contains. It is also largely redundant with the rSASA / interface-distance features, which let the model learn "distal implies zero" from the 79 real SUR rows. Strongest forms: a penalty for predicting non-zero at distal positions, and a test-time probe that checks the interface prior was learned at all |
 | FoldX pseudo-label pretraining | Learning curve shows data volume is the constraint | Strictly more informative than distal-neutral for the same purpose: a graded, structure-aware signal across the whole label range rather than a point mass at zero, and `skempi-foldx` ships precomputed values so FoldX never has to run |
+
+### Negative result: within-complex target centering does not help
+
+The cheapest test of the "ranking fixes the offset problem" hypothesis, run before building any
+pair machinery. Train on `ddG - mean(ddG | complex)` using training-fold means only, predict the
+deviation, rank within complex as usual. This captures the whole efficiency argument for a
+ranking loss while changing exactly one thing and keeping the gradient-boosted head, so no
+head-architecture change confounds it.
+
+`python -m src.train --model gbt --features chem --center --name rung1c_chem_gbt_centered`
+
+| Metric | Uncentered | Centered | Paired delta | 95% CI | Clears zero |
+| --- | --- | --- | --- | --- | --- |
+| **Per-complex Spearman (n>=10)** | 0.180 | 0.167 | **-0.015** | [-0.078, +0.058] | no |
+| Per-complex Spearman (all) | 0.111 | 0.128 | +0.013 | [-0.072, +0.107] | no |
+| Global Spearman | 0.207 | 0.105 | -0.103 | [-0.226, -0.002] | yes |
+
+The global-Spearman drop is the **positive control**: centering removed the between-complex
+component exactly as designed, so this is a real null and not a broken experiment. On the
+headline metric 13 of 27 complexes improved, median delta -0.009 -- a coin flip, with individual
+complexes swinging between -0.35 and +0.44.
+
+What it rules out: that squared error wasting 38% of its gradient on an unlearnable per-complex
+offset is what limits our within-complex ranking. It is not, at least for a tree head on
+chemistry features.
+
+What it does not rule out, stated honestly: the harness's minimum detectable effect for a
+genuinely different model is about +0.10 (power analysis, `reports/`), so an effect of +0.05
+would have been invisible either way. The result is consistent with anything from -0.08 to
++0.06. What tilts it negative is that the point estimate is negative -- a real mechanism should
+at least have produced a positive one.
+
+What survives: a ranking loss is invariant to per-complex *monotone rescaling*, not just
+additive offsets, and it is the only route to using the 80 non-binders and 86 censored rows.
+Those arguments are independent of this test.
 
 The architecture is built so each of these is a swap behind a stable interface: encoders write cached feature files keyed by row id, and the fusion head reads features by name. Changing an encoder or adding a modality does not touch the split, the harness, or the error-analysis code.
 

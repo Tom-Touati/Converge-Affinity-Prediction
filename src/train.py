@@ -70,19 +70,39 @@ def _git_sha() -> str:
 
 
 def run(model: str, features: list, name: str, seed: int = 0, min_group: int = 10,
-        n_boot: int = 1000, verbose: bool = True) -> pd.DataFrame:
+        n_boot: int = 1000, verbose: bool = True, center: bool = False) -> pd.DataFrame:
     t0 = time.perf_counter()
     df = splits.load()
     X = build_matrix(df, features)
     y = df["ddG"].to_numpy(float)
+    complexes = df["#Pdb"].to_numpy()
 
     preds = np.full(len(df), np.nan)
     for f in sorted(df["fold"].unique()):
         te = (df["fold"] == f).to_numpy()
         tr = ~te
         est = MODELS[model](seed)
-        est.fit(X[tr], y[tr])
-        preds[te] = est.predict(X[te])
+
+        if center:
+            # Train on the within-complex deviation instead of the raw label.
+            #
+            # 38% of this dataset's label variance is between complexes -- an offset set by the
+            # wild type's reference affinity, the assay and the temperature, none of which the
+            # mutation's features can predict for an unseen complex. Squared error spends that
+            # share of its gradient on it, while the headline metric (per-complex Spearman)
+            # ignores it entirely, being rank-based within each complex.
+            #
+            # Means come from TRAINING rows only. Test complexes never appear in training under
+            # grouped CV, so no test-complex mean exists to leak -- which is the point.
+            tr_mean = pd.Series(y[tr]).groupby(complexes[tr]).mean()
+            est.fit(X[tr], y[tr] - pd.Series(complexes[tr]).map(tr_mean).to_numpy())
+            # Add the global training mean back so predictions stay on a physical scale. The
+            # model still makes no attempt at per-complex offsets, so its RMSE is not comparable
+            # to an uncentered run's -- only the rank metrics are.
+            preds[te] = est.predict(X[te]) + y[tr].mean()
+        else:
+            est.fit(X[tr], y[tr])
+            preds[te] = est.predict(X[te])
     assert np.isfinite(preds).all(), "some rows never landed in a test fold"
 
     out = pd.DataFrame({
@@ -101,7 +121,8 @@ def run(model: str, features: list, name: str, seed: int = 0, min_group: int = 1
     (d / "metrics.json").write_text(json.dumps({"metrics": m, "ci": ci}, indent=2, default=float))
     (d / "run.json").write_text(json.dumps({
         "name": name, "model": model, "features": features, "seed": seed,
-        "min_group": min_group, "n_boot": n_boot, "n_folds": int(df["fold"].nunique()),
+        "min_group": min_group, "n_boot": n_boot, "center": center,
+        "n_folds": int(df["fold"].nunique()),
         "n_rows": len(df), "n_features": X.shape[1], "git_sha": _git_sha(),
         "python": platform.python_version(), "machine": platform.processor(),
         "wall_seconds": round(time.perf_counter() - t0, 1),
@@ -128,9 +149,12 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--min-group", type=int, default=10)
     p.add_argument("--n-boot", type=int, default=1000)
+    p.add_argument("--center", action="store_true",
+                   help="train on the within-complex deviation instead of the raw ddG")
     a = p.parse_args()
     feats = [f.strip() for f in a.features.split(",") if f.strip()]
-    run(a.model, feats, a.name or f"{a.model}_{'+'.join(feats)}", a.seed, a.min_group, a.n_boot)
+    run(a.model, feats, a.name or f"{a.model}_{'+'.join(feats)}", a.seed, a.min_group,
+        a.n_boot, center=a.center)
 
 
 if __name__ == "__main__":
