@@ -10,6 +10,9 @@ data/features/
 # --- generated results ---------------------------------------------------
 reports/**
 !reports/.gitkeep
+# figures are deliverables the README points at, so they are versioned
+!reports/figures/
+!reports/figures/**
 
 # --- third-party model weights and checkouts -----------------------------
 third_party/
