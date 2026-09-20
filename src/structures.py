@@ -40,7 +40,9 @@ IG_MOTIFS = (
     re.compile(r"WG[QKRAE]G"),       # FR4 WGxG
 )
 
-BACKBONE = ("N", "CA", "C")
+# N, CA, C, O -- the four atoms inverse-folding models expect. O is needed by
+# ProteinMPNN's featuriser; nothing else in the repo reads past index 2.
+BACKBONE = ("N", "CA", "C", "O")
 
 
 @dataclass
@@ -139,7 +141,7 @@ def parse_pdb(path: Path) -> Structure:
         c = Chain(id=ch, keys=keys)
         c.seq = "".join(names[ch][k] for k in keys)
         c.index = {k: i for i, k in enumerate(keys)}
-        bb = np.full((len(keys), 3, 3), np.nan, np.float32)
+        bb = np.full((len(keys), len(BACKBONE), 3), np.nan, np.float32)
         for i, k in enumerate(keys):
             atoms = raw[ch][k]
             for j, name in enumerate(BACKBONE):
