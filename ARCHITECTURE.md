@@ -31,6 +31,33 @@ Two facts to carry forward:
   both beat chemistry alone; ESM-2 35M is at or below zero and *subtracts* 0.016 when added to
   chem+geom. Any design that spends parameters symmetrically on the two modalities is
   misallocating them.
+
+  The one that didn't work was the protein language model. ESM-2 scored at or below zero and
+  actively made the combination worse. Its notion of "surprising" is driven by evolutionary
+  conservation, and antibody binding sites are the one part of a protein that evolution
+  deliberately doesn't conserve.
+
+  This is not an inference from the score alone — it is visible in the features. Mean
+  masked-marginal log-likelihood ratio, grouped by SKEMPI's interface annotation:
+
+  | | INT | SUR | SUP | COR | RIM |
+  | --- | --- | --- | --- | --- | --- |
+  | ESM-2 35M, mean LLR | −1.165 | −0.922 | −0.575 | **−0.449** | **−0.350** |
+
+  The ordering is backwards for binding. ESM-2 finds mutations at buried *interior* positions
+  most surprising, which is exactly right for folding stability, while interface **core and rim**
+  — the positions that actually govern binding — surprise it least. It has learned burial-driven
+  conservation, which is a folding signal.
+
+  ProteinMPNN, asked the same way, orders by contact with the partner instead: its
+  partner-attributable term `llr_delta` runs COR −0.486, RIM −0.301, SUP −0.098, INT −0.021,
+  SUR +0.015 — concentrated at the interface and *zero* where nothing is touching. Two encoders,
+  the same dataset, opposite orderings; only one of them is answering the question we asked.
+
+  Consequence for the design: do not spend a parameter budget on a sequence encoder whose
+  inductive bias points away from the target. If a sequence arm is kept at all, it should be
+  there to supply residue identity and local context to the fusion, not to contribute a
+  likelihood score of its own.
 * **The best model has no learned encoder in its head at all.** 33 scalar features into
   gradient-boosted trees. That is the number a neural model has to beat.
 
