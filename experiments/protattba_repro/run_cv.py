@@ -53,6 +53,7 @@ import json
 import os
 import shutil
 import time
+from pathlib import Path
 from argparse import Namespace
 
 # Set before torch initialises CUDA, exactly as their trainer.py does at import time.
@@ -148,9 +149,79 @@ UPSTREAM_ARGS = dict(
 DEVIATIONS = [
     "frozen ESM2-650M served from a precomputed cache instead of recomputed in the loop "
     "(identity under --freeze_backbone; see check_encoder_assumptions.py)",
-    "DataLoader num_workers=0 instead of 4 (Windows spawn cost; the sampler runs in the "
-    "parent process either way, so batch composition and order are unchanged)",
+    "DataLoader num_workers=0 on Windows instead of their 4 (spawn cost); their 4 is used "
+    "on Linux. The sampler runs in the parent process either way, so batch composition and "
+    "iteration order are unchanged.",
 ]
+
+
+#: Where to write per-epoch history. The project's dashboard (`scripts/dashboard/serve.py`)
+#: polls a *running* VM with `colab download`, which works while the kernel is BUSY, and looks
+#: for `<REMOTE>/rank_fusion_sweep.csv` plus `<REMOTE>/<name>/history.csv` where REMOTE is
+#: `/content/converge_bind/reports`. Writing into that layout means the existing dashboard
+#: shows this run live with no change to it -- `serve.py --session pab`.
+HISTORY_ROOT = Path(os.environ.get("PROTATTBA_HISTORY_DIR",
+                                   "/content/converge_bind/reports"
+                                   if os.path.isdir("/content") else str(RESULTS / "history")))
+SWEEP_CSV = HISTORY_ROOT / "rank_fusion_sweep.csv"
+
+
+class HistoryCallback(pl.Callback):
+    """Append one row per validation epoch, in the dashboard's history.csv schema.
+
+    Exists because the first remote attempt was invisible: with `enable_progress_bar=False`
+    and `logger=False` there was no way to tell a slow epoch from a hung process, and a
+    35-minute silence had to be diagnosed by guessing. This makes the run observable while it
+    runs, and records seconds-per-epoch so the wall clock can be explained rather than
+    estimated.
+    """
+
+    COLUMNS = ("epoch", "step", "steps", "loss", "val_rho", "val_pearson", "val_rmse",
+               "train_rho", "seconds", "fold", "n_train", "n_val", "name", "protocol")
+
+    def __init__(self, name: str, protocol: str, fold: int, n_train: int, n_val: int):
+        self.path = HISTORY_ROOT / name / "history.csv"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.meta = dict(name=name, protocol=protocol, fold=fold,
+                         n_train=n_train, n_val=n_val)
+        self.t0 = time.time()
+        if not self.path.exists():
+            self.path.write_text(",".join(self.COLUMNS) + "\n")
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        m = {k: float(v) for k, v in trainer.logged_metrics.items()
+             if hasattr(v, "item") or isinstance(v, (int, float))}
+        row = {
+            "epoch": trainer.current_epoch,
+            "step": trainer.global_step,
+            "steps": trainer.num_training_batches,
+            "loss": m.get("loss_epoch", m.get("loss", "")),
+            "val_rho": m.get("val_spearman_corr", ""),
+            "val_pearson": m.get("val_pearson_corr", ""),
+            "val_rmse": m.get("val_mse", "") ** 0.5 if m.get("val_mse") else "",
+            "train_rho": "",          # their LitModel does not compute a training correlation
+            "seconds": round(time.time() - self.t0, 1),
+            **self.meta,
+        }
+        with open(self.path, "a") as f:
+            f.write(",".join(str(row[c]) for c in self.COLUMNS) + "\n")
+
+
+def write_sweep_row(name: str, protocol: str, folds_done: int, note: str = "") -> None:
+    """Keep one row per run in the file the dashboard reads first, so the run is listed."""
+    HISTORY_ROOT.mkdir(parents=True, exist_ok=True)
+    rows = {}
+    if SWEEP_CSV.exists():
+        try:
+            for r in pd.read_csv(SWEEP_CSV).to_dict("records"):
+                rows[r.get("name")] = r
+        except Exception:
+            rows = {}
+    rows[name] = {"name": name, "protocol": protocol, "folds_done": folds_done,
+                  "resid": False, "min_grp": "n/a", "dataset": "S1131", "note": note}
+    pd.DataFrame(list(rows.values())).to_csv(SWEEP_CSV, index=False)
 
 
 def build_args(protocol: str, device: str, max_epochs: int | None) -> Namespace:
@@ -158,12 +229,48 @@ def build_args(protocol: str, device: str, max_epochs: int | None) -> Namespace:
     args.model_locate = str(ESM2_DIR)
     args.data_path = str(S1131_CSV)
     args.data_name = "S1131"
-    args.num_workers = 0
+    # Their trainer.py default is 4. Windows pays a process-spawn cost per epoch that makes
+    # that a loss, but on Linux it is both faster *and* their actual setting, so it is used
+    # wherever it works. Either way the sampler runs in the parent process, so batch
+    # composition and iteration order are identical -- this cannot move the result.
+    #
+    # It matters more than it looks: the collator calls the tokenizer four times per batch
+    # over sequences up to 965 residues, and with a single worker that CPU work does not
+    # overlap the GPU at all. A T4 epoch measured 30 s at roughly 1% utilisation.
+    args.num_workers = 0 if os.name == "nt" else 4
     args.accelerator = device
     args.protocol = protocol
     if max_epochs is not None:
         args.max_epochs = max_epochs
     return args
+
+
+def restore_best(args: Namespace, ckpt_path: str) -> LitModel:
+    """Rebuild the model and load the best epoch's weights.
+
+    Their trainer.py does ``LitModel.load_from_checkpoint(best_model_path)``. That classmethod
+    reconstructs the module from the checkpoint's stored hyperparameters, and under Lightning
+    2.6 with an argparse ``Namespace`` in ``hparams`` it did not return -- an 8-epoch probe
+    trained in 262 s and then sat for 18 minutes with the checkpoint already written.
+
+    This does the same two things explicitly: construct ``LitModel(args)`` from the arguments
+    we already hold, and load the saved ``state_dict`` strictly. Same weights, same module, no
+    dependence on how a given Lightning version round-trips hyperparameters. ``strict=True`` is
+    the guard -- if the module tree and the checkpoint ever stopped matching, this raises
+    rather than silently evaluating a partly-initialised head.
+    """
+    blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    lit = LitModel(args)
+    missing, unexpected = lit.load_state_dict(blob["state_dict"], strict=False)
+    # The cached encoder holds no parameters, so nothing of it appears in the state dict.
+    missing = [k for k in missing if not k.startswith("model.encoder.")]
+    unexpected = [k for k in unexpected if not k.startswith("model.encoder.")]
+    if missing or unexpected:
+        raise RuntimeError(
+            f"checkpoint does not match the model: missing={missing[:5]} "
+            f"unexpected={unexpected[:5]}"
+        )
+    return lit
 
 
 @torch.no_grad()
@@ -285,6 +392,14 @@ def main() -> None:
             p.unlink()
         done = {}
 
+    # Registered before the first fold, not after it. The dashboard pulls the sweep file first
+    # and only fetches history for names it lists, so registering late leaves the run invisible
+    # for exactly the stretch when watching it matters most.
+    run_name = f"protattba_{cli.protocol}"
+    write_sweep_row(run_name, cli.protocol, len(done), note="running")
+    print(f"\nhistory -> {HISTORY_ROOT / run_name / 'history.csv'}")
+    print(f"sweep   -> {SWEEP_CSV}")
+
     t_start = time.time()
 
     splits = folds_for(cli.protocol, n_rows, args)
@@ -334,11 +449,13 @@ def main() -> None:
             enable_progress_bar=False,
             enable_model_summary=False,
             logger=False,
-            callbacks=[ckpt, early],
+            callbacks=[ckpt, early,
+                       HistoryCallback(f"protattba_{cli.protocol}", cli.protocol,
+                                       fold, len(train_idx), len(mon_idx))],
         )
         trainer.fit(lit, mon_pack.get_train_loader(), mon_pack.get_val_loader())
 
-        best = LitModel.load_from_checkpoint(ckpt.best_model_path, args=args)
+        best = restore_best(args, ckpt.best_model_path)
         preds, trues = predict(best, test_pack.get_test_loader(), device)
 
         assert len(preds) == len(test_idx), f"{len(preds)} predictions for {len(test_idx)} rows"
@@ -361,6 +478,8 @@ def main() -> None:
               f"{float(ckpt.best_model_score):.4f} | test PCC {one.pcc:.4f} rho {one.rho:.4f} "
               f"RMSE {one.rmse:.4f} | {mins:.1f} min", flush=True)
 
+        write_sweep_row(f"protattba_{cli.protocol}", cli.protocol, fold + 1,
+                        note=f"{trainer.current_epoch} epochs, {mins:.1f} min/fold")
         shutil.rmtree(ckpt_root / str(fold), ignore_errors=True)
         del lit, best, trainer
         if device.type == "cuda":

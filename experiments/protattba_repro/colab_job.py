@@ -141,17 +141,20 @@ def stage_crosscheck():
     print("STAGE_OK crosscheck", flush=True)
 
 
-def _run(protocol):
-    sh(f"python run_cv.py --protocol {protocol} --device gpu")
-    print(f"STAGE_OK {protocol}", flush=True)
+def _run(protocol, upto=None):
+    """One protocol, optionally only up to fold ``upto``-1.
 
-
-def stage_upstream():
-    _run("upstream")
-
-
-def stage_honest():
-    _run("honest")
+    Called one fold at a time by colab_run.sh. A Colab session was reclaimed mid-run
+    ("Session 'pab' appears to be lost (404/401)") and at ~25 s an epoch a 10-fold protocol is
+    3-5 hours, far longer than a session can be relied on. run_cv.py writes one file per fold
+    and reuses any already on disk, so exec'ing it with a rising fold bound makes each call
+    cost one fold, and the driver downloads that fold before starting the next. A lost VM then
+    costs the fold in flight rather than the run.
+    """
+    bound = "" if upto is None else f" --folds {upto}"
+    os.environ["PROTATTBA_HISTORY_DIR"] = "/content/converge_bind/reports"
+    sh(f"python run_cv.py --protocol {protocol} --device gpu{bound}")
+    print(f"STAGE_OK {protocol}" + ("" if upto is None else f":{upto}"), flush=True)
 
 
 def stage_compare():
@@ -168,13 +171,20 @@ def stage_collect():
 
 STAGES = {
     "bootstrap": stage_bootstrap, "verify": stage_verify, "crosscheck": stage_crosscheck,
-    "extract": stage_extract, "upstream": stage_upstream, "honest": stage_honest,
-    "compare": stage_compare, "collect": stage_collect,
+    "extract": stage_extract, "compare": stage_compare, "collect": stage_collect,
 }
+PROTOCOLS = ("upstream", "honest")
 
 if __name__ == "__main__":
     name = sys.argv[1] if len(sys.argv) > 1 else "bootstrap"
-    if name not in STAGES:
-        print(f"!!! STAGE_FAILED: unknown stage {name!r}; have {sorted(STAGES)}", flush=True)
+    # "upstream" runs every fold; "upstream:4" runs up to fold 3, reusing folds already on
+    # disk, which is how the driver advances one fold per exec.
+    proto, _, bound = name.partition(":")
+    if proto in PROTOCOLS:
+        _run(proto, int(bound) if bound else None)
+    elif name in STAGES:
+        STAGES[name]()
+    else:
+        print(f"!!! STAGE_FAILED: unknown stage {name!r}; "
+              f"have {sorted(STAGES) + [f'{p}[:N]' for p in PROTOCOLS]}", flush=True)
         raise SystemExit(2)
-    STAGES[name]()

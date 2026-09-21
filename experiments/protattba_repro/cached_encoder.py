@@ -53,6 +53,11 @@ class EncoderOutput:
 #: Resident is a pure throughput change -- same values, same order, same results.
 CACHE_DEVICE_ENV = "PROTATTBA_CACHE_DEVICE"
 
+#: Process-level memo. ``SeqBindModel`` is constructed once per fold, and again when the best
+#: epoch is restored, so ``from_pretrained`` runs ~20 times in a 10-fold run. Without this,
+#: each call re-materialised 0.66 GB from the memmap and copied it to the device again.
+_LOADED: dict = {}
+
 
 class CachedEsmEncoder(nn.Module):
     """Serves ``extract_embeddings.py``'s cache. Holds no parameters, so it trains nothing."""
@@ -75,6 +80,9 @@ class CachedEsmEncoder(nn.Module):
         the checkpoint at ``paths_local.ESM2_DIR``, and that provenance is asserted there
         (hidden size 1280) rather than re-derived here.
         """
+        if "store" in _LOADED:
+            return cls(_LOADED["store"], _LOADED["index"], _LOADED["hidden"])
+
         store = np.load(EMBEDDINGS, mmap_mode="r")
         with open(EMBEDDINGS_INDEX, "rb") as f:
             meta = pickle.load(f)
@@ -97,6 +105,7 @@ class CachedEsmEncoder(nn.Module):
             else:
                 print(f"[cache] only {free / 1e9:.2f} GB free on {want}; keeping the memmap "
                       f"on the host (this is much slower per step)")
+        _LOADED.update(store=store, index=meta["index"], hidden=meta["hidden"])
         return cls(store, meta["index"], meta["hidden"])
 
     def _locate(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
@@ -124,10 +133,17 @@ class CachedEsmEncoder(nn.Module):
         batch, width = input_ids.shape
 
         if self._resident:
-            out = torch.zeros(batch, width, self.hidden, dtype=torch.float32,
-                              device=self._store.device)
-            for row, (offset, n) in enumerate(spans):
-                out[row, :n] = self._store[offset:offset + n]
+            # One index_select plus one scatter, rather than a Python loop of 12 small device
+            # copies per call. The encoder is called four times per step, so the loop version
+            # was issuing ~48 tiny copies per step; at 85 steps an epoch that overhead is
+            # visible next to a head this small.
+            dev = self._store.device
+            src = torch.cat([torch.arange(off, off + n) for off, n in spans]).to(dev)
+            rows = torch.cat([torch.full((n,), r, dtype=torch.long)
+                              for r, (_, n) in enumerate(spans)]).to(dev)
+            cols = torch.cat([torch.arange(n) for _, n in spans]).to(dev)
+            out = torch.zeros(batch, width, self.hidden, dtype=torch.float32, device=dev)
+            out[rows, cols] = self._store.index_select(0, src)
             return EncoderOutput(out.to(input_ids.device))
 
         host = np.zeros((batch, width, self.hidden), dtype=np.float32)

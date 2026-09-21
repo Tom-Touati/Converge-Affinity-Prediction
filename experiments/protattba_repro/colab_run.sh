@@ -89,34 +89,72 @@ STAGES=("$@")
 
 say "start  session=$SESSION gpu=$GPU  stages: ${STAGES[*]}"
 push
-stage bootstrap 2400 || { say "bootstrap failed, stopping"; exit 1; }
+stage bootstrap 2400 || say "bootstrap had trouble; the fold loop will retry it"
 stage verify 900
 # Colab's python 3.13 forces a much newer transformers than their pin. Prove the encoder is
 # unchanged before spending GPU hours on a run that would otherwise be unattributable.
-stage crosscheck 900 || {
+if ! stage crosscheck 900; then
   if grep -q "EXCEEDS TOLERANCE" "$LOG"; then
-    say "ENCODER DIFFERS across stacks -- the remote run would measure a different encoder"
-  else
-    say "crosscheck stage errored (not an encoder mismatch); see $LOG"
+    say "ENCODER DIFFERS across stacks -- refusing to run, the numbers would not be theirs"
+    exit 1
   fi
-  exit 1
-}
-stage extract 3600 || { say "extract failed, stopping"; exit 1; }
-# The run stages are hours long and `colab exec` dropped its connection 35 minutes into the
-# first attempt ("RuntimeError: Connection was lost."), losing the whole fold. run_cv.py now
-# writes one file per fold and skips folds already on disk, so a retry resumes rather than
-# restarts -- which makes retrying the right response to a dropped connection.
-for st in "${STAGES[@]}"; do
-  for attempt in 1 2 3 4 5; do
-    say "--- $st attempt $attempt"
-    if stage "$st" 21600; then break; fi
-    grab "$st"                      # salvage whatever folds completed before the drop
-    if grep -q "STAGE_FAILED" "$LOG" && ! tail -400 "$LOG" | grep -q "Connection was lost"; then
-      say "$st failed for a reason other than a dropped connection; not retrying"
-      break
-    fi
-    say "$st lost its connection; resuming from the folds already on disk"
+  say "crosscheck could not run (not an encoder mismatch); continuing, see $LOG"
+fi
+stage extract 3600 || say "extract had trouble; the fold loop will retry it"
+# One fold per exec, with the fold's predictions pulled down as soon as it finishes and any
+# folds we already hold pushed back up first. Two things forced this:
+#
+#   * `colab exec` dropped its connection 35 minutes into a 10-fold call
+#     ("RuntimeError: Connection was lost."), and
+#   * the session itself was later reclaimed ("Session 'pab' appears to be lost (404/401)").
+#
+# At ~25 s an epoch a protocol is 3-5 hours, which is longer than a session can be relied on,
+# so the unit of work has to be smaller than the run. run_cv.py writes one file per fold and
+# reuses any already present, so this loop is resumable across a VM loss: whatever folds are
+# on local disk are restored to the fresh VM and only the missing ones are computed.
+push_folds () {   # push_folds <protocol>
+  local n=0
+  shopt -s nullglob
+  for f in "$HERE"/results/"$1"_fold*.csv; do
+    timeout 180 colab upload -s "$SESSION" "$f" \
+      "$REMOTE/results/$(basename "$f")" >>"$LOG" 2>&1 && n=$((n+1))
   done
+  shopt -u nullglob
+  [[ $n -gt 0 ]] && say "  restored $n completed fold(s) to the VM"
+  return 0
+}
+
+pull_folds () {   # pull_folds <protocol>
+  for k in 0 1 2 3 4 5 6 7 8 9; do
+    [[ -f "$HERE/results/$1_fold$k.csv" ]] && continue
+    timeout 180 colab download -s "$SESSION" "$REMOTE/results/$1_fold$k.csv" \
+      "$HERE/results/$1_fold$k.csv" >>"$LOG" 2>&1 \
+      && say "  pulled $1_fold$k.csv"
+  done
+  return 0
+}
+
+for st in "${STAGES[@]}"; do
+  for k in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -f "$HERE/results/${st}_fold$((k-1)).csv" ]] && continue
+    ok=no
+    for attempt in 1 2 3; do
+      ensure || { say "cannot get a session for $st fold $((k-1))"; break; }
+      push_folds "$st"
+      # A fresh VM needs the environment and the cache back before it can train. Both stages
+      # are idempotent and skip their own work when the outputs are already there -- ~30 s and
+      # ~5 s on a session that has already run them, ~4 min on a brand new VM -- so they are
+      # called unconditionally rather than tracked.
+      stage bootstrap 2400
+      stage extract 3600
+      if stage "$st:$k" 7200; then ok=yes; fi
+      pull_folds "$st"
+      [[ $ok == yes ]] && break
+      say "  $st fold $((k-1)) attempt $attempt did not finish; retrying on whatever session exists"
+    done
+    [[ $ok == yes ]] || say "GIVING UP on $st fold $((k-1))"
+  done
+  say "### $st: $(ls "$HERE"/results/"$st"_fold*.csv 2>/dev/null | wc -l) of 10 folds on disk"
   grab "$st"
 done
 stage compare 600

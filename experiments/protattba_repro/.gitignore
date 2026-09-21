@@ -21,3 +21,4 @@ results/**
 # matter are unpacked into results/ and the summaries there are versioned.
 colab_*.log
 results_colab_*.tgz
+_live/
