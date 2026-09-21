@@ -76,6 +76,34 @@ def build_pairs(y: np.ndarray, groups: np.ndarray, margin: float = 0.5):
     return np.concatenate(I), np.concatenate(J)
 
 
+def _augment(t, cfg):
+    """Augment an encoder's output in feature space, during training only.
+
+    The loss curves are unambiguous about what limits this model: training Spearman reaches
+    1.00 while validation sits near 0.2, so it memorises all 723-757 rows. There is no more
+    data to give it -- SKEMPI's antibody subset is 997 rows -- so the alternative is to stop
+    the same vector arriving twice. Two augmentations, both applied to the frozen encoders'
+    outputs rather than to the structures, since the encoders are not being fine-tuned and
+    re-running them per epoch would be absurd:
+
+    * ``noise_std`` -- Gaussian jitter on the standardised representation. Inputs are already
+      unit-scaled, so the value reads directly as a fraction of a standard deviation.
+    * ``feat_drop`` -- zero whole embedding dimensions, shared across the batch, rescaling the
+      survivors. Coarser than element-wise dropout on purpose: it forces the head to spread
+      its reliance across dimensions instead of leaning on a few, which is the failure mode
+      that memorisation of 750 rows actually takes.
+    """
+    if t is None:
+        return t
+    ns, fd = cfg.get("noise_std", 0.0), cfg.get("feat_drop", 0.0)
+    if ns > 0:
+        t = t + torch.randn_like(t) * ns
+    if fd > 0:
+        keep = (torch.rand(t.shape[-1], device=t.device) >= fd).to(t.dtype)
+        t = t * keep / max(1e-6, 1.0 - fd)
+    return t
+
+
 def _split_held(held, clusters, cx, rng):
     """Halve the held-out fold: one half supervises early stopping, the other is scored.
 
@@ -175,8 +203,12 @@ def _fit(tr, va, cfg, seed):
     if len(I) == 0:
         cfg = dict(cfg, huber_w=1.0, rank_w=0.0)
 
-    def fwd(idx):
-        return net(S[idx], G[idx], CH[idx], C[idx], None if X is None else X[idx])
+    def fwd(idx, train=False):
+        s_, g_, ch_ = S[idx], G[idx], CH[idx]
+        x_ = None if X is None else X[idx]
+        if train:
+            s_, g_, ch_, x_ = (_augment(v, cfg) for v in (s_, g_, ch_, x_))
+        return net(s_, g_, ch_, C[idx], x_)
 
     yv, yt = y_va, y_tr
     span = yt.max() - yt.min()
@@ -204,7 +236,7 @@ def _fit(tr, va, cfg, seed):
             if cfg["rank_w"] > 0 and len(sel):
                 pi = torch.as_tensor(I[sel], device=dev)
                 pj = torch.as_tensor(J[sel], device=dev)
-                fi, fj = fwd(pi), fwd(pj)
+                fi, fj = fwd(pi, train=True), fwd(pj, train=True)
                 dy = Y[pi] - Y[pj]
                 w = dy.abs() if cfg["weighted"] else torch.ones_like(dy)
                 r = (w * nn.functional.softplus(-torch.sign(dy) * (fi - fj))).sum() / w.sum()
@@ -212,7 +244,7 @@ def _fit(tr, va, cfg, seed):
                 ep_rank += float(r)
             if cfg["huber_w"] > 0:
                 ridx = torch.as_tensor(next(rows_it), device=dev)
-                h = huber(fwd(ridx), Y[ridx])
+                h = huber(fwd(ridx, train=True), Y[ridx])
                 loss = loss + cfg["huber_w"] * h
                 ep_huber += float(h)
             loss.backward()
@@ -337,6 +369,15 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
     ens.to_csv(out_dir / "predictions.csv", index=False)
     hdf = pd.DataFrame(history)
     hdf.to_csv(out_dir / "history.csv", index=False)
+    # The generalisation gap at the epoch each (seed, fold) actually checkpointed. This is the
+    # number the regularisation ladder exists to move -- the headline can stay flat while the
+    # gap closes, and that would still be informative, so report both rather than one.
+    gap = tr_rho = float("nan")
+    if not hdf.empty and hdf["val_rho"].notna().any():
+        picks = hdf.dropna(subset=["val_rho"]).loc[
+            hdf.dropna(subset=["val_rho"]).groupby(["seed", "fold"])["val_rho"].idxmax()]
+        tr_rho, va_rho = picks["train_rho"].mean(), picks["val_rho"].mean()
+        gap = tr_rho - va_rho
     plot_history(hdf, cfg["name"], out_dir / "losses.png")
     pd.DataFrame(splitlog).to_csv(out_dir / "splits.csv", index=False)
     (out_dir / "metrics.json").write_text(json.dumps({"metrics": m, "ci": {}}, indent=2, default=float))
@@ -344,6 +385,9 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
                                                   "config": cfg}, indent=2))
     return {"name": cfg["name"], "rank_w": cfg["rank_w"], "huber_w": cfg["huber_w"],
             "margin": cfg["margin"], "weighted": cfg["weighted"],
+            "noise": cfg.get("noise_std", 0.0), "fdrop": cfg.get("feat_drop", 0.0),
+            "dropout": cfg["dropout"], "wd": cfg["wd"], "d": cfg["d"],
+            "train_rho": round(tr_rho, 3), "gap": round(gap, 3),
             "per_cx_rho": round(m["per_complex_spearman"], 3),
             "global_rho": round(m["global_spearman"], 3), "rmse": round(m["rmse"], 3)}
 
@@ -410,7 +454,46 @@ def plot_history(hdf, name, out_png):
 BASE = dict(heads=4, dropout=0.2, lr=3e-4, wd=1e-2, epochs=200, batch=64, patience=20, d=64,
             mut_token=True, residual=True, pairs=("sg",), chem_token=False,
             rank_w=1.0, huber_w=1.0, margin=0.5, weighted=False, max_steps=None,
-            device="auto")
+            noise_std=0.0, feat_drop=0.0, device="auto")
+
+
+def aug_configs():
+    """Regularisation ladder, built so a gain can be attributed to one cause.
+
+    The baseline `rk_both` memorises: training Spearman 1.00 against validation ~0.2. Three
+    separate levers could close that, and changing them together would make any improvement
+    uninterpretable, so each rung moves one thing:
+
+      aug_none      the same model again, as the control every rung is measured against
+      aug_noise     Gaussian jitter only
+      aug_drop      feature dropout only
+      aug_both      both augmentations, no change to capacity
+      reg_dropout   head dropout 0.2 -> 0.5, no augmentation
+      reg_wd        weight decay 1e-2 -> 1e-1, no augmentation
+      reg_small     width 64 -> 32, no augmentation
+      full_light    every lever, gently
+      full_heavy    every lever, hard -- the "tough regularisation" end of the range
+
+    Huber is kept alongside the rank term throughout. Dropping it removes the only anchor on
+    output scale, which is what produced rk_rank_only's RMSE of 6.179 and, earlier in this
+    project, a -6872 kcal/mol prediction.
+    """
+    C = []
+    def add(name, **kw):
+        cfg = dict(BASE, name=name, rank_w=1.0, huber_w=1.0)
+        cfg.update(kw)
+        C.append(cfg)
+
+    add("aug_none")
+    add("aug_noise",    noise_std=0.2)
+    add("aug_drop",     feat_drop=0.2)
+    add("aug_both",     noise_std=0.2, feat_drop=0.2)
+    add("reg_dropout",  dropout=0.5)
+    add("reg_wd",       wd=1e-1)
+    add("reg_small",    d=32)
+    add("full_light",   noise_std=0.15, feat_drop=0.15, dropout=0.35, wd=3e-2, d=48)
+    add("full_heavy",   noise_std=0.35, feat_drop=0.3,  dropout=0.5,  wd=1e-1, d=32)
+    return C
 
 
 def sweep_configs():
@@ -434,6 +517,8 @@ def sweep_configs():
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--sweep", action="store_true")
+    p.add_argument("--aug-sweep", action="store_true",
+                   help="regularisation and representation-augmentation ladder")
     p.add_argument("--seeds", type=int, default=5)
     p.add_argument("--device", default="auto", help="auto|cpu|cuda")
     p.add_argument("--only", default=None,
@@ -445,10 +530,11 @@ def main():
     seeds = tuple(range(a.seeds))
     rows = []
     want = set(a.only.split(",")) if a.only else None
-    configs = [c for c in sweep_configs() if want is None or c["name"] in want]
+    pool = aug_configs() if a.aug_sweep else sweep_configs()
+    configs = [c for c in pool if want is None or c["name"] in want]
     if want and not configs:
         raise SystemExit(f"no config matched {sorted(want)}; "
-                         f"available: {[c['name'] for c in sweep_configs()]}")
+                         f"available: {[c['name'] for c in pool]}")
     for cfg in configs:
         cfg = dict(cfg, device=a.device)
         if a.max_steps:

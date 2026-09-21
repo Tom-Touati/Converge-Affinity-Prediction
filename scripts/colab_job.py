@@ -150,6 +150,21 @@ def stage_plots():
        check=False)
 
 
+def stage_aug():
+    """Representation augmentation and tough regularisation, nine rungs, one lever each.
+
+    Three seeds rather than five: nine configurations at five seeds is roughly four hours of
+    T4 time, and the session was reclaimed mid-run once already. Three keeps it near two and
+    a half and still averages out seed noise, at the cost of wider intervals.
+    """
+    sh(f"{_py()} -m src.rank_fusion --aug-sweep --device cuda --seeds 3", check=False)
+
+
+def stage_v3():
+    """The chem-as-third-modality sweep, runnable for the first time now the NameError is gone."""
+    sh(f"{_py()} -m src.fusion_v3 --sweep --seeds 3", check=False)
+
+
 def stage_esm650():
     # Six probes say the sequence arm adds nothing over structure+chemistry, and both
     # diagnosed mechanisms are about what the PLM represents, not about capacity. If 650M
@@ -165,7 +180,7 @@ def stage_collect():
 
 STAGES = {
     "bootstrap": stage_bootstrap, "extract": stage_extract, "runs": stage_runs,
-    "plots": stage_plots, "esm650": stage_esm650, "collect": stage_collect,
+    "plots": stage_plots, "aug": stage_aug, "v3": stage_v3, "esm650": stage_esm650, "collect": stage_collect,
 }
 
 if __name__ == "__main__":
