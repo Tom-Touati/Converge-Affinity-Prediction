@@ -379,6 +379,11 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
             mu2, sd2 = Xs[tr].mean(0), Xs[tr].std(0) + 1e-6
             sc = [np.clip((Xs[m] - mu2) / sd2, -CLIP, CLIP) for m in (tr, va, te)]
 
+            # use_scalars=False removes the bypass that hands the head the same 49 features
+            # the forest already fitted. The net is trained on that forest's residual, so the
+            # path lets it re-derive what has been subtracted out.
+            if not cfg.get("use_scalars", True):
+                sc = [None, None, None]
             net, hist = _fit((s3[0], g3[0], ch3[0], cats[tr], sc[0], target[tr], groups[tr]),
                              (s3[1], g3[1], ch3[1], cats[va], sc[1], target[va], groups[va]),
                              cfg, seed)
@@ -391,7 +396,8 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
                 dev = next(net.parameters()).device
                 T = lambda a, dt=torch.float32: torch.as_tensor(a, dtype=dt, device=dev)
                 p = net(T(s3[2]), T(g3[2]), T(ch3[2]),
-                        T(cats[te], torch.long), T(sc[2])).cpu().numpy()
+                        T(cats[te], torch.long),
+                        None if sc[2] is None else T(sc[2])).cpu().numpy()
             oof[te] = p + base_te if base_te is not None else p
         oofs.append(oof)
 
@@ -439,6 +445,8 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
             "margin": cfg["margin"], "weighted": cfg["weighted"],
             "noise": cfg.get("noise_std", 0.0), "fdrop": cfg.get("feat_drop", 0.0),
             "dropout": cfg["dropout"], "wd": cfg["wd"], "d": cfg["d"],
+            "scalars": cfg.get("use_scalars", True), "attn": cfg.get("mut_token", True),
+            "had": bool(cfg.get("pairs", ())),
             "train_rho": round(tr_rho, 3), "gap": round(gap, 3),
             "per_cx_rho": round(m["per_complex_spearman"], 3),
             "global_rho": round(m["global_spearman"], 3), "rmse": round(m["rmse"], 3)}
@@ -506,7 +514,7 @@ def plot_history(hdf, name, out_png):
 BASE = dict(heads=4, dropout=0.2, lr=3e-4, wd=1e-2, epochs=200, batch=64, patience=20, d=64,
             mut_token=True, residual=True, pairs=("sg",), chem_token=False,
             rank_w=1.0, huber_w=1.0, margin=0.5, weighted=False, max_steps=None,
-            noise_std=0.0, feat_drop=0.0, eval_every=0, device="auto")
+            noise_std=0.0, feat_drop=0.0, eval_every=0, use_scalars=True, device="auto")
 
 
 def aug_configs():
@@ -557,6 +565,37 @@ def aug_configs():
     return C
 
 
+def ablation_configs():
+    """Head ablations and regularisation, measured on the SAME footing.
+
+    The ablations were run on a local probe -- one fold, one seed, CPU -- while full_heavy's
+    0.502 came from the ladder at four folds and three seeds. Comparing those two numbers is
+    not valid, and the combination they suggest (drop the scalars, keep the width, regularise
+    hard) has never been run at all. Everything here goes through run() identically.
+
+    HEAVY is full_heavy's settings minus the width change, so `d` can be varied independently
+    and the question "is the dimension reduction doing the work, or the regularisation?" has
+    an answer rather than a guess.
+    """
+    HEAVY = dict(noise_std=0.35, feat_drop=0.3, dropout=0.5, wd=1e-1)
+    C = []
+
+    def add(name, **kw):
+        cfg = dict(BASE, name=name, rank_w=1.0, huber_w=1.0, eval_every=10, patience=25)
+        cfg.update(kw)
+        C.append(cfg)
+
+    add("ab_control")                                            # d=64, scalars, no reg
+    add("ab_heavy_d64",       **HEAVY)                           # reg only, width kept
+    add("ab_heavy_d32",       d=32, **HEAVY)                     # = full_heavy, the reference
+    add("ab_noscalars",       use_scalars=False)                 # the probe's winner, no reg
+    add("ab_noscalars_heavy", use_scalars=False, **HEAVY)        # <- the proposed combination
+    add("ab_noscalars_d32",   use_scalars=False, d=32, **HEAVY)  # both, to test sub-additivity
+    add("ab_noattn",          mut_token=False)                   # probe said this collapses
+    add("ab_nohadamard",      pairs=())
+    return C
+
+
 def sweep_configs():
     C = []
     def add(name, **kw):
@@ -580,6 +619,8 @@ def main():
     p.add_argument("--sweep", action="store_true")
     p.add_argument("--aug-sweep", action="store_true",
                    help="regularisation and representation-augmentation ladder")
+    p.add_argument("--ablation-sweep", action="store_true",
+                   help="head ablations and regularisation on one footing")
     p.add_argument("--seeds", type=int, default=5)
     p.add_argument("--device", default="auto", help="auto|cpu|cuda")
     p.add_argument("--only", default=None,
@@ -591,7 +632,8 @@ def main():
     seeds = tuple(range(a.seeds))
     rows = []
     want = set(a.only.split(",")) if a.only else None
-    pool = aug_configs() if a.aug_sweep else sweep_configs()
+    pool = (ablation_configs() if a.ablation_sweep
+            else aug_configs() if a.aug_sweep else sweep_configs())
     configs = [c for c in pool if want is None or c["name"] in want]
     if want and not configs:
         raise SystemExit(f"no config matched {sorted(want)}; "

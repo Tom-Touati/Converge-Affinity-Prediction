@@ -40,6 +40,20 @@ PROBES = {
     "full_heavy":  dict(noise_std=0.35, feat_drop=0.3, dropout=0.5, wd=1e-1, d=32),
     "lowlr":       dict(lr=5e-5),
     "huber_only":  dict(rank_w=0.0),
+
+    # Component ablations. Each removes one path into the head, so the question "which part
+    # is doing the memorising" gets an answer per part rather than in aggregate.
+    #   no_attn      drop the mutation-token cross-attention   -20,864 params
+    #   no_hadamard  drop the sequence-structure Hadamard      -12,416 params
+    #   no_scalars   stop feeding the forest's own 49 features -3,136 params, but it is the
+    #                only path that hands the net what the forest already models
+    "no_attn":      dict(mut_token=False),
+    "no_hadamard":  dict(pairs=()),
+    "no_scalars":   {"_no_scalars": True},
+    "only_scalars": dict(mut_token=False, pairs=()),   # floor: the head sees the 49 scalars only
+    "no_seq":       {"_no_seq": True},
+    "no_attn_noise": dict(mut_token=False, noise_std=0.2),
+    "no_scalars_noise": {"_no_scalars": True, "noise_std": 0.2},
 }
 OUT = pathlib.Path("reports/probe_earlyfit")
 
@@ -94,12 +108,23 @@ def main():
         raise SystemExit(f"unknown probe {a.config!r}; pick from {' '.join(PROBES)}")
 
     tr, va = build(a.fold, a.seed)
+    over = dict(PROBES[a.config])
+    if over.pop("_no_scalars", False):
+        # scalars enter the head by concatenation; _fit reads n_scalars off this tensor, so
+        # None is what removes the path rather than a flag.
+        tr, va = (t[:4] + (None,) + t[5:] for t in (tr, va))
+        tr, va = tuple(tr), tuple(va)
+    if over.pop("_no_seq", False):
+        # zero the sequence tokens rather than deleting the arm: seq_proj still exists, so the
+        # comparison isolates the information, not the parameter count.
+        tr = (np.zeros_like(tr[0]),) + tr[1:]
+        va = (np.zeros_like(va[0]),) + va[1:]
     # max_steps caps the epoch so `steps` is reached inside one pass; patience is disabled so
     # the probe always runs its full length rather than stopping early.
     cfg = dict(BASE, name=f"probe_{a.config}", rank_w=1.0, huber_w=1.0,
                epochs=a.epochs, patience=10 ** 6, max_steps=a.steps,
                eval_every=a.eval_every)
-    cfg.update(PROBES[a.config])
+    cfg.update(over)
     _, hist = _fit(tr, va, cfg, a.seed)
 
     h = pd.DataFrame(hist)

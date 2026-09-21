@@ -30,13 +30,26 @@
   .foot{color:var(--dim);font-size:12px;margin-top:12px}
   .err{color:var(--bad)}
   canvas{max-height:280px}
+  .tabs{display:flex;gap:8px;align-items:center;margin:0 0 14px}
+  .tab{background:var(--panel);color:var(--dim);border:1px solid var(--line);
+       border-radius:8px;padding:6px 12px;cursor:pointer;font:inherit;font-size:13px}
+  .tab.on{color:var(--fg);border-color:var(--accent)}
+  select{background:var(--panel);color:var(--fg);border:1px solid var(--line);
+         border-radius:8px;padding:6px 10px;font:inherit;font-size:13px;margin-left:auto}
+  .hide{display:none}
+  .note{color:var(--dim);font-size:12px;margin-top:8px}
 </style>
 </head>
 <body>
 <h1>Representation augmentation &amp; regularisation ladder</h1>
 <div class="sub" id="sub">waiting for first poll…</div>
+<div class="tabs">
+  <button class="tab on" data-view="train">Training</button>
+  <button class="tab" data-view="error">Error analysis</button>
+  <select id="runsel" title="which run to analyse"></select>
+</div>
 
-<div class="grid">
+<div class="grid" id="view-train">
   <div class="card wide">
     <h2>Configurations — click a row to plot its curves</h2>
     <table id="tbl"><thead><tr>
@@ -55,6 +68,57 @@
   <div class="card"><h2>Gap vs headline ρ</h2><canvas id="cScatter"></canvas></div>
   <div class="card"><h2>Validation ρ per epoch — <span id="selA">—</span></h2><canvas id="cVal"></canvas></div>
   <div class="card"><h2>Train (solid) vs validation (dashed) — <span id="selB">—</span></h2><canvas id="cTV"></canvas></div>
+</div>
+
+<div class="grid hide" id="view-error">
+  <div class="card wide">
+    <h2>Direction of effect — where a destabilising-heavy dataset hides failure</h2>
+    <table id="tDir"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
+      <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
+      <th>cluster ρ</th><th>rmse</th><th>bias</th>
+    </tr></thead><tbody></tbody></table>
+    <div class="note">Micro pools every row; macro averages per-complex Spearman. The threshold is 5 now,
+      not 10 — the old rule dropped 27 of 54 complexes and those carry the highest error. They disagree often, and where they do the micro number is usually
+      being carried by between-complex spread rather than within-complex ranking.</div>
+  </div>
+
+  <div class="card wide">
+    <h2>Structural-similarity tier (TM-score &gt; 0.8 vs that fold's training set)</h2>
+    <table id="tTier"><thead><tr><th>tier</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
+      <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
+      <th>cluster ρ</th><th>rmse</th><th>bias</th>
+    </tr></thead><tbody></tbody></table>
+    <div class="note" id="tierNote">easy = ≥50 structurally similar training measurements,
+      medium = 1–50, hard = 0. Antigen chains are aligned, not whole complexes: antibody
+      frameworks are near-identical across unrelated targets and would put almost every pair
+      above 0.8.</div>
+  </div>
+
+  <div class="card"><h2>Complex size vs error — each point is one complex</h2>
+    <canvas id="cSize"></canvas>
+    <div class="note">Area is the complex's label spread. A complex with a narrow ΔΔG range is
+      hard to rank however good the model is, so low ρ there is not the same failure as low ρ
+      on a wide-range complex.</div>
+  </div>
+  <div class="card"><h2>Complex size vs per-complex ρ</h2><canvas id="cSizeRho"></canvas></div>
+
+  <div class="card wide">
+    <h2>Per homology cluster — the actual independent unit</h2>
+    <table id="tClust"><thead><tr><th>cluster</th><th>rows</th><th>complexes</th>
+      <th>sd(true)</th><th>ρ</th><th>rmse</th></tr></thead><tbody></tbody></table>
+    <div class="note">54 complexes sit in 17 clusters, and one of them (1MLC_AB_E) holds 274 of
+      997 rows. Averaging per complex weights a ten-complex cluster ten times over a singleton
+      — the same imbalance the grouped split controls for in training, but nothing controlled
+      for in reporting.</div>
+  </div>
+
+  <div class="card wide">
+    <h2>Support and other thin slices</h2>
+    <table id="tSup"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
+      <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
+      <th>cluster ρ</th><th>rmse</th><th>bias</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
 </div>
 
 <script>
@@ -127,6 +191,85 @@ function draw(s){
     options:{plugins:{legend:{labels:{color:'#e6e8ee',boxWidth:10,filter:i=>i.text.endsWith('train')}}},
              scales:axes('epoch','ρ')}});
 }
+
+// ---------------------------------------------------------------- error analysis
+let ERR=null, RUN=null;
+const f3=(v)=>v===null||v===undefined?'—':(typeof v==='number'?v.toFixed(3):v);
+
+function fillTable(id, obj, order){
+  const tb=document.querySelector('#'+id+' tbody'); tb.innerHTML='';
+  if(!obj){ tb.innerHTML='<tr><td colspan="12" style="text-align:left;color:#98a0b3">not available</td></tr>'; return; }
+  const keys=order?order.filter(k=>k in obj):Object.keys(obj);
+  keys.forEach(k=>{
+    const b=obj[k], tr=document.createElement('tr');
+    tr.innerHTML=`<td>${k}</td><td>${b.n}</td><td>${b.n_complexes}</td>
+      <td>${b.n_counted}</td><td>${b.n_counted10}</td>
+      <td>${f3(b.sd_true)}</td><td>${f3(b.micro_rho)}</td>
+      <td><b>${f3(b.macro_rho)}</b></td><td>${f3(b.macro_rho10)}</td>
+      <td>${f3(b.cluster_rho)}</td><td>${f3(b.rmse)}</td><td>${f3(b.bias)}</td>`;
+    tb.appendChild(tr);
+  });
+}
+
+async function loadRuns(){
+  const runs=await (await fetch('/api/runs')).json();
+  const sel=document.getElementById('runsel');
+  sel.innerHTML='';
+  runs.forEach(r=>{ const o=document.createElement('option'); o.value=o.textContent=r; sel.appendChild(o); });
+  const pref=['ov_both_geom','rk_huber_only','aug_none'].find(r=>runs.includes(r));
+  sel.value=RUN=pref||runs[0];
+  sel.onchange=()=>{ RUN=sel.value; loadError(); };
+}
+
+async function loadError(){
+  if(!RUN) return;
+  ERR=await (await fetch('/api/error?run='+encodeURIComponent(RUN))).json();
+  if(ERR.error){ document.getElementById('tierNote').textContent=ERR.error; return; }
+  fillTable('tDir', ERR.direction, ['stabilising (<-0.5)','neutral (|ddG|<=0.5)','destabilising (>+0.5)']);
+  fillTable('tTier', ERR.tier, ['easy','medium','hard']);
+  fillTable('tSup', Object.assign({}, ERR.support, ERR.extra));
+  if(ERR.tier_note) document.getElementById('tierNote').textContent=ERR.tier_note;
+  else if(ERR.tier_counts) document.getElementById('tierNote').textContent +=
+      '  Complex-folds per tier: '+JSON.stringify(ERR.tier_counts);
+
+  const cl=ERR.per_cluster||[];
+  const ctb=document.querySelector('#tClust tbody'); ctb.innerHTML='';
+  cl.slice().sort((a,b)=>(a.rho??9)-(b.rho??9)).forEach(c=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${c.cluster}</td><td>${c.n}</td><td>${c.n_complexes}</td>
+      <td>${f3(c.sd_true)}</td><td><b>${f3(c.rho)}</b></td><td>${f3(c.rmse)}</td>`;
+    ctb.appendChild(tr);
+  });
+
+  const pc=ERR.per_complex||[];
+  const maxSd=Math.max(...pc.map(p=>p.sd_true||0),1);
+  mk('cSize',{type:'scatter',data:{datasets:[{label:'complex',
+      data:pc.map(p=>({x:p.n,y:p.rmse,cx:p.complex,sd:p.sd_true})),
+      pointRadius:pc.map(p=>4+10*(p.sd_true||0)/maxSd),
+      backgroundColor:'rgba(96,165,250,.6)'}]},
+    options:{plugins:{legend:{display:false},tooltip:{callbacks:{label:(c)=>
+        `${c.raw.cx}  n=${c.raw.x}  rmse=${c.raw.y.toFixed(2)}  sd=${(c.raw.sd||0).toFixed(2)}`}}},
+      scales:axes('mutations in complex','rmse (kcal/mol)')}});
+
+  const wr=pc.filter(p=>p.rho!==null);
+  mk('cSizeRho',{type:'scatter',data:{datasets:[{label:'complex (≥10 mutations)',
+      data:wr.map(p=>({x:p.n,y:p.rho,cx:p.complex})),pointRadius:6,
+      backgroundColor:'rgba(74,222,128,.7)'}]},
+    options:{plugins:{legend:{display:false},tooltip:{callbacks:{label:(c)=>
+        `${c.raw.cx}  n=${c.raw.x}  rho=${c.raw.y.toFixed(3)}`}}},
+      scales:axes('mutations in complex','per-complex ρ')}});
+}
+
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on');
+  const err=b.dataset.view==='error';
+  document.getElementById('view-train').classList.toggle('hide',err);
+  document.getElementById('view-error').classList.toggle('hide',!err);
+  if(err) loadError();
+});
+
+loadRuns().then(loadError);
 tick(); setInterval(tick,15000);
 </script>
 </body>

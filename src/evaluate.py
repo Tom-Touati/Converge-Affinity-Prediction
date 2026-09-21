@@ -69,12 +69,28 @@ def _safe_pearson(a, b) -> float:
         return float(stats.pearsonr(a, b)[0])
 
 
-def per_complex(preds: pd.DataFrame, min_group: int = 10) -> pd.DataFrame:
-    """Per-complex correlation table, sorted worst first. The error analysis starts here."""
+MIN_GROUP = 5
+"""Mutations a group needs before its correlation is counted.
+
+Was 10, which is the common choice in the SKEMPI literature and is defensible on its own --
+a Spearman over fewer points is extremely noisy. But on this dataset it discarded 27 of 54
+complexes and 109 rows from the headline, and those excluded complexes carry the *highest*
+error (rmse 2.27 for complexes with 1-5 mutations against 1.33 for 11-20). The metric was
+being computed on the easy half of the data by construction.
+
+Lowering it to 5 is not free: a 5-point Spearman takes only values in a coarse lattice and
+its sampling noise is large. Both thresholds are therefore reported -- `per_complex_spearman`
+at 5, and `per_complex_spearman_min10` at the old rule, so every earlier number in this repo
+stays comparable.
+"""
+
+
+def _grouped(preds: pd.DataFrame, key: str, min_group: int) -> pd.DataFrame:
+    """Correlation table over one grouping key, worst first."""
     rows = []
-    for cx, g in preds.groupby("complex"):
+    for name, g in preds.groupby(key):
         rows.append({
-            "complex": cx,
+            key: name,
             "n": len(g),
             "ddG_sd": g["y_true"].std(),
             "spearman": _safe_spearman(g["y_true"], g["y_pred"]),
@@ -86,7 +102,24 @@ def per_complex(preds: pd.DataFrame, min_group: int = 10) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def metrics(preds: pd.DataFrame, min_group: int = 10) -> dict:
+def per_complex(preds: pd.DataFrame, min_group: int = MIN_GROUP) -> pd.DataFrame:
+    """Per-complex correlation table, sorted worst first. The error analysis starts here."""
+    return _grouped(preds, "complex", min_group)
+
+
+def per_cluster(preds: pd.DataFrame, min_group: int = MIN_GROUP) -> pd.DataFrame:
+    """Per-homology-cluster correlation table.
+
+    The complex is not the independent unit -- 54 complexes sit in 17 clusters, and a cluster
+    can hold ten near-identical complexes. Averaging per complex therefore weights a
+    well-sampled cluster ten times over a singleton, which is the same imbalance the grouped
+    split exists to control for on the training side but nothing controlled for on the
+    reporting side.
+    """
+    return _grouped(preds, "cluster", min_group)
+
+
+def metrics(preds: pd.DataFrame, min_group: int = MIN_GROUP) -> dict:
     """Every headline number, from one predictions table."""
     missing = [c for c in REQUIRED if c not in preds.columns]
     if missing:
@@ -104,6 +137,7 @@ def metrics(preds: pd.DataFrame, min_group: int = 10) -> dict:
         "per_complex_spearman": float(kept["spearman"].mean()),
         "per_complex_pearson": float(kept["pearson"].mean()),
         "per_complex_spearman_all": float(pc["spearman"].mean(skipna=True)),
+        "min_group": int(min_group),
         # --- comparability with the SKEMPI literature -----------------------------------
         "global_spearman": _safe_spearman(y, p),
         "global_pearson": _safe_pearson(y, p),
@@ -111,6 +145,27 @@ def metrics(preds: pd.DataFrame, min_group: int = 10) -> dict:
         "rmse": float(np.sqrt(np.mean((y - p) ** 2))),
         "mae": float(np.mean(np.abs(y - p))),
     }
+
+    # --- the old threshold, kept so every number reported before this change stays readable
+    kept10 = pc[pc["n"] >= 10]
+    m["per_complex_spearman_min10"] = (float(kept10["spearman"].mean())
+                                       if len(kept10) else np.nan)
+    m["n_complexes_counted_min10"] = int(len(kept10))
+
+    # --- cluster as the unit, since complexes inside a cluster are not independent ---------
+    if "cluster" in preds.columns:
+        cl = per_cluster(preds, min_group)
+        keptc = cl[cl["counted"]]
+        m["n_clusters"] = int(preds["cluster"].nunique())
+        m["n_clusters_counted"] = int(len(keptc))
+        m["per_cluster_spearman"] = float(keptc["spearman"].mean()) if len(keptc) else np.nan
+        m["per_cluster_spearman_all"] = float(cl["spearman"].mean(skipna=True))
+        # Complexes averaged with each cluster weighted once, so a ten-complex cluster does not
+        # count ten times. This is the number least flattered by the dataset's imbalance.
+        byc = pc.merge(preds[["complex", "cluster"]].drop_duplicates(), on="complex", how="left")
+        byc = byc[byc["counted"]]
+        m["per_complex_spearman_cluster_weighted"] = (
+            float(byc.groupby("cluster")["spearman"].mean().mean()) if len(byc) else np.nan)
 
     # --- the classification framing ------------------------------------------------------
     m["macro_f1"] = float(f1_score(to_classes(y), to_classes(p), average="macro",

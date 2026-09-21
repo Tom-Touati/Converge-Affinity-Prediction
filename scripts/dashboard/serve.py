@@ -16,11 +16,15 @@ import io
 import json
 import pathlib
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import erroranalysis
+
 HERE = pathlib.Path(__file__).parent
+sys.path.insert(0, str(HERE))
 DATA = HERE / "_data"
 REMOTE = "/content/converge_bind/reports"
 POLL_SECONDS = 45
@@ -111,6 +115,20 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/state"):
             with LOCK:
                 body = json.dumps(STATE).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+        elif self.path.startswith("/api/runs"):
+            body = json.dumps(erroranalysis.available_runs()).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+        elif self.path.startswith("/api/error"):
+            run = self.path.split("run=", 1)[1].split("&")[0] if "run=" in self.path else ""
+            try:
+                body = json.dumps(erroranalysis.analyse(run)).encode()
+            except Exception as e:                    # a bad run name must not kill the server
+                body = json.dumps({"error": f"{type(e).__name__}: {e}"}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
