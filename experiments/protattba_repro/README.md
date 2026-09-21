@@ -60,6 +60,74 @@ Three things this buys:
 
 ---
 
+## What S1131 actually is, and why that matters for this project
+
+The model sees four sequences and a label per row, and nothing else. `utils/common.py` reads
+only `PDB, mutation, a, b, a_mut, b_mut, ddG`, and `get_s1131_data` hands the head
+`(a, b, a_mut, b_mut, ddG)`. Their code calls `a` the antibody stream and `b` the antigen
+stream, but they are just the two partner sides of a complex.
+
+Row 0, as the model receives it:
+
+| field | value |
+|---|---|
+| PDB / partners | 1A22, chains A_B |
+| mutation | `A:C171A` |
+| `a` / `a_mut` | 191 residues, differing at exactly one position (C→A at index 181) |
+| `b` / `b_mut` | 238 residues, byte-identical |
+| ddG | +1.010 kcal/mol |
+
+Shape of the set:
+
+| | |
+|---|---|
+| rows | 1131, every one a single-point mutation |
+| distinct complexes | 112 |
+| rows per complex | median 1, max 190 |
+| concentration | 3 complexes hold 45% of rows, top 10 hold 66% |
+| ddG | mean +1.24, sd 2.45; 842 destabilising, 275 stabilising, 14 exactly zero |
+
+**S1131 contains no antibody-antigen complexes.** SKEMPI 2.0 annotates complex class in
+`Hold_out_type`, and that is exactly the column `src/data.py` uses to build this project's
+dataset (`raw["Hold_out_type"].str.contains("AB/AG")`). Applied to S1131's 112 PDB ids:
+
+```
+Pr/PI     990 rows      protease / protease-inhibitor
+<blank>  1429 rows      unannotated (hormone-receptor, barnase-barstar, colicin-Im9, ...)
+AB/AG       0 rows
+```
+
+The three largest complexes are all protease-inhibitor systems: 3SGB (190 rows, protease B
+with turkey ovomucoid inhibitor), 1PPF (171, elastase with OMTKY3) and 1R0R (152, subtilisin
+Carlsberg with OMTKY3). The canonical antibody-lysozyme complexes 1DQJ and 1VFB *are* labelled
+AB/AG in SKEMPI and are **absent** from S1131. And there is **zero PDB overlap** between
+S1131's 112 complexes and this project's 53.
+
+So the paper's title is about antibody engineering, and their AB645/AB1101 sets are antibody
+data, but the S1131 row of Table 1 is measured on general protein-protein binding with the
+antibody cases removed. Reproducing it is still a valid check on their method and on this
+infrastructure, which is what it is used for here. It is **not** an antibody baseline, and its
+0.84 must not be quoted next to this project's numbers as though it were one.
+
+### The antibody sets are the ones worth having, and they overlap us heavily
+
+`AB645.csv` and `AB1101.csv` carry real antibody columns
+(`antibody_light_seq`, `antibody_heavy_seq`, `antigen_a_seq`, `antigen_b_seq`):
+
+| set | rows | complexes | complexes shared with our 53 | their rows from shared complexes | our rows from shared complexes |
+|---|---|---|---|---|---|
+| AB645 | 645 | 25 | 19 | 499 of 645 | 625 of 940 |
+| AB1101 | 1100 | 28 | 20 | 656 of 1100 | 636 of 940 |
+
+Two consequences, both for later rather than here:
+
+- These are the right sequence-only baseline for this project, not S1131.
+- Two thirds of our rows sit in complexes they also train on, so a published AB645/AB1101
+  number is **not** a clean external comparison for us, and any fusion that trains on them
+  must keep the frozen cluster split or it will leak.
+
+---
+
 ## Which ESM2 checkpoint
 
 The paper never says, and `model/readme.txt` only says to download weights from Hugging Face.
