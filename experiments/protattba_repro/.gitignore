@@ -16,3 +16,8 @@ results/**
 !results/.gitkeep
 !results/*_summary.csv
 !results/*_predictions.csv
+
+# Transient Colab run logs and the result tarballs pulled off the VM. The numbers that
+# matter are unpacked into results/ and the summaries there are versioned.
+colab_*.log
+results_colab_*.tgz
