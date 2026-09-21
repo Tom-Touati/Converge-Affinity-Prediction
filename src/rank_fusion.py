@@ -213,8 +213,42 @@ def _fit(tr, va, cfg, seed):
     yv, yt = y_va, y_tr
     span = yt.max() - yt.min()
     lo_ok, hi_ok = yt.min() - span, yt.max() + span
-    best, state, waited = -np.inf, None, 0
+    best, state, waited, gstep, stop = -np.inf, None, 0, 0, False
     n_rows = len(y_tr)
+    ev_every = cfg.get("eval_every") or 0     # 0 keeps the original once-per-epoch cadence
+
+    def check(ep, n_steps, ep_tot, ep_rank, ep_huber, seen):
+        """Validate, checkpoint, and decide whether patience is exhausted.
+
+        Hoisted out of the epoch loop so it can also run mid-epoch. With the step cap gone an
+        epoch is 135-205 steps, i.e. each row is seen 12-17 times before validation is looked
+        at even once -- so per-epoch early stopping cannot see, let alone act on, anything
+        that happens while the model is memorising.
+        """
+        nonlocal best, state, waited
+        net.eval()
+        with torch.no_grad():
+            pv = net(Sv, Gv, CHv, Cv, Xv).cpu().numpy()
+            pt = net(S, G, CH, C, X).cpu().numpy()
+        net.train()
+        v = evaluate._safe_spearman(yv, pv)
+        v = -np.inf if not np.isfinite(v) else v
+        clipped = cfg["huber_w"] > 0 and not (lo_ok <= pv.min() and pv.max() <= hi_ok)
+        if clipped:
+            v = -np.inf
+        hist.append({"epoch": ep, "step": gstep, "steps": n_steps,
+                     "loss": ep_tot / max(seen, 1),
+                     "rank_loss": ep_rank / max(seen, 1) if cfg["rank_w"] > 0 else np.nan,
+                     "huber_loss": ep_huber / max(seen, 1) if cfg["huber_w"] > 0 else np.nan,
+                     "val_rho": np.nan if not np.isfinite(v) else v,
+                     "val_rmse": float(np.sqrt(np.mean((pv - yv) ** 2))),
+                     "train_rho": evaluate._safe_spearman(yt, pt),
+                     "rejected": bool(clipped)})
+        if v > best + 1e-4:
+            best, state, waited = v, {k2: t.clone() for k2, t in net.state_dict().items()}, 0
+            return False
+        waited += 1
+        return waited >= cfg["patience"]
     rows_it = _row_batches(rng, n_rows, min(cfg["batch"], n_rows))
     hist = []
     for ep in range(cfg["epochs"]):
@@ -251,30 +285,17 @@ def _fit(tr, va, cfg, seed):
             nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             opt.step()
             ep_tot += float(loss)
+            gstep += 1
+            if ev_every and gstep % ev_every == 0:
+                if check(ep, n_steps, ep_tot, ep_rank, ep_huber, k + 1):
+                    stop = True
+                    break
 
-        net.eval()
-        with torch.no_grad():
-            pv = net(Sv, Gv, CHv, Cv, Xv).cpu().numpy()
-            pt = net(S, G, CH, C, X).cpu().numpy()
-        v = evaluate._safe_spearman(yv, pv)
-        v = -np.inf if not np.isfinite(v) else v
-        clipped = cfg["huber_w"] > 0 and not (lo_ok <= pv.min() and pv.max() <= hi_ok)
-        if clipped:
-            v = -np.inf
-        hist.append({"epoch": ep, "steps": n_steps,
-                     "loss": ep_tot / n_steps,
-                     "rank_loss": ep_rank / n_steps if cfg["rank_w"] > 0 else np.nan,
-                     "huber_loss": ep_huber / n_steps if cfg["huber_w"] > 0 else np.nan,
-                     "val_rho": np.nan if not np.isfinite(v) else v,
-                     "val_rmse": float(np.sqrt(np.mean((pv - yv) ** 2))),
-                     "train_rho": evaluate._safe_spearman(yt, pt),
-                     "rejected": bool(clipped)})
-        if v > best + 1e-4:
-            best, state, waited = v, {k2: t.clone() for k2, t in net.state_dict().items()}, 0
-        else:
-            waited += 1
-            if waited >= cfg["patience"]:
+        if not ev_every:
+            if check(ep, n_steps, ep_tot, ep_rank, ep_huber, n_steps):
                 break
+        elif stop:
+            break
     if state is not None:
         net.load_state_dict(state)
     return net.eval(), hist
@@ -454,7 +475,7 @@ def plot_history(hdf, name, out_png):
 BASE = dict(heads=4, dropout=0.2, lr=3e-4, wd=1e-2, epochs=200, batch=64, patience=20, d=64,
             mut_token=True, residual=True, pairs=("sg",), chem_token=False,
             rank_w=1.0, huber_w=1.0, margin=0.5, weighted=False, max_steps=None,
-            noise_std=0.0, feat_drop=0.0, device="auto")
+            noise_std=0.0, feat_drop=0.0, eval_every=0, device="auto")
 
 
 def aug_configs():
@@ -480,7 +501,13 @@ def aug_configs():
     """
     C = []
     def add(name, **kw):
-        cfg = dict(BASE, name=name, rank_w=1.0, huber_w=1.0)
+        # eval_every=10 is the substantive change, not a knob. With the step cap gone an epoch
+        # is 135-205 steps, and a step-level trace shows validation peaking around step 40 and
+        # decaying after. Per-epoch early stopping never evaluated before step 146, so it could
+        # not checkpoint the peak: it was keeping a memorised model at val rho ~0.25 when ~0.48
+        # was on the table. Every rung below is measured with that fixed, or the ladder would
+        # only be comparing which regulariser best survives a broken checkpoint policy.
+        cfg = dict(BASE, name=name, rank_w=1.0, huber_w=1.0, eval_every=10, patience=25)
         cfg.update(kw)
         C.append(cfg)
 
@@ -493,6 +520,9 @@ def aug_configs():
     add("reg_small",    d=32)
     add("full_light",   noise_std=0.15, feat_drop=0.15, dropout=0.35, wd=3e-2, d=48)
     add("full_heavy",   noise_std=0.35, feat_drop=0.3,  dropout=0.5,  wd=1e-1, d=32)
+    # The control for the control: per-epoch stopping, so the size of the checkpoint-policy
+    # effect is measured here rather than asserted.
+    add("epoch_stop",   eval_every=0, patience=20)
     return C
 
 
