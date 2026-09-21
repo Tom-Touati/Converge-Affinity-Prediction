@@ -76,6 +76,78 @@ def build_pairs(y: np.ndarray, groups: np.ndarray, margin: float = 0.5):
     return np.concatenate(I), np.concatenate(J)
 
 
+def _split_held(held, clusters, cx, rng):
+    """Halve the held-out fold: one half supervises early stopping, the other is scored.
+
+    Prefers a CLUSTER-disjoint halving so the half used for checkpoint selection contains no
+    homologue of the half being scored. That is not always possible: fold 0 of this dataset is
+    a *single* cluster (1MLC_AB_E, 274 rows, 14 complexes, 27% of all data), so there is no
+    cluster boundary to cut along and the split falls back to complexes. Where that happens
+    the two halves are homologous by construction and early stopping is choosing a checkpoint
+    against near-copies of the rows it will be scored on, which flatters that fold. ``how``
+    records which case applied so the write-up can say so per fold rather than in general.
+    """
+    fc = pd.unique(clusters[held])
+    if len(fc) > 1:
+        vc = _half_complexes(held, clusters, fc, cx, rng)
+        va = held & np.isin(clusters, list(vc))
+        if va.any() and (held & ~va).any():
+            return va, held & ~va, "cluster"
+    fx = pd.unique(cx[held])
+    pick = set(rng.permutation(fx)[:max(1, len(fx) // 2)])
+    va = held & np.isin(cx, list(pick))
+    if not va.any() or not (held & ~va).any():      # degenerate fold, keep it whole
+        return held, held, "degenerate"
+    return va, held & ~va, "complex"
+
+
+def _half_complexes(tr_all, clusters, tc, cx, rng):
+    """Pick whole clusters until validation holds about half the held-in COMPLEXES.
+
+    Taking half the *clusters* is not the same thing and was badly behaved: clusters are very
+    unequal, so a 50% cluster split put 473 validation rows against 250 training rows in fold 0
+    -- validation larger than the training set it was meant to supervise. Accumulating whole
+    clusters until the complex count crosses half gives what was actually asked for while
+    keeping the cluster as the indivisible unit, so homologues never straddle the boundary.
+
+    At least three clusters go to validation, and at least one is always left for training.
+    """
+    count = lambda v: len(np.unique(cx[tr_all & np.isin(clusters, list(v))])) if v else 0
+    target = len(np.unique(cx[tr_all])) / 2
+    vc, order = set(), list(rng.permutation(tc))
+    for c in order:
+        if len(vc) >= len(tc) - 1 or (len(vc) >= 3 and count(vc) >= target):
+            break
+        vc.add(c)
+        last = c
+    # A single cluster can hold many complexes, so the crossing step can overshoot badly --
+    # fold 3 once landed on 26 validation complexes against 6 for training. Undo the last
+    # addition when doing so lands nearer the target and still leaves three clusters.
+    if len(vc) > 3:
+        without = vc - {last}
+        if abs(count(without) - target) < abs(count(vc) - target):
+            vc = without
+    return vc
+
+
+def _row_batches(rng, n_rows, batch):
+    """Yield row batches by cycling a fresh permutation, so every row is used equally often.
+
+    The previous version called ``rng.choice(n_rows, batch, replace=False)`` independently at
+    every step, so ``replace=False`` only held *within* a batch and rows had no epoch structure
+    at all. Measured over one epoch at 40 steps: rows were visited between 0 and 14 times, and
+    in fold 3, 23 of 681 rows were never seen. Cycling a permutation bounds the spread to one
+    visit between the most- and least-seen row.
+    """
+    order = rng.permutation(n_rows)
+    pos = 0
+    while True:
+        if pos + batch > len(order):
+            order, pos = rng.permutation(n_rows), 0
+        yield order[pos:pos + batch]
+        pos += batch
+
+
 def _fit(tr, va, cfg, seed):
     s_tr, g_tr, ch_tr, c_tr, x_tr, y_tr, grp_tr = tr
     s_va, g_va, ch_va, c_va, x_va, y_va, _ = va
@@ -111,14 +183,20 @@ def _fit(tr, va, cfg, seed):
     lo_ok, hi_ok = yt.min() - span, yt.max() + span
     best, state, waited = -np.inf, None, 0
     n_rows = len(y_tr)
-    for _ in range(cfg["epochs"]):
+    rows_it = _row_batches(rng, n_rows, min(cfg["batch"], n_rows))
+    hist = []
+    for ep in range(cfg["epochs"]):
         net.train()
         order = rng.permutation(len(I)) if len(I) else np.zeros(0, int)
-        # Cap the steps per epoch. Every pair step costs two forward passes (both halves), so
-        # walking all ~11,000 pairs is about 28x the compute of row batching and made the first
-        # run intractable. A fresh random subset each epoch still covers the pair space across
-        # training while keeping an epoch comparable in cost to the regression baseline.
-        n_steps = max(1, min(cfg["max_steps"], len(order) // cfg["batch"]))
+        # An epoch now means an epoch. ``max_steps`` was previously a hard default of 40, which
+        # bound in every fold and silently discarded 3,856-9,906 of the pairs each pass (only
+        # 20-40% were ever used). It is now an opt-in cap for a slow machine; left unset, the
+        # loop walks every full batch. When there is no ranking term the pair pool is irrelevant
+        # and the epoch is sized by rows instead.
+        n_full = (len(order) // cfg["batch"] if (cfg["rank_w"] > 0 and len(order))
+                  else max(1, n_rows // cfg["batch"]))
+        n_steps = max(1, min(cfg["max_steps"] or n_full, n_full))
+        ep_rank, ep_huber, ep_tot = 0.0, 0.0, 0.0
         for k in range(n_steps):
             sel = order[k * cfg["batch"]:(k + 1) * cfg["batch"]]
             opt.zero_grad()
@@ -131,21 +209,34 @@ def _fit(tr, va, cfg, seed):
                 w = dy.abs() if cfg["weighted"] else torch.ones_like(dy)
                 r = (w * nn.functional.softplus(-torch.sign(dy) * (fi - fj))).sum() / w.sum()
                 loss = loss + cfg["rank_w"] * r
+                ep_rank += float(r)
             if cfg["huber_w"] > 0:
-                ridx = torch.as_tensor(rng.choice(n_rows, min(cfg["batch"], n_rows),
-                                                  replace=False), device=dev)
-                loss = loss + cfg["huber_w"] * huber(fwd(ridx), Y[ridx])
+                ridx = torch.as_tensor(next(rows_it), device=dev)
+                h = huber(fwd(ridx), Y[ridx])
+                loss = loss + cfg["huber_w"] * h
+                ep_huber += float(h)
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             opt.step()
+            ep_tot += float(loss)
 
         net.eval()
         with torch.no_grad():
             pv = net(Sv, Gv, CHv, Cv, Xv).cpu().numpy()
+            pt = net(S, G, CH, C, X).cpu().numpy()
         v = evaluate._safe_spearman(yv, pv)
         v = -np.inf if not np.isfinite(v) else v
-        if cfg["huber_w"] > 0 and not (lo_ok <= pv.min() and pv.max() <= hi_ok):
+        clipped = cfg["huber_w"] > 0 and not (lo_ok <= pv.min() and pv.max() <= hi_ok)
+        if clipped:
             v = -np.inf
+        hist.append({"epoch": ep, "steps": n_steps,
+                     "loss": ep_tot / n_steps,
+                     "rank_loss": ep_rank / n_steps if cfg["rank_w"] > 0 else np.nan,
+                     "huber_loss": ep_huber / n_steps if cfg["huber_w"] > 0 else np.nan,
+                     "val_rho": np.nan if not np.isfinite(v) else v,
+                     "val_rmse": float(np.sqrt(np.mean((pv - yv) ** 2))),
+                     "train_rho": evaluate._safe_spearman(yt, pt),
+                     "rejected": bool(clipped)})
         if v > best + 1e-4:
             best, state, waited = v, {k2: t.clone() for k2, t in net.state_dict().items()}, 0
         else:
@@ -154,7 +245,7 @@ def _fit(tr, va, cfg, seed):
                 break
     if state is not None:
         net.load_state_dict(state)
-    return net.eval()
+    return net.eval(), hist
 
 
 def run(cfg, seeds=(0, 1, 2, 3, 4)):
@@ -165,31 +256,38 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
     y = d.ddG.to_numpy(np.float32)
     folds, clusters = d.fold.to_numpy(), d.cluster.to_numpy()
     groups = pd.factorize(d["#Pdb"])[0]
+    cx = d["#Pdb"].to_numpy()
 
     blocks = ["chem", "geom", "geomrev", "mpnn"]
     Xs = np.nan_to_num(train.build_matrix(d, blocks).to_numpy(np.float32))
     chem = np.nan_to_num(train.build_matrix(d, ["chem"]).to_numpy(np.float32))
 
-    oofs = []
+    oofs, history, splitlog = [], [], []
     for seed in seeds:
         oof = np.full(len(d), np.nan, np.float32)
         for f in np.unique(folds):
-            te = folds == f
-            tr_all = ~te
-            tc = pd.unique(clusters[tr_all])
+            held = folds == f
+            tr = ~held                     # the whole of the other folds now trains
+            # Validation is half the complexes of the HELD-OUT fold, and the other half is
+            # what gets scored. Training therefore keeps all k-1 folds instead of surrendering
+            # 20-67% of its rows, which is what the previous inner split cost it.
             rng = np.random.default_rng(seed)
-            vc = set(rng.choice(tc, min(max(3, len(tc) // 3), len(tc) - 1), replace=False))
-            va = tr_all & np.isin(clusters, list(vc))
-            tr = tr_all & ~va
+            va, te, how = _split_held(held, clusters, cx, rng)
+            splitlog.append({"seed": seed, "fold": int(f), "how": how,
+                             "val_rows": int(va.sum()), "test_rows": int(te.sum()),
+                             "val_cx": int(len(np.unique(cx[va]))),
+                             "test_cx": int(len(np.unique(cx[te]))),
+                             "train_rows": int(tr.sum())})
 
             target, base_te = y.copy(), None
             if cfg["residual"]:
-                idx_tr = np.where(tr_all)[0]
-                inner = _inner_forest_residuals(Xs, y, idx_tr, clusters, seed)
-                est = MODELS["rf"](seed).fit(Xs[tr_all], y[tr_all])
+                inner = _inner_forest_residuals(Xs, y, np.where(tr)[0], clusters, seed)
+                est = MODELS["rf"](seed).fit(Xs[tr], y[tr])
                 base_te = est.predict(Xs[te])
                 target[tr] = y[tr] - inner[tr]
-                target[va] = y[va] - inner[va]
+                # Validation now sits outside the training pool, so its forest baseline has to
+                # come from the outer forest rather than the inner out-of-fold residuals.
+                target[va] = y[va] - est.predict(Xs[va])
 
             s3, g3 = _standardise(seq[tr], seq[va], seq[te]), _standardise(st[tr], st[va], st[te])
             mu, sd = chem[tr].mean(0), chem[tr].std(0) + 1e-6
@@ -197,9 +295,14 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
             mu2, sd2 = Xs[tr].mean(0), Xs[tr].std(0) + 1e-6
             sc = [np.clip((Xs[m] - mu2) / sd2, -CLIP, CLIP) for m in (tr, va, te)]
 
-            net = _fit((s3[0], g3[0], ch3[0], cats[tr], sc[0], target[tr], groups[tr]),
-                       (s3[1], g3[1], ch3[1], cats[va], sc[1], target[va], groups[va]),
-                       cfg, seed)
+            net, hist = _fit((s3[0], g3[0], ch3[0], cats[tr], sc[0], target[tr], groups[tr]),
+                             (s3[1], g3[1], ch3[1], cats[va], sc[1], target[va], groups[va]),
+                             cfg, seed)
+            for h in hist:
+                h.update(seed=seed, fold=int(f), n_train=int(tr.sum()), n_val=int(va.sum()),
+                         val_complexes=int(d.loc[va, "#Pdb"].nunique()),
+                         train_complexes=int(d.loc[tr, "#Pdb"].nunique()))
+            history.extend(hist)
             with torch.no_grad():
                 dev = next(net.parameters()).device
                 T = lambda a, dt=torch.float32: torch.as_tensor(a, dtype=dt, device=dev)
@@ -208,13 +311,34 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
             oof[te] = p + base_te if base_te is not None else p
         oofs.append(oof)
 
+    # Each seed scores only the half of the fold it did not validate on, so a row is predicted
+    # by some seeds and not others -- nanmean, not mean, or every row a single seed skipped
+    # would poison the whole column. Rows no seed ever scored are dropped and counted, because
+    # a silently shrinking denominator is exactly how a metric stops being comparable.
+    stack = np.vstack(oofs)
+    seen = np.sum(~np.isnan(stack), axis=0)
+    pred = np.full(stack.shape[1], np.nan)
+    if (seen > 0).any():                      # nanmean warns on all-NaN columns; skip them
+        pred[seen > 0] = np.nanmean(stack[:, seen > 0], axis=0)
     ens = pd.DataFrame({"row_id": d.row_id, "complex": d["#Pdb"], "cluster": d.cluster,
                         "fold": d.fold, "y_true": y.astype(float),
-                        "y_pred": np.mean(oofs, axis=0)})
+                        "y_pred": pred, "n_seeds_scored": seen})
+    dropped = int((seen == 0).sum())
+    ens = ens[seen > 0].reset_index(drop=True)
+    print(f"    scored {len(ens)}/{len(d)} rows "
+          f"({dropped} never in a test half), median "
+          f"{int(np.median(seen[seen > 0])) if (seen > 0).any() else 0} seeds per scored row",
+          flush=True)
     m = evaluate.metrics(ens, 10)
+    m["n_scored"] = len(ens)
+    m["n_dropped"] = dropped
     out_dir = paths.REPORTS / cfg["name"]
     out_dir.mkdir(parents=True, exist_ok=True)
     ens.to_csv(out_dir / "predictions.csv", index=False)
+    hdf = pd.DataFrame(history)
+    hdf.to_csv(out_dir / "history.csv", index=False)
+    plot_history(hdf, cfg["name"], out_dir / "losses.png")
+    pd.DataFrame(splitlog).to_csv(out_dir / "splits.csv", index=False)
     (out_dir / "metrics.json").write_text(json.dumps({"metrics": m, "ci": {}}, indent=2, default=float))
     (out_dir / "run.json").write_text(json.dumps({"name": cfg["name"], "model": "rank_fusion",
                                                   "config": cfg}, indent=2))
@@ -224,9 +348,68 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
             "global_rho": round(m["global_spearman"], 3), "rmse": round(m["rmse"], 3)}
 
 
+def plot_history(hdf, name, out_png):
+    """Four panels of what training actually did, per fold, averaged over seeds.
+
+    Curves are ragged: early stopping fires at a different epoch in every (seed, fold), so
+    each line is drawn only as far as that fold's shortest-surviving seed, and the epoch each
+    fold's checkpoint was taken from is marked. Without the marks the loss curves are easy to
+    over-read -- the model returned is the argmax of panel 3, not the end of panel 1.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if hdf.empty:
+        return
+    folds = sorted(hdf.fold.unique())
+    cmap = plt.get_cmap("tab10")
+    fig, ax = plt.subplots(2, 2, figsize=(13, 8))
+    (a0, a1), (a2, a3) = ax
+
+    for i, f in enumerate(folds):
+        g = hdf[hdf.fold == f].groupby("epoch")
+        c = cmap(i)
+        m = g.mean(numeric_only=True)
+        a0.plot(m.index, m["loss"], color=c, label=f"fold {f}")
+        if m["rank_loss"].notna().any():
+            a1.plot(m.index, m["rank_loss"], color=c, ls="-", label=f"fold {f} rank")
+        if m["huber_loss"].notna().any():
+            a1.plot(m.index, m["huber_loss"], color=c, ls=":", label=f"fold {f} huber")
+        a2.plot(m.index, m["val_rho"], color=c, label=f"fold {f}")
+        a3.plot(m.index, m["train_rho"], color=c, ls="-")
+        a3.plot(m.index, m["val_rho"], color=c, ls="--")
+        if m["val_rho"].notna().any():
+            best_ep = m["val_rho"].idxmax()
+            a2.axvline(best_ep, color=c, ls=":", alpha=0.5)
+            a2.plot([best_ep], [m["val_rho"].max()], "o", color=c, ms=6)
+
+    a0.set_title("training loss (total)")
+    a1.set_title("loss components -- solid rank, dotted Huber")
+    a2.set_title("validation Spearman (dot = checkpoint taken)")
+    a3.set_title("train (solid) vs validation (dashed) Spearman")
+    for a in (a0, a1, a2, a3):
+        a.set_xlabel("epoch")
+        a.grid(alpha=0.3)
+    a0.set_ylabel("loss")
+    a1.set_ylabel("loss")
+    a2.set_ylabel("rho")
+    a3.set_ylabel("rho")
+    a0.legend(fontsize=8)
+    a2.legend(fontsize=8)
+
+    nv = hdf.groupby("fold")[["n_train", "n_val", "val_complexes", "train_complexes"]].first()
+    sub = "  |  ".join(f"fold {f}: train {r.n_train}r/{r.train_complexes}cx, "
+                       f"val {r.n_val}r/{r.val_complexes}cx" for f, r in nv.iterrows())
+    fig.suptitle(name + "\n" + sub, fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.savefig(out_png, dpi=130)
+    plt.close(fig)
+
+
 BASE = dict(heads=4, dropout=0.2, lr=3e-4, wd=1e-2, epochs=200, batch=64, patience=20, d=64,
             mut_token=True, residual=True, pairs=("sg",), chem_token=False,
-            rank_w=1.0, huber_w=1.0, margin=0.5, weighted=False, max_steps=40,
+            rank_w=1.0, huber_w=1.0, margin=0.5, weighted=False, max_steps=None,
             device="auto")
 
 

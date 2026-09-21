@@ -10,6 +10,9 @@
 # On a host that already has a working CUDA torch outside a venv (Colab, some images):
 #   VENV_ARGS=--system-site-packages bash scripts/setup_remote.sh --big
 # Otherwise the fresh venv cannot see it and a CPU wheel gets installed over it.
+# Pair it with REQ_FILE to drop the torch pin so the existing build survives:
+#   grep -v '^torch==' requirements.txt > /tmp/req.txt
+#   REQ_FILE=/tmp/req.txt VENV_ARGS=--system-site-packages bash scripts/setup_remote.sh --big
 #
 # The two data files are NOT in git (they are large and SKEMPI asks you to register). Either
 # download them from https://life.bsc.es/pid/skempi2/ into data/, or copy them from a machine
@@ -34,7 +37,10 @@ PY=.venv/bin/python
 [[ -x "$PY" ]] || PY=.venv/Scripts/python.exe        # windows layout, just in case
 
 $PY -m pip install --quiet --upgrade pip
-$PY -m pip install --quiet -r requirements.txt
+# REQ_FILE lets a caller substitute a filtered requirements file. On hosts that already
+# ship a CUDA torch (Colab), the torch==2.4.1 pin -- a Windows-only MSVC constraint --
+# has to be stripped or pip replaces the good build with an older one.
+$PY -m pip install --quiet -r "${REQ_FILE:-requirements.txt}"
 
 # The torch pin in requirements.txt exists only for this project's Windows development box
 # (MSVC runtime 14.28). On a GPU machine take a current CUDA wheel instead.
