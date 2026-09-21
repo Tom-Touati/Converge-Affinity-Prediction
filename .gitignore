@@ -42,3 +42,7 @@ Converge Bio - Machine Learning Researcher - Home Assignment - External.pdf
 
 # live dashboard pulls these off a running VM; transient
 scripts/dashboard/_data/
+
+# GPU run artefacts: 20 MB tarballs pulled off the VM, and their extractions.
+# The runs that matter are unpacked into reports/ and tracked there.
+reports_colab/
