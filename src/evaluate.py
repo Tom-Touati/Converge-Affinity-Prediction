@@ -309,9 +309,16 @@ def paired_bootstrap(a: pd.DataFrame, b: pd.DataFrame, metric: str = "per_comple
 def format_report(m: dict, ci: dict | None = None, title: str = "") -> str:
     ci = ci or {}
     lines = [f"== {title} ==" if title else "== results =="]
+    # The threshold is read from the metrics rather than hardcoded. It said "n>=10" for a
+    # while after the default moved to 5, which is exactly the kind of stale label that makes
+    # two different metrics look like one.
+    mg = m.get("min_group", MIN_GROUP)
     order = [
-        ("per_complex_spearman", "per-complex Spearman (n>=10)  HEADLINE"),
+        ("per_complex_spearman", f"per-complex Spearman (n>={mg})  HEADLINE"),
+        ("per_complex_spearman_min10", "per-complex Spearman (n>=10)"),
         ("per_complex_spearman_all", "per-complex Spearman (all)"),
+        ("per_cluster_spearman", f"per-cluster Spearman (n>={mg})"),
+        ("concordance_micro_m05", "pairwise concordance (margin 0.5)"),
         ("per_complex_pearson", "per-complex Pearson"),
         ("global_spearman", "global Spearman"),
         ("global_pearson", "global Pearson"),

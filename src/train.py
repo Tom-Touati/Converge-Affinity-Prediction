@@ -86,11 +86,12 @@ def _git_sha() -> str:
         return "uncommitted"
 
 
-def run(model: str, features: list, name: str, seed: int = 0, min_group: int = 10,
-        n_boot: int = 1000, verbose: bool = True, center: bool = False,
-        augment: bool = False) -> pd.DataFrame:
+def run(model: str, features: list, name: str, seed: int = 0,
+        min_group: int = evaluate.MIN_GROUP, n_boot: int = 1000, verbose: bool = True,
+        center: bool = False, augment: bool = False,
+        grouping: str = "cluster") -> pd.DataFrame:
     t0 = time.perf_counter()
-    df = splits.load()
+    df = splits.load(grouping)
     X = build_matrix(df, features)
     y = df["ddG"].to_numpy(float)
     complexes = df["#Pdb"].to_numpy()
@@ -152,6 +153,7 @@ def run(model: str, features: list, name: str, seed: int = 0, min_group: int = 1
     (d / "run.json").write_text(json.dumps({
         "name": name, "model": model, "features": features, "seed": seed,
         "min_group": min_group, "n_boot": n_boot, "center": center, "augment": augment,
+        "grouping": grouping,
         "estimator_params": est_params,
         "n_folds": int(df["fold"].nunique()),
         "n_rows": len(df), "n_features": X.shape[1], "git_sha": _git_sha(),
@@ -178,7 +180,10 @@ def main() -> None:
     p.add_argument("--features", default="chem", help="comma-separated feature blocks")
     p.add_argument("--name", default=None, help="report directory name")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--min-group", type=int, default=10)
+    p.add_argument("--min-group", type=int, default=evaluate.MIN_GROUP)
+    p.add_argument("--grouping", default="cluster", choices=splits.GROUPINGS,
+                   help="which split to evaluate on; `complex` is the looser, "
+                        "literature-comparable one and is NOT the reported result")
     p.add_argument("--n-boot", type=int, default=1000)
     p.add_argument("--center", action="store_true",
                    help="train on the within-complex deviation instead of the raw ddG")
@@ -187,7 +192,7 @@ def main() -> None:
     a = p.parse_args()
     feats = [f.strip() for f in a.features.split(",") if f.strip()]
     run(a.model, feats, a.name or f"{a.model}_{'+'.join(feats)}", a.seed, a.min_group,
-        a.n_boot, center=a.center, augment=a.augment)
+        a.n_boot, center=a.center, augment=a.augment, grouping=a.grouping)
 
 
 if __name__ == "__main__":

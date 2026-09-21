@@ -333,7 +333,7 @@ def _fit(tr, va, cfg, seed):
 
 
 def run(cfg, seeds=(0, 1, 2, 3, 4)):
-    d = splits.load()
+    d = splits.load(cfg.get("grouping", "cluster"))
     seq = _tokens(SEQ_CACHE, SEQ_BLOCKS, d.row_id)
     st = _tokens(STRUCT_CACHE, STRUCT_BLOCKS, d.row_id)
     cats = categoricals(d)
@@ -439,7 +439,13 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
     # difference. Carrying the matched number in the same row of the table makes that mistake
     # hard to repeat.
     rf_m = {}
-    rf_path = paths.REPORTS / "ov_both_geom" / "predictions.csv"
+    # The forest baseline has to come from the SAME split. Comparing a net trained on the
+    # complex-level split against a forest scored on the cluster-level one would be comparing
+    # two different problems -- under `complex`, 42 of 54 complexes gain a TM>0.8 twin in
+    # training, so it is a materially easier task.
+    rf_run = cfg.get("rf_baseline") or ("ov_both_geom" if cfg.get("grouping", "cluster") ==
+                                        "cluster" else f"rf_{cfg['grouping']}")
+    rf_path = paths.REPORTS / rf_run / "predictions.csv"
     if rf_path.exists():
         rf = pd.read_csv(rf_path)
         rf = rf[rf.row_id.isin(ens.row_id)]
@@ -547,7 +553,8 @@ def plot_history(hdf, name, out_png):
 BASE = dict(heads=4, dropout=0.2, lr=3e-4, wd=1e-2, epochs=200, batch=64, patience=20, d=64,
             mut_token=True, residual=False, pairs=("sg",), chem_token=False,
             rank_w=1.0, huber_w=1.0, margin=0.5, weighted=False, max_steps=None,
-            noise_std=0.0, feat_drop=0.0, eval_every=0, use_scalars=True, device="auto")
+            noise_std=0.0, feat_drop=0.0, eval_every=0, use_scalars=True,
+            grouping="cluster", device="auto")
 
 
 def aug_configs():
@@ -694,6 +701,9 @@ def main():
                    help="head ablations and regularisation on one footing")
     p.add_argument("--direct-sweep", action="store_true",
                    help="no residual learning: the net predicts ddG itself")
+    p.add_argument("--grouping", default="cluster",
+                   help="cluster (default, reported) | complex (looser, comparable to the "
+                        "SKEMPI literature) | random")
     p.add_argument("--seeds", type=int, default=5)
     p.add_argument("--device", default="auto", help="auto|cpu|cuda")
     p.add_argument("--only", default=None,
@@ -713,7 +723,9 @@ def main():
         raise SystemExit(f"no config matched {sorted(want)}; "
                          f"available: {[c['name'] for c in pool]}")
     for cfg in configs:
-        cfg = dict(cfg, device=a.device)
+        cfg = dict(cfg, device=a.device, grouping=a.grouping)
+        if a.grouping != "cluster":
+            cfg["name"] = f"{cfg['name']}_{a.grouping}"
         if a.max_steps:
             cfg["max_steps"] = a.max_steps
         t0 = time.perf_counter()

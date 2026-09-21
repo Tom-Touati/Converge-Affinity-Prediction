@@ -46,6 +46,7 @@
 <div class="tabs">
   <button class="tab on" data-view="train">Training</button>
   <button class="tab" data-view="error">Error analysis</button>
+  <button class="tab" data-view="runs">Runs</button>
   <select id="runsel" title="which run to analyse"></select>
 </div>
 
@@ -66,8 +67,32 @@
 
   <div class="card"><h2>Generalisation gap by config</h2><canvas id="cGap"></canvas></div>
   <div class="card"><h2>Gap vs headline ρ</h2><canvas id="cScatter"></canvas></div>
-  <div class="card"><h2>Validation ρ per epoch — <span id="selA">—</span></h2><canvas id="cVal"></canvas></div>
+  <div class="card"><h2>Validation ρ — <span id="selA">—</span></h2><canvas id="cVal"></canvas>
+    <div class="note">Read the units before comparing runs. A run trained with residual
+      learning is scored here against <i>ΔΔG minus the forest's prediction</i>, and one without
+      is scored against ΔΔG itself — the same axis, two different targets. The residual runs
+      sit near 0.2 and the direct ones near 0.4 largely for that reason. Check the
+      <b>resid</b> column on the Runs tab.</div></div>
   <div class="card"><h2>Train (solid) vs validation (dashed) — <span id="selB">—</span></h2><canvas id="cTV"></canvas></div>
+</div>
+
+<div class="grid hide" id="view-runs">
+  <div class="card wide">
+    <h2>All runs — newest first. Click a row to analyse it.</h2>
+    <input id="runfilter" placeholder="filter by name…"
+           style="width:100%;margin-bottom:10px;background:var(--bg);color:var(--fg);
+                  border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit">
+    <table id="tRuns"><thead><tr>
+      <th>run</th><th>when</th><th>model</th><th>resid</th><th>rows</th><th>min_grp</th>
+      <th>macro ρ</th><th>macro ρ<br>(≥10)</th><th>global ρ</th><th>conc</th><th>rmse</th>
+    </tr></thead><tbody></tbody></table>
+    <div class="note"><b>LIVE</b> marks a configuration in the sweep running right now.
+      <b>resid</b> is whether the run used residual learning — those numbers include a random
+      forest added back at inference and are not comparable with the rest.
+      <b>min_grp</b> is the mutation threshold the stored headline used: runs written before it
+      moved from 10 to 5 have their macro ρ computed at 10, so that column mixes two
+      definitions unless you read this one alongside it.</div>
+  </div>
 </div>
 
 <div class="grid hide" id="view-error">
@@ -75,7 +100,8 @@
     <h2>Direction of effect — where a destabilising-heavy dataset hides failure</h2>
     <table id="tDir"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
       <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
-      <th>cluster ρ</th><th>rmse</th><th>bias</th>
+      <th>cluster ρ</th><th>rmse</th><th>mae</th><th>med|err|</th>
+      <th>rmse/sd</th><th>bias</th>
     </tr></thead><tbody></tbody></table>
     <div class="note">Micro pools every row; macro averages per-complex Spearman. The threshold is 5 now,
       not 10 — the old rule dropped 27 of 54 complexes and those carry the highest error. They disagree often, and where they do the micro number is usually
@@ -86,7 +112,8 @@
     <h2>Structural-similarity tier (TM-score &gt; 0.8 vs that fold's training set)</h2>
     <table id="tTier"><thead><tr><th>tier</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
       <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
-      <th>cluster ρ</th><th>rmse</th><th>bias</th>
+      <th>cluster ρ</th><th>rmse</th><th>mae</th><th>med|err|</th>
+      <th>rmse/sd</th><th>bias</th>
     </tr></thead><tbody></tbody></table>
     <div class="note" id="tierNote">easy = ≥50 structurally similar training measurements,
       medium = 1–50, hard = 0. Antigen chains are aligned, not whole complexes: antibody
@@ -106,7 +133,8 @@
     <h2>Single-point vs multi-point</h2>
     <table id="tMult"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
       <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
-      <th>cluster ρ</th><th>rmse</th><th>bias</th>
+      <th>cluster ρ</th><th>rmse</th><th>mae</th><th>med|err|</th>
+      <th>rmse/sd</th><th>bias</th>
     </tr></thead><tbody></tbody></table>
     <div class="note">ΔΔG for a multi-point mutant is only additive when the sites do not
       interact, and the label spread is much wider (sd 2.25 against 1.61), so a good micro
@@ -118,7 +146,8 @@
     <h2>Which side carries the mutation</h2>
     <table id="tSide"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
       <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
-      <th>cluster ρ</th><th>rmse</th><th>bias</th>
+      <th>cluster ρ</th><th>rmse</th><th>mae</th><th>med|err|</th>
+      <th>rmse/sd</th><th>bias</th>
     </tr></thead><tbody></tbody></table>
     <div class="note">Antibody-side mutations are the affinity-maturation case and dominate
       the dataset (584 of 997 rows); antigen-side are the escape case. This slice looked
@@ -140,14 +169,15 @@
     <h2>Support and other thin slices</h2>
     <table id="tSup"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
       <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
-      <th>cluster ρ</th><th>rmse</th><th>bias</th>
+      <th>cluster ρ</th><th>rmse</th><th>mae</th><th>med|err|</th>
+      <th>rmse/sd</th><th>bias</th>
     </tr></thead><tbody></tbody></table>
   </div>
 </div>
 
 <script>
 const FOLD=['#60a5fa','#fbbf24','#4ade80','#f87171'];
-let sel=null, charts={};
+let sel=null, charts={}, S=null, HIST={};
 const num=(v)=>{const n=parseFloat(v);return isNaN(n)?null:n;};
 const fmt=(v,d=3)=>v===null?'—':v.toFixed(d);
 
@@ -158,6 +188,7 @@ const leg={legend:{labels:{color:'#e6e8ee',boxWidth:10}}};
 
 async function tick(){
   let s; try{ s=await (await fetch('/api/state',{cache:'no-store'})).json(); }catch(e){ return; }
+  S=s; HIST=s.history||{};
   const rows=s.sweep||[];
   document.getElementById('sub').innerHTML =
     `${rows.length} of 9 configs finished · last poll ${s.last_poll||'—'} · ${s.polls} polls`
@@ -196,13 +227,13 @@ function draw(s){
   document.getElementById('selB').textContent=sel||'—';
   const h=(s.history||{})[sel];
   if(!h){ ['cVal','cTV'].forEach(id=>mk(id,{type:'line',data:{labels:[],datasets:[]},
-      options:{plugins:{legend:{display:false}},scales:axes('epoch','ρ')}})); return; }
+      options:{plugins:{legend:{display:false}},scales:axes('optimiser step','ρ')}})); return; }
 
   const folds=Object.keys(h).sort();
   mk('cVal',{type:'line',data:{labels:h[folds[0]].epoch,
     datasets:folds.map((f,i)=>({label:'fold '+f,data:h[f].val,borderColor:FOLD[i%4],
       pointRadius:0,borderWidth:2,tension:.15}))},
-    options:{plugins:leg,scales:axes('epoch','validation ρ (residual space)')}});
+    options:{plugins:leg,scales:axes('optimiser step','validation ρ (target depends on resid flag)')}});
 
   const ds=[];
   folds.forEach((f,i)=>{
@@ -213,16 +244,16 @@ function draw(s){
   });
   mk('cTV',{type:'line',data:{labels:h[folds[0]].epoch,datasets:ds},
     options:{plugins:{legend:{labels:{color:'#e6e8ee',boxWidth:10,filter:i=>i.text.endsWith('train')}}},
-             scales:axes('epoch','ρ')}});
+             scales:axes('optimiser step','ρ')}});
 }
 
 // ---------------------------------------------------------------- error analysis
 let ERR=null, RUN=null;
-const f3=(v)=>v===null||v===undefined?'—':(typeof v==='number'?v.toFixed(3):v);
+const f3=(v,d=3)=>v===null||v===undefined?'—':(typeof v==='number'?v.toFixed(d):v);
 
 function fillTable(id, obj, order){
   const tb=document.querySelector('#'+id+' tbody'); tb.innerHTML='';
-  if(!obj){ tb.innerHTML='<tr><td colspan="12" style="text-align:left;color:#98a0b3">not available</td></tr>'; return; }
+  if(!obj){ tb.innerHTML='<tr><td colspan="16" style="text-align:left;color:#98a0b3">not available</td></tr>'; return; }
   const keys=order?order.filter(k=>k in obj):Object.keys(obj);
   keys.forEach(k=>{
     const b=obj[k], tr=document.createElement('tr');
@@ -230,7 +261,11 @@ function fillTable(id, obj, order){
       <td>${b.n_counted}</td><td>${b.n_counted10}</td>
       <td>${f3(b.sd_true)}</td><td>${f3(b.micro_rho)}</td>
       <td><b>${f3(b.macro_rho)}</b></td><td>${f3(b.macro_rho10)}</td>
-      <td>${f3(b.cluster_rho)}</td><td>${f3(b.rmse)}</td><td>${f3(b.bias)}</td>`;
+      <td>${f3(b.cluster_rho)}</td><td>${f3(b.rmse)}</td><td>${f3(b.mae)}</td>
+      <td>${f3(b.medae)}</td>
+      <td style="color:${b.rmse_over_sd==null?'inherit':(b.rmse_over_sd<0.9?'var(--good)':b.rmse_over_sd<1?'var(--warn)':'var(--bad)')}">
+        ${f3(b.rmse_over_sd,2)}</td>
+      <td>${f3(b.bias)}</td>`;
     tb.appendChild(tr);
   });
 }
@@ -290,11 +325,70 @@ async function loadError(){
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
   b.classList.add('on');
-  const err=b.dataset.view==='error';
-  document.getElementById('view-train').classList.toggle('hide',err);
-  document.getElementById('view-error').classList.toggle('hide',!err);
-  if(err) loadError();
+  const v=b.dataset.view;
+  document.getElementById('view-train').classList.toggle('hide',v!=='train');
+  document.getElementById('view-error').classList.toggle('hide',v!=='error');
+  document.getElementById('view-runs').classList.toggle('hide',v!=='runs');
+  if(v==='error') loadError();
+  if(v==='runs') loadCatalog();
 });
+
+let CATALOG=[];
+let LIVEROWS=[];
+async function loadCatalog(){
+  CATALOG = await (await fetch('/api/catalog',{cache:'no-store'})).json();
+  // Configurations of the sweep running right now exist only on the VM until `collect`
+  // downloads them, so they have no local predictions.csv and never appear in the catalog.
+  // The poller already pulls the sweep CSV off the busy VM, so take them from there and show
+  // them at the top -- otherwise the page looks idle while the GPU is working.
+  try {
+    const st = await (await fetch('/api/state',{cache:'no-store'})).json();
+    LIVEROWS = (st.sweep||[]).map(r=>({
+      run:r.name, when:'running', model:'rank_fusion', residual:null,
+      rows:r.n_scored??null, min_group:5,
+      macro5:parseFloat(r.per_cx_rho), macro10:parseFloat(r.per_cx_rho10),
+      global_:parseFloat(r.global_rho), conc:parseFloat(r.conc),
+      rmse:parseFloat(r.rmse), live:true, pending:true}));
+  } catch(e){ LIVEROWS=[]; }
+  renderCatalog();
+}
+function renderCatalog(){
+  const f=(document.getElementById('runfilter').value||'').toLowerCase();
+  const tb=document.querySelector('#tRuns tbody'); tb.innerHTML='';
+  const names=new Set(LIVEROWS.map(r=>r.run));
+  const all=[...LIVEROWS, ...CATALOG.filter(r=>!names.has(r.run))];
+  all.filter(r=>!f||r.run.toLowerCase().includes(f)).forEach(r=>{
+    const tr=document.createElement('tr');
+    if(r.run===RUN) tr.className='sel';
+    const live = r.live
+        ? ` <span class="pill" style="background:${r.pending?'var(--warn)':'var(--good)'};color:#0f1115">${r.pending?'RUNNING':'LIVE'}</span>`
+        : '';
+    const resid = r.residual===true
+        ? '<span class="pill" style="background:var(--bad);color:#0f1115">yes</span>'
+        : (r.residual===false ? 'no' : '—');
+    tr.innerHTML=`<td>${r.run}${live}</td><td>${r.when}</td><td>${r.model??'—'}</td>
+      <td>${resid}</td><td>${r.rows??'—'}</td><td>${r.min_group??'—'}</td>
+      <td><b>${f3(r.macro5)}</b></td><td>${f3(r.macro10)}</td><td>${f3(r.global_)}</td>
+      <td>${f3(r.conc)}</td><td>${f3(r.rmse,2)}</td>`;
+    tr.onclick=()=>{
+      // Selecting a run drives BOTH tabs: the error tables read RUN, the training curves read
+      // `sel`. Updating only one left the two panes describing different runs.
+      sel = r.run;
+      draw({sweep:(typeof S!=='undefined'&&S)?S.sweep:[], history:HIST});
+      if(r.pending){ return; }      // still on the VM; nothing local to analyse yet
+      RUN=r.run;
+      const rs=document.getElementById('runsel'); if(rs) rs.value=r.run;
+      document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
+      document.querySelector('.tab[data-view="error"]').classList.add('on');
+      document.getElementById('view-runs').classList.add('hide');
+      document.getElementById('view-train').classList.add('hide');
+      document.getElementById('view-error').classList.remove('hide');
+      loadError();
+    };
+    tb.appendChild(tr);
+  });
+}
+document.getElementById('runfilter').addEventListener('input',renderCatalog);
 
 loadRuns().then(loadError);
 tick(); setInterval(tick,15000);

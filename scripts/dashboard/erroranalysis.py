@@ -6,6 +6,7 @@ comparable to one over twenty, and the difference is usually what makes a slice 
 """
 from __future__ import annotations
 
+import json
 import pathlib
 
 import numpy as np
@@ -42,15 +43,23 @@ def _block(g: pd.DataFrame) -> dict:
     err = (g.y_pred - g.y_true).to_numpy()
     per5 = _by(g, "complex", 5)
     per10 = _by(g, "complex", 10)
+    sd = float(g.y_true.std())
+    rmse = float(np.sqrt(np.mean(err ** 2)))
     out = {
         "n": int(len(g)),
         "n_complexes": int(g.complex.nunique()),
         "n_counted": len(per5),
         "n_counted10": len(per10),
-        "rmse": float(np.sqrt(np.mean(err ** 2))),
+        "rmse": rmse,
         "mae": float(np.mean(np.abs(err))),
+        "medae": float(np.median(np.abs(err))),
+        # RMSE against the only baseline that needs no model: predict this slice's own mean.
+        # Correlation says whether the ordering is right and stays silent about magnitude, so
+        # a slice can show a healthy rho while every prediction is off by 2 kcal/mol. Below 1
+        # the model beats the slice mean; at or above 1 it does not, whatever rho says.
+        "rmse_over_sd": (rmse / sd) if sd and sd == sd and sd > 0 else None,
         "bias": float(np.mean(err)),
-        "sd_true": float(g.y_true.std()),
+        "sd_true": sd,
         "micro_rho": _spearman(g.y_true, g.y_pred),
         "macro_rho": float(np.mean(per5)) if per5 else None,
         "macro_rho10": float(np.mean(per10)) if per10 else None,
@@ -192,3 +201,63 @@ def available_runs() -> list:
     r = ROOT / "reports"
     return sorted(p.name for p in r.iterdir()
                   if p.is_dir() and (p / "predictions.csv").exists()) if r.exists() else []
+
+
+_CATALOG: dict = {}
+
+
+def catalog(live: set | None = None) -> list:
+    """One row per run: what it is, when it landed, and its headline numbers.
+
+    Ninety-odd runs have accumulated and a dropdown of them sorted alphabetically is useless
+    for finding the one that just finished. Rows are newest first and carry the metrics from
+    metrics.json rather than recomputing, so the listing stays cheap; the parse is memoised on
+    (path, mtime) because the poller hits this endpoint on a timer.
+
+    `live` marks the configurations belonging to the sweep currently running on the VM, which
+    the poller knows from the sweep CSV it is already pulling.
+    """
+    live = live or set()
+    out = []
+    rdir = ROOT / "reports"
+    if not rdir.exists():
+        return out
+    for d in rdir.iterdir():
+        pred = d / "predictions.csv"
+        if not d.is_dir() or not pred.exists():
+            continue
+        mtime = pred.stat().st_mtime
+        cached = _CATALOG.get(d.name)
+        if cached and cached["_mtime"] == mtime:
+            out.append(cached)
+            continue
+        row = {"_mtime": mtime, "run": d.name,
+               "when": __import__("datetime").datetime.fromtimestamp(mtime).strftime("%m-%d %H:%M"),
+               "model": None, "rows": None, "macro5": None, "macro10": None,
+               "global": None, "rmse": None, "conc": None, "residual": None,
+               "min_group": None}
+        try:
+            m = json.loads((d / "metrics.json").read_text())["metrics"]
+            # min_group travels with the number. Runs written before the threshold moved from
+            # 10 to 5 stored per_complex_spearman AT 10, so their macro5 column is really a
+            # macro10 and the two read identically. Showing the threshold makes that visible
+            # instead of silently comparing two different metrics down one column.
+            row["min_group"] = m.get("min_group")
+            row.update(rows=m.get("n"), macro5=m.get("per_complex_spearman"),
+                       macro10=m.get("per_complex_spearman_min10"),
+                       global_=m.get("global_spearman"), rmse=m.get("rmse"),
+                       conc=m.get("concordance_micro_m05"))
+        except Exception:
+            pass
+        try:
+            r = json.loads((d / "run.json").read_text())
+            row["model"] = r.get("model")
+            cfg = r.get("config") or {}
+            row["residual"] = cfg.get("residual")
+        except Exception:
+            pass
+        _CATALOG[d.name] = row
+        out.append(row)
+    for r in out:
+        r["live"] = r["run"] in live
+    return sorted(out, key=lambda r: -r["_mtime"])

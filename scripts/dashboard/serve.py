@@ -81,12 +81,20 @@ def summarise(path: pathlib.Path) -> dict:
                                                               errors="replace"))))
     except Exception:
         return out
+    # Bucket on `step`, not `epoch`. With eval_every set, a single epoch contains many
+    # evaluations -- dir_huber_only logged 92 of them across 200 epochs -- and grouping by
+    # epoch collapsed all of an epoch's evaluations into one averaged point. That both threw
+    # away the resolution the step-level evaluation exists to provide and mixed early and late
+    # points within an epoch, which is what made some curves look flat at a different level
+    # from others.
     agg: dict = {}
     for r in rows:
         try:
-            fold, ep = int(float(r["fold"])), int(float(r["epoch"]))
-        except (KeyError, ValueError):
+            fold = int(float(r["fold"]))
+            x = int(float(r.get("step") or 0)) or int(float(r["epoch"]))
+        except (KeyError, ValueError, TypeError):
             continue
+        ep = x
         b = agg.setdefault(fold, {}).setdefault(ep, {"v": [], "t": [], "l": []})
         for key, dest in (("val_rho", "v"), ("train_rho", "t"), ("loss", "l")):
             try:
@@ -99,12 +107,31 @@ def summarise(path: pathlib.Path) -> dict:
     for fold, eps in agg.items():
         ks = sorted(eps)
         out[str(fold)] = {
+            "x_is_step": any("step" in r for r in rows),
             "epoch": ks,
             "val": [mean(eps[k]["v"]) for k in ks],
             "train": [mean(eps[k]["t"]) for k in ks],
             "loss": [mean(eps[k]["l"]) for k in ks],
         }
     return out
+
+
+def jsonable(obj):
+    """Replace NaN and infinity with null so the payload is valid JSON.
+
+    json.dumps happily writes bare NaN, which is legal Python and illegal JSON: the browser's
+    JSON.parse rejects the whole response and the page renders nothing. Every metric here can
+    be NaN -- a Spearman over constant values, a mean of an empty slice -- so this is the
+    normal case, not an edge one. Testing the endpoint with curl hides it, because curl never
+    parses the body.
+    """
+    if isinstance(obj, float):
+        return None if (obj != obj or obj in (float("inf"), float("-inf"))) else obj
+    if isinstance(obj, dict):
+        return {k: jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [jsonable(v) for v in obj]
+    return obj
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -114,19 +141,26 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/api/state"):
             with LOCK:
-                body = json.dumps(STATE).encode()
+                body = json.dumps(jsonable(STATE)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+        elif self.path.startswith("/api/catalog"):
+            with LOCK:
+                live = {r.get("name") for r in STATE.get("sweep", []) if r.get("name")}
+            body = json.dumps(jsonable(erroranalysis.catalog(live))).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
         elif self.path.startswith("/api/runs"):
-            body = json.dumps(erroranalysis.available_runs()).encode()
+            body = json.dumps(jsonable(erroranalysis.available_runs())).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
         elif self.path.startswith("/api/error"):
             run = self.path.split("run=", 1)[1].split("&")[0] if "run=" in self.path else ""
             try:
-                body = json.dumps(erroranalysis.analyse(run)).encode()
+                body = json.dumps(jsonable(erroranalysis.analyse(run))).encode()
             except Exception as e:                    # a bad run name must not kill the server
                 body = json.dumps({"error": f"{type(e).__name__}: {e}"}).encode()
             self.send_response(200)
