@@ -56,3 +56,6 @@ reports_colab/
 !results/failures.md
 !results/predictions/
 !results/predictions/**
+!results/error_analysis_E0c.md
+!results/plots/
+!results/plots/**

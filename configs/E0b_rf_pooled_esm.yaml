@@ -1,0 +1,9 @@
+# sequence only: pooled ESM-2 650M wild-type and mutant, plus site scalars
+exp: E0b_rf_pooled_esm
+kind: tree                 # dispatched by src/fusion/run.py
+dataset: skempi_abag
+split: data/splits/skempi_abag_5fold_by_complex.json
+feature_set: pooled_esm
+model: rf              # key into src.model.MODELS
+drop_vectors: false
+seeds: [0, 1, 2]

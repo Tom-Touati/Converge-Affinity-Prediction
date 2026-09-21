@@ -1,0 +1,9 @@
+# the multimodal baseline: E0b plus pooled ProteinMPNN
+exp: E0c_rf_pooled_esm_mpnn
+kind: tree                 # dispatched by src/fusion/run.py
+dataset: skempi_abag
+split: data/splits/skempi_abag_5fold_by_complex.json
+feature_set: pooled_esm_mpnn
+model: rf              # key into src.model.MODELS
+drop_vectors: false
+seeds: [0, 1, 2]

@@ -1,0 +1,9 @@
+# the project's existing best tree feature set, on the frozen split
+exp: E0a_rf_handcrafted
+kind: tree                 # dispatched by src/fusion/run.py
+dataset: skempi_abag
+split: data/splits/skempi_abag_5fold_by_complex.json
+feature_set: handcrafted
+model: rf              # key into src.model.MODELS
+drop_vectors: false
+seeds: [0, 1, 2]

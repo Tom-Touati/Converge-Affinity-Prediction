@@ -1,0 +1,9 @@
+# floor: predict the training mean of each fold
+exp: E0e_mean
+kind: tree                 # dispatched by src/fusion/run.py
+dataset: skempi_abag
+split: data/splits/skempi_abag_5fold_by_complex.json
+feature_set: handcrafted
+model: mean              # key into src.model.MODELS
+drop_vectors: true
+seeds: [0, 1, 2]

@@ -153,6 +153,44 @@ Neural experiments therefore have to run on Colab. Tree baselines run locally.
 
 ## 8. What ran tonight
 
-<!-- RUN LOG -->
-*Filled in as experiments complete. See `results/summary.md` for numbers and
-`results/failures.md` for anything that raised.*
+**Completed.**
+
+| step | outcome |
+|---|---|
+| frozen 5-fold split | `data/splits/skempi_abag_5fold_by_complex.json`, 940 rows, 53 complexes, 188 test rows per fold |
+| cross-dataset dedup + leakage | AB645 202 and AB1101 284 exact `(pdb, mutation)` duplicates; per-fold usable counts in the json |
+| `E0a_rf_handcrafted` | pooled Pearson 0.489 ± 0.001, per-complex Spearman 0.418 ± 0.020 |
+| `E0b_rf_pooled_esm` | 0.252 ± 0.015 / 0.273 ± 0.011 |
+| `E0c_rf_pooled_esm_mpnn` | 0.303 ± 0.015 / 0.366 ± 0.022 |
+| `E0e_mean` (floor) | pooled Pearson −0.274; a constant is not a zero baseline here |
+| error analysis | `results/error_analysis.md` for E0a, `results/error_analysis_E0c.md` for E0c, 6 plots |
+| summary | `results/summary.md`, regenerable with `python scripts/summarize.py` |
+| entry point | `python -m src.fusion.run --config configs/<exp>.yaml` |
+
+Headline: **the plan's "multimodal baseline everything else must beat" (E0c) is beaten by 49
+handcrafted columns, by 0.19 pooled Pearson.** Pooled ProteinMPNN does add signal over pooled
+ESM alone (0.252 → 0.303), so the structure channel is not empty; it is the pooling that
+costs. This reproduces on the frozen split what `HANDOFF.md` §6 recorded as dilution.
+
+**Did not run: E1–E8, and E0d.** All of them need per-residue ESM and ProteinMPNN tensors for
+these 940 rows, and no such cache exists — every block under `data/features/` is pooled or
+scalar (§3, precondition mismatch 1). `src/fusion/run.py` raises with that explanation rather
+than substituting a stand-in representation. The prerequisite table is built and validated;
+see `docs/next_steps.md` item 1, which is ~3 min of T4 time.
+
+**Also did not run: E6 multi-dataset training as specified.** Its auxiliary pool was to be
+SKEMPI ∪ AB645 ∪ S1131 ∪ AB1101, but S1131 contains no antibody-antigen complexes at all and
+shares no PDB with this dataset, so it is not usable auxiliary antibody data (§3, mismatch 2).
+AB645 and AB1101 are, and the leakage exclusion for them is computed and stored.
+
+**In flight on Colab: the ProtAttBA S1131 reproduction.** 3 of 10 folds complete, tracking the
+paper closely (PCC 0.7826 / 0.8629 / 0.8138 against their 0.7673 / 0.8638 / 0.7780). Two
+Colab sessions were reclaimed mid-run, so the driver now works one fold per remote call and
+resumes from whatever is on local disk.
+
+**Wall time and hardware.** Everything in the table above ran on the local CPU (i7-8650U, 4
+cores) in well under the plan's 45-minute-per-experiment budget: the three forests take about
+0.5 min per seed. The neural work is on a Colab T4 because the local GTX 1050's 2 GB cannot
+hold the ProtAttBA head at their batch size.
+
+**Failures file.** `results/failures.md` was not created, because nothing raised.
