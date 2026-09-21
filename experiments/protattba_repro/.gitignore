@@ -1,0 +1,18 @@
+# Upstream checkout of https://github.com/code4luck/ProtAttBA (81 MB, pinned in README).
+# Not vendored: it is a third-party repository, not part of this deliverable. The two small
+# files this reproduction actually consumes are copied into upstream/ and are versioned.
+ProtAttBA/
+
+# Isolated python 3.10 environment for the upstream code. Deliberately separate from the
+# project's own requirements.txt (torch pin differs).
+.venv_protattba/
+
+# Frozen ESM2-650M weights (2.6 GB) and the per-residue embedding cache (~330 MB).
+model/
+cache/
+
+# Per-fold run outputs. The aggregated tables that the README quotes are versioned.
+results/**
+!results/.gitkeep
+!results/*_summary.csv
+!results/*_predictions.csv
