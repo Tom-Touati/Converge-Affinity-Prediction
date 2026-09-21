@@ -219,10 +219,53 @@ def leakage_report(ds: pd.DataFrame, folds: pd.DataFrame, verbose: bool = True) 
     return rep
 
 
-def build(k: int = DEFAULT_K, verbose: bool = True) -> pd.DataFrame:
+GROUPINGS = ("cluster", "complex", "random")
+"""Available split strictness. `cluster` is the project default and the only one reported.
+
+The three sit on a ladder this project has already measured -- random 0.722, complex 0.485,
+cluster 0.353 on the same model -- so the choice deserves a sentence rather than a default.
+
+* **cluster** groups by homology (antigen 30% identity, antibody 90%), so structural twins
+  cannot straddle a fold boundary. It is the honest question and it is brutal: every complex
+  comes out `hard` under the published TM-score tiering, because all 118 antigen pairs above
+  TM 0.8 sit inside a fold.
+* **complex** keeps each #Pdb whole but lets homologues fall on opposite sides, which is what
+  much of the SKEMPI literature does. The gap between it and `cluster` measures directly what
+  homology leakage is worth.
+* **random** ignores structure entirely. It quantifies a ceiling; it is not a result.
+
+`complex` and `random` write their own files and never touch data/folds.csv, so the frozen
+split stays frozen.
+"""
+
+
+def _grouped_folds(ds: pd.DataFrame, by: pd.Series, k: int) -> pd.Series:
+    """Greedy balanced assignment of whole groups to k folds, largest group first."""
+    key = by.reindex(ds["#Pdb"]).to_numpy()
+    sizes = pd.Series(key).groupby(key).size().sort_values(ascending=False)
+    load = {f: 0 for f in range(k)}
+    where = {}
+    for g, n in sizes.items():
+        f = min(load, key=load.get)
+        where[g] = f
+        load[f] += n
+    return pd.Series([where[g] for g in key])
+
+
+def build(k: int = DEFAULT_K, verbose: bool = True, grouping: str = "cluster") -> pd.DataFrame:
+    if grouping not in GROUPINGS:
+        raise SystemExit(f"grouping must be one of {GROUPINGS}")
     ds = pd.read_parquet(paths.DATASET)
-    cluster = build_clusters(ds, verbose)
-    fold = assign_folds(ds, cluster, k, verbose)
+
+    if grouping == "cluster":
+        cluster = build_clusters(ds, verbose)
+        fold = assign_folds(ds, cluster, k, verbose)
+    elif grouping == "complex":
+        cluster = pd.Series(ds["#Pdb"].unique(), index=ds["#Pdb"].unique())
+        fold = _grouped_folds(ds, cluster, k)
+    else:
+        cluster = pd.Series(ds["#Pdb"].unique(), index=ds["#Pdb"].unique())
+        fold = pd.Series(np.random.default_rng(0).integers(0, k, len(ds)))
 
     folds = pd.DataFrame({
         "row_id": ds["row_id"],
@@ -232,23 +275,39 @@ def build(k: int = DEFAULT_K, verbose: bool = True) -> pd.DataFrame:
     }).sort_values("row_id").reset_index(drop=True)
 
     # invariants -- these are the tests that matter, so they run on every build
-    per_cluster_folds = folds.groupby("cluster")["fold"].nunique()
-    assert (per_cluster_folds == 1).all(), "a cluster leaked across folds"
-    per_cx_folds = folds.groupby("#Pdb")["fold"].nunique()
-    assert (per_cx_folds == 1).all(), "a complex leaked across folds"
     assert folds["row_id"].is_unique and len(folds) == len(ds)
+    if grouping != "random":
+        per_cx_folds = folds.groupby("#Pdb")["fold"].nunique()
+        assert (per_cx_folds == 1).all(), "a complex leaked across folds"
+    if grouping == "cluster":
+        per_cluster_folds = folds.groupby("cluster")["fold"].nunique()
+        assert (per_cluster_folds == 1).all(), "a cluster leaked across folds"
 
-    folds.to_csv(paths.FOLDS, index=False)
+    out = (paths.FOLDS if grouping == "cluster"
+           else paths.FOLDS.with_name(f"folds_{grouping}.csv"))
+    folds.to_csv(out, index=False)
     if verbose:
-        leakage_report(ds, folds, verbose)
-        print(f"\nwrote {paths.FOLDS.relative_to(paths.ROOT)}  ({len(folds):,} rows, k={k})")
+        if grouping == "cluster":
+            leakage_report(ds, folds, verbose)
+        print(f"\nwrote {out.relative_to(paths.ROOT)}  "
+              f"({len(folds):,} rows, k={k}, grouping={grouping})")
     return folds
 
 
-def load() -> pd.DataFrame:
-    """Dataset joined to the frozen folds. The single entry point for every model."""
+def load(grouping: str = "cluster") -> pd.DataFrame:
+    """Dataset joined to the frozen folds. The single entry point for every model.
+
+    `grouping` selects an alternative split file and defaults to the frozen cluster-grouped
+    one, so nothing changes unless a caller asks. The others are secondary and must be built
+    first: `python -m src.splits --grouping complex`.
+    """
     ds = pd.read_parquet(paths.DATASET)
-    folds = pd.read_csv(paths.FOLDS)
+    fp = (paths.FOLDS if grouping == "cluster"
+          else paths.FOLDS.with_name(f"folds_{grouping}.csv"))
+    if not fp.exists():
+        raise SystemExit(f"{fp.name} not built -- run: "
+                         f"python -m src.splits --grouping {grouping}")
+    folds = pd.read_csv(fp)
     out = ds.merge(folds[["row_id", "cluster", "fold"]], on="row_id", how="left", validate="1:1")
     if out["fold"].isna().any():
         raise RuntimeError("dataset rows missing from folds.csv -- rebuild the split deliberately")
@@ -259,8 +318,10 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("-k", type=int, default=DEFAULT_K, help="number of folds (default: 4)")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--grouping", default="cluster", choices=GROUPINGS,
+                   help="cluster (default, frozen) | complex (literature-comparable) | random")
     a = p.parse_args()
-    build(k=a.k, verbose=not a.quiet)
+    build(k=a.k, verbose=not a.quiet, grouping=a.grouping)
 
 
 if __name__ == "__main__":

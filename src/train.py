@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -25,29 +26,45 @@ from . import evaluate, paths, splits
 from .model import MODELS
 
 
+#: embedding-vector columns, as written by features/esm2.py
+_VECTOR_COL = re.compile(r"^d\d+$")
+
+
 def _feature_block(name: str, df: pd.DataFrame) -> pd.DataFrame:
-    """Resolve a feature block by name, preferring a cached file over recomputation."""
+    """Resolve a feature block by name, preferring a cached file over recomputation.
+
+    A ``@scalars`` suffix drops the wide embedding-difference columns and keeps only the
+    summary scalars. With ~750 training rows a 480- or 1280-dimensional difference vector is
+    hopeless for a tree head but fine for ridge, so the two want different views of one cache.
+    """
+    name, _, view = name.partition("@")
     cache = paths.FEATURES / f"{name}.parquet"
+
     if cache.exists():
         block = pd.read_parquet(cache)
-        missing = set(df["row_id"]) - set(block.index)
-        if missing:
-            raise RuntimeError(
-                f"cached block '{name}' is missing {len(missing)} row_ids; delete "
-                f"{cache} and re-extract"
-            )
-        return block.loc[df["row_id"]]
-
-    if name == "chem":
-        from .features.chem import build
     else:
-        raise KeyError(
-            f"unknown feature block '{name}'. Cached blocks found: "
-            f"{sorted(p.stem for p in paths.FEATURES.glob('*.parquet'))}"
+        builders = {"chem": "chem", "geom": "geometry", "geomrev": "geom_rev"}
+        if name not in builders:
+            raise KeyError(
+                f"unknown feature block '{name}'. Cached blocks: "
+                f"{sorted(p.stem for p in paths.FEATURES.glob('*.parquet'))}. "
+                f"ESM blocks are produced by `python -m src.features.esm2 --model ...`."
+            )
+        mod = __import__(f"src.features.{builders[name]}", fromlist=["build"])
+        block = mod.build(df)
+        paths.FEATURES.mkdir(parents=True, exist_ok=True)
+        block.to_parquet(cache)
+
+    missing = set(df["row_id"]) - set(block.index)
+    if missing:
+        raise RuntimeError(
+            f"cached block '{name}' is missing {len(missing)} row_ids; delete "
+            f"{cache} and re-extract"
         )
-    block = build(df)
-    paths.FEATURES.mkdir(parents=True, exist_ok=True)
-    block.to_parquet(cache)
+    if view == "scalars":
+        block = block[[c for c in block.columns if not _VECTOR_COL.match(c)]]
+    elif view:
+        raise KeyError(f"unknown view '@{view}' on block '{name}' (only '@scalars' exists)")
     return block.loc[df["row_id"]]
 
 
@@ -69,20 +86,54 @@ def _git_sha() -> str:
         return "uncommitted"
 
 
-def run(model: str, features: list, name: str, seed: int = 0, min_group: int = 10,
-        n_boot: int = 1000, verbose: bool = True) -> pd.DataFrame:
+def run(model: str, features: list, name: str, seed: int = 0,
+        min_group: int = evaluate.MIN_GROUP, n_boot: int = 1000, verbose: bool = True,
+        center: bool = False, augment: bool = False,
+        grouping: str = "cluster") -> pd.DataFrame:
     t0 = time.perf_counter()
-    df = splits.load()
+    df = splits.load(grouping)
     X = build_matrix(df, features)
     y = df["ddG"].to_numpy(float)
+    complexes = df["#Pdb"].to_numpy()
 
     preds = np.full(len(df), np.nan)
+    est_params = None
     for f in sorted(df["fold"].unique()):
         te = (df["fold"] == f).to_numpy()
         tr = ~te
         est = MODELS[model](seed)
-        est.fit(X[tr], y[tr])
-        preds[te] = est.predict(X[te])
+        if est_params is None:
+            # Record what the head actually is. Without this a report says only "rf" and the
+            # configuration that produced it is unrecoverable once model.py moves on.
+            est_params = {k: str(v) for k, v in getattr(est, "get_params", dict)().items()}
+
+        if center:
+            # Train on the within-complex deviation instead of the raw label.
+            #
+            # 38% of this dataset's label variance is between complexes -- an offset set by the
+            # wild type's reference affinity, the assay and the temperature, none of which the
+            # mutation's features can predict for an unseen complex. Squared error spends that
+            # share of its gradient on it, while the headline metric (per-complex Spearman)
+            # ignores it entirely, being rank-based within each complex.
+            #
+            # Means come from TRAINING rows only. Test complexes never appear in training under
+            # grouped CV, so no test-complex mean exists to leak -- which is the point.
+            tr_mean = pd.Series(y[tr]).groupby(complexes[tr]).mean()
+            est.fit(X[tr], y[tr] - pd.Series(complexes[tr]).map(tr_mean).to_numpy())
+            # Add the global training mean back so predictions stay on a physical scale. The
+            # model still makes no attempt at per-complex offsets, so its RMSE is not comparable
+            # to an uncentered run's -- only the rank metrics are.
+            preds[te] = est.predict(X[te]) + y[tr].mean()
+        else:
+            X_tr, y_tr = X[tr], y[tr]
+            if augment:
+                # Reverse-mutation augmentation, TRAINING FOLD ONLY. A reversed row is the same
+                # measurement with a flipped sign, so letting one reach a test fold whose source
+                # sat in training would leak as badly as duplicating the row.
+                from .augment import augment_training_fold
+                X_tr, y_tr = augment_training_fold(X_tr, y_tr, df[tr], features)
+            est.fit(X_tr, y_tr)
+            preds[te] = est.predict(X[te])
     assert np.isfinite(preds).all(), "some rows never landed in a test fold"
 
     out = pd.DataFrame({
@@ -101,7 +152,10 @@ def run(model: str, features: list, name: str, seed: int = 0, min_group: int = 1
     (d / "metrics.json").write_text(json.dumps({"metrics": m, "ci": ci}, indent=2, default=float))
     (d / "run.json").write_text(json.dumps({
         "name": name, "model": model, "features": features, "seed": seed,
-        "min_group": min_group, "n_boot": n_boot, "n_folds": int(df["fold"].nunique()),
+        "min_group": min_group, "n_boot": n_boot, "center": center, "augment": augment,
+        "grouping": grouping,
+        "estimator_params": est_params,
+        "n_folds": int(df["fold"].nunique()),
         "n_rows": len(df), "n_features": X.shape[1], "git_sha": _git_sha(),
         "python": platform.python_version(), "machine": platform.processor(),
         "wall_seconds": round(time.perf_counter() - t0, 1),
@@ -126,11 +180,19 @@ def main() -> None:
     p.add_argument("--features", default="chem", help="comma-separated feature blocks")
     p.add_argument("--name", default=None, help="report directory name")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--min-group", type=int, default=10)
+    p.add_argument("--min-group", type=int, default=evaluate.MIN_GROUP)
+    p.add_argument("--grouping", default="cluster", choices=splits.GROUPINGS,
+                   help="which split to evaluate on; `complex` is the looser, "
+                        "literature-comparable one and is NOT the reported result")
     p.add_argument("--n-boot", type=int, default=1000)
+    p.add_argument("--center", action="store_true",
+                   help="train on the within-complex deviation instead of the raw ddG")
+    p.add_argument("--augment", action="store_true",
+                   help="append each training row's reverse mutation with a flipped label")
     a = p.parse_args()
     feats = [f.strip() for f in a.features.split(",") if f.strip()]
-    run(a.model, feats, a.name or f"{a.model}_{'+'.join(feats)}", a.seed, a.min_group, a.n_boot)
+    run(a.model, feats, a.name or f"{a.model}_{'+'.join(feats)}", a.seed, a.min_group,
+        a.n_boot, center=a.center, augment=a.augment, grouping=a.grouping)
 
 
 if __name__ == "__main__":

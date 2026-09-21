@@ -79,6 +79,8 @@ from cached_encoder import CachedEsmEncoder  # noqa: E402
 #: is never touched.
 upstream_model.EsmModel = CachedEsmEncoder
 
+import model_module.rope_attn as rope_attn  # noqa: E402
+
 from dataset import WrapperDataset  # noqa: E402
 from litmodel import LitModel  # noqa: E402
 from utils.common import get_s1131_data  # noqa: E402
@@ -86,6 +88,39 @@ from utils.data_split import (  # noqa: E402
     get_K_fold_generator,
     get_K_fold_with_test_generator,
 )
+
+
+def enable_gradient_checkpointing() -> None:
+    """Recompute the four cross-attention blocks in backward instead of storing them.
+
+    Needed only because this box has a 2 GB GTX 1050. Their batch of 12 at S1131's longest
+    antibody chain (965 residues) stores, per attention block, a [12, 967, 1280] tensor for
+    each of the layer norms, the query projection, the rotary-rotated query, the attention
+    output and three more feed-forward steps -- about 60 MB each, four blocks deep, on top of
+    a 124 MB head with 372 MB of AdamW state. It ran out at 917 MB allocated with 28 MB
+    requested.
+
+    This is a compute-for-memory trade and nothing else: ``checkpoint`` re-runs the same
+    forward under the same RNG state (``preserve_rng_state`` defaults to True, so the
+    attention dropout draws the identical mask), so gradients and therefore the trained model
+    are unchanged. Batch size stays at their 12, which matters -- see the ``1e-10`` key mask
+    note in cached_encoder.py, where a prediction genuinely depends on its batch's padding
+    width.
+
+    Patched on the class rather than by wrapping the module, so the module tree and the
+    state_dict keys stay exactly as their code builds them and ModelCheckpoint /
+    load_from_checkpoint keep working.
+    """
+    original = rope_attn.MutilHeadSelfAttn.forward
+
+    def forward(self, q, k, v, mask=None):
+        if self.training and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(
+                original, self, q, k, v, mask, use_reentrant=False
+            )
+        return original(self, q, k, v, mask)
+
+    rope_attn.MutilHeadSelfAttn.forward = forward
 
 #: bash_cross-validation.sh, plus src_s1131/trainer.py defaults for what it does not set.
 UPSTREAM_ARGS = dict(
@@ -197,7 +232,12 @@ def main() -> None:
     ap.add_argument("--max-epochs", type=int, default=None, help="override for smoke tests")
     ap.add_argument("--folds", type=int, default=None, help="run only the first N folds")
     ap.add_argument("--tag", default=None, help="suffix for output filenames")
+    ap.add_argument("--grad-checkpoint", action="store_true",
+                    help="recompute attention blocks in backward; needed under ~4 GB VRAM")
     cli = ap.parse_args()
+
+    if cli.grad_checkpoint:
+        enable_gradient_checkpointing()
 
     args = build_args(cli.protocol, cli.device, cli.max_epochs)
     tag = cli.tag or cli.protocol
@@ -209,6 +249,9 @@ def main() -> None:
     print("deviations from bash_cross-validation.sh:")
     for d in DEVIATIONS:
         print(f"  - {d}")
+    if cli.grad_checkpoint:
+        print("  - cross-attention blocks recomputed in backward (memory only; batch size "
+              "stays 12 and gradients are unchanged)")
     if cli.protocol == "upstream":
         print("\nNOTE: in this protocol EarlyStopping and ModelCheckpoint monitor the TEST fold,"
               "\n      because WrapperDataset assigns the test indices to self.val_dataset and"

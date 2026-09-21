@@ -1,0 +1,251 @@
+[19:26:43] start  session=pab gpu=T4  stages: upstream honest
+[19:26:46] ### upload harness
+dirs ready
+[colab] Uploaded 'metrics.py' to '/content/protattba_repro/metrics.py'
+[19:26:58]   pushed metrics.py
+[colab] Uploaded 'paths_local.py' to '/content/protattba_repro/paths_local.py'
+[19:27:02]   pushed paths_local.py
+[colab] Uploaded 'cached_encoder.py' to '/content/protattba_repro/cached_encoder.py'
+[19:27:05]   pushed cached_encoder.py
+[colab] Uploaded 'extract_embeddings.py' to '/content/protattba_repro/extract_embeddings.py'
+[19:27:12]   pushed extract_embeddings.py
+[colab] Uploaded 'run_cv.py' to '/content/protattba_repro/run_cv.py'
+[19:27:15]   pushed run_cv.py
+[colab] Uploaded 'compare.py' to '/content/protattba_repro/compare.py'
+[19:27:19]   pushed compare.py
+[colab] Uploaded 'fetch_esm2.py' to '/content/protattba_repro/fetch_esm2.py'
+[19:27:22]   pushed fetch_esm2.py
+[colab] Uploaded 'check_encoder_assumptions.py' to '/content/protattba_repro/check_encoder_assumptions.py'
+[19:27:25]   pushed check_encoder_assumptions.py
+[colab] Uploaded 'verify_published.py' to '/content/protattba_repro/verify_published.py'
+[19:27:28]   pushed verify_published.py
+[colab] Uploaded 'crosscheck_embeddings.py' to '/content/protattba_repro/crosscheck_embeddings.py'
+[19:27:31]   pushed crosscheck_embeddings.py
+[colab] Uploaded 'crosscheck_local.json' to '/content/protattba_repro/crosscheck_local.json'
+[19:27:34]   pushed crosscheck_local.json
+[colab] Uploaded 'colab_job.py' to '/content/protattba_repro/colab_job.py'
+[19:27:36]   pushed colab_job.py
+[colab] Uploaded 'upstream/S1131.csv' to '/content/protattba_repro/upstream/S1131.csv'
+[19:27:51]   pushed upstream/S1131.csv
+[colab] Uploaded 'upstream/S1131_published_predictions.csv' to '/content/protattba_repro/upstream/S1131_published_predictions.csv'
+[19:27:55]   pushed upstream/S1131_published_predictions.csv
+[19:27:58] ### bootstrap
+
+$ nvidia-smi || echo 'NO GPU -- runtime has no accelerator'
+Mon Sep 21 19:28:06 2026
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.82.07              Driver Version: 580.82.07      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  Tesla T4                       Off |   00000000:00:04.0 Off |                    0 |
+| N/A   36C    P8             12W /   70W |       3MiB /  15360MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+$ git -C /content/protattba_repro/ProtAttBA fetch --depth 50 origin && git -C /content/protattba_repro/ProtAttBA checkout 9adbf9899a7b3aa69da4ea00f5b3ca9e14bddbbd
+HEAD is now at 9adbf98 Update readme.md
+
+$ git -C /content/protattba_repro/ProtAttBA rev-parse HEAD
+9adbf9899a7b3aa69da4ea00f5b3ca9e14bddbbd
+
+installing only ['pytorch-lightning', 'torchmetrics']; see NEEDED for why their pins are not used
+
+$ pip install -q pytorch-lightning torchmetrics
+
+$ python -c "import sys, torch, transformers, pytorch_lightning as pl, torchmetrics; print('python', sys.version.split()[0]); print('torch', torch.__version__, '| cuda', torch.cuda.is_available()); print('transformers', transformers.__version__, '| lightning', pl.__version__, '| torchmetrics', torchmetrics.__version__); print('device', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none'); from transformers import EsmModel, AutoTokenizer; print('EsmModel import OK')"
+python 3.13.15
+torch 2.11.0+cu128 | cuda True
+transformers 5.16.1 | lightning 2.6.6 | torchmetrics 1.9.0
+device Tesla T4
+EsmModel import OK
+
+$ python -c "import paths_local; paths_local.add_upstream_to_path(); import model, litmodel, dataset; from model_module.rope_attn import MutilHeadSelfAttn; from utils.common import get_s1131_data; from utils.data_split import get_K_fold_generator, get_K_fold_with_test_generator; print('upstream import chain OK:', model.__file__)"
+upstream import chain OK: /content/protattba_repro/ProtAttBA/cross_validation/src_s1131/model.py
+
+$ python fetch_esm2.py
+already present: /content/protattba_repro/model/esm2_650m
+STAGE_OK bootstrap
+[19:28:27] OK bootstrap
+[19:28:30] ### verify
+
+$ python verify_published.py
+S1131.csv                 1131 rows, 112 distinct PDB ids
+shipped predictions       1131 rows, 10 folds, 1131 distinct row indices
+
+[1] fold assignment      KFold(10, shuffle=True, random_state=3407) matches exactly, all 1131 rows
+[2] label alignment      test_indices indexes S1131.csv row order, max |drift| = 5.5e-07
+
+[3] scoring their own shipped predictions, per fold:
+
+ fold   n    pcc    rho   rmse
+    0 114 0.7673 0.6647 1.2789
+    1 113 0.8638 0.7896 1.3715
+    2 113 0.7780 0.7145 1.1549
+    3 113 0.9193 0.8095 1.1908
+    4 113 0.7949 0.6948 1.2966
+    5 113 0.8284 0.8085 1.3910
+    6 113 0.9047 0.8211 1.2351
+    7 113 0.8631 0.8280 1.3392
+    8 113 0.7943 0.7137 1.3932
+    9 113 0.8558 0.6531 1.4118
+
+    metric   reproduced from shipped preds   Table 1 (ESM2, S1131)   match
+    pcc     0.8370 +/- 0.0501                0.84 +/- 0.05            yes
+    rho     0.7497 +/- 0.0648                0.75 +/- 0.06            yes
+    rmse    1.3063 +/- 0.0856                1.31 +/- 0.09            yes
+
+    pooled over all 1131 predictions (not what the paper reports): PCC 0.8449  rho 0.7315  RMSE 1.3091
+
+Conclusion: Table 1 is exactly the per-fold mean +/- population std of the
+predictions committed in the repo. The target is internally consistent, the split is
+pinned to seed 3407, and every one of the 1131 published predictions is available
+for per-example comparison against our own run.
+
+$ python check_encoder_assumptions.py
+
+Loading weights:   0%|          | 0/534 [00:00<?, ?it/s]
+Loading weights: 100%|██████████| 534/534 [00:00<00:00, 8764.91it/s]
+[transformers] [1mEsmModel LOAD REPORT[0m from: /content/protattba_repro/model/esm2_650m
+Key                       | Status     |
+--------------------------+------------+-
+lm_head.dense.bias        | UNEXPECTED |
+lm_head.layer_norm.bias   | UNEXPECTED |
+lm_head.bias              | UNEXPECTED |
+lm_head.layer_norm.weight | UNEXPECTED |
+lm_head.dense.weight      | UNEXPECTED |
+pooler.dense.bias         | MISSING    |
+pooler.dense.weight       | MISSING    |
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+- MISSING:	those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+checkpoint                esm2_650m
+num_hidden_layers         33
+hidden_size               1280   (bash_cross-validation.sh sets HIDDEN_SIZE=1280)
+position_embedding_type   rotary
+parameters                651.0 M
+
+[1] stochasticity in train mode
+    hidden_dropout_prob            0.0
+    attention_probs_dropout_prob   0.0
+    two train-mode passes, max |diff|   0.000e+00
+    train mode vs eval mode, max |diff| 0.000e+00
+
+[2] cross-example coupling
+    BatchNorm modules in the encoder    0
+
+[3] padding invariance (their collator pads to the batch maximum)
+    seq 0 len   17 padded to  967   max |diff| on real tokens 2.861e-06
+    seq 1 len  165 padded to  967   max |diff| on real tokens 6.199e-06
+    seq 2 len  245 padded to  967   max |diff| on real tokens 7.391e-06
+    seq 3 len  965 padded to  967   max |diff| on real tokens 0.000e+00
+    mean |embedding| 0.139, so worst relative drift is 5.3e-05
+
+Conclusion: with --freeze_backbone the encoder output is a deterministic,
+padding-invariant function of a single sequence. Caching it once and running
+ProtAttBA's own head code on the cache is equivalent to their loop, up to float
+reassociation noise of order 1e-4 in the embeddings.
+STAGE_OK verify
+[19:30:37] OK verify
+[19:30:40] ### crosscheck
+
+$ python crosscheck_embeddings.py --reference crosscheck_local.json
+three sequences, lengths [17, 192, 965]
+reference built under python 3.10.11, torch 2.1.2+cu118, transformers 4.40.2
+this runtime   python 3.13.15, torch 2.11.0+cu128, transformers 5.16.1
+
+Loading weights:   0%|          | 0/534 [00:00<?, ?it/s]
+Loading weights: 100%|██████████| 534/534 [00:00<00:00, 8140.17it/s]
+[transformers] [1mEsmModel LOAD REPORT[0m from: /content/protattba_repro/model/esm2_650m
+Key                       | Status     |
+--------------------------+------------+-
+lm_head.dense.weight      | UNEXPECTED |
+lm_head.dense.bias        | UNEXPECTED |
+lm_head.bias              | UNEXPECTED |
+lm_head.layer_norm.weight | UNEXPECTED |
+lm_head.layer_norm.bias   | UNEXPECTED |
+pooler.dense.bias         | MISSING    |
+pooler.dense.weight       | MISSING    |
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+- MISSING:	those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+
+  sequence 0  len 17  tokens 19
+    mean   reference -0.001412   here -0.001412   |diff| 6.53e-10
+    std    reference +0.281878   here +0.281878   |diff| 1.08e-09
+    min    reference -9.253284   here -9.253284   |diff| 9.54e-07
+    max    reference +1.079306   here +1.079309   |diff| 2.26e-06
+    first_token_head max |diff| over 8 components 1.04e-07
+    last_token_head  max |diff| over 8 components 1.71e-07
+
+  sequence 1  len 192  tokens 194
+    mean   reference +0.000058   here +0.000058   |diff| 3.06e-11
+    std    reference +0.267473   here +0.267473   |diff| 1.27e-09
+    min    reference -8.982508   here -8.982509   |diff| 9.54e-07
+    max    reference +3.250628   here +3.250628   |diff| 4.77e-07
+    first_token_head max |diff| over 8 components 1.04e-07
+    last_token_head  max |diff| over 8 components 1.34e-07
+
+  sequence 2  len 965  tokens 967
+    mean   reference -0.000815   here -0.000815   |diff| 7.57e-11
+    std    reference +0.275025   here +0.275025   |diff| 7.51e-11
+    min    reference -9.370749   here -9.370749   |diff| 9.54e-07
+    max    reference +3.176334   here +3.176334   |diff| 4.77e-07
+    first_token_head max |diff| over 8 components 9.69e-08
+    last_token_head  max |diff| over 8 components 1.64e-07
+
+ESM2-650M agrees across the two stacks to better than 0.002 absolute.
+The library drift forced by Colab's python 3.13 does not change the encoder.
+STAGE_OK crosscheck
+[19:31:18] OK crosscheck
+[19:31:20] ### extract
+
+$ python extract_embeddings.py --device cuda --batch-tokens 32768
+1021 distinct sequences, 127156 residues (vs 4524 sequence cells in the csv)
+device cuda
+
+Loading weights:   0%|          | 0/534 [00:00<?, ?it/s]
+Loading weights: 100%|██████████| 534/534 [00:00<00:00, 7558.10it/s]
+[transformers] [1mEsmModel LOAD REPORT[0m from: /content/protattba_repro/model/esm2_650m
+Key                       | Status     |
+--------------------------+------------+-
+lm_head.layer_norm.weight | UNEXPECTED |
+lm_head.bias              | UNEXPECTED |
+lm_head.dense.weight      | UNEXPECTED |
+lm_head.dense.bias        | UNEXPECTED |
+lm_head.layer_norm.bias   | UNEXPECTED |
+pooler.dense.bias         | MISSING    |
+pooler.dense.weight       | MISSING    |
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+- MISSING:	those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+129198 tokens including <cls>/<eos>; cache will be 0.66 GB fp32
+   1021/1021 seqs   129198/129198 tokens    1.1 min elapsed,   1918 tok/s,   0.0 min left
+
+wrote esm2_650m_embeddings.npy (0.66 GB) and esm2_650m_index.pkl (1021 keys) in 1.1 min
+STAGE_OK extract
+[19:32:45] OK extract
+[19:32:48] ### upstream
+
+$ python run_cv.py --protocol upstream --device gpu
+Seed set to 3407
+/usr/local/lib/python3.13/dist-packages/torchmetrics/utilities/prints.py:43: UserWarning: Metric `SpearmanCorrcoef` will save all targets and predictions in the buffer. For large datasets, this may lead to large memory footprint.
+  warnings.warn(*args, **kwargs)
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+💡 Tip: For seamless cloud logging and experiment tracking, try installing [litlogger](https://pypi.org/project/litlogger/) to enable LitLogger, which logs metrics and artifacts automatically to the Lightning Experiments platform.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+/usr/local/lib/python3.13/dist-packages/pytorch_lightning/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.

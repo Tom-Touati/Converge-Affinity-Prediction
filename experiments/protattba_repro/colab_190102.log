@@ -1,0 +1,109 @@
+[19:01:02] start  session=pab gpu=T4  stages: upstream honest
+[19:01:10] allocating T4
+[colab] Creating session 'pab'...
+[colab] Session READY.
+[19:01:29] ### upload harness
+dirs ready
+[colab] Uploaded 'metrics.py' to '/content/protattba_repro/metrics.py'
+[19:02:18]   pushed metrics.py
+[colab] Uploaded 'paths_local.py' to '/content/protattba_repro/paths_local.py'
+[19:02:21]   pushed paths_local.py
+[colab] Uploaded 'cached_encoder.py' to '/content/protattba_repro/cached_encoder.py'
+[19:02:25]   pushed cached_encoder.py
+[colab] Uploaded 'extract_embeddings.py' to '/content/protattba_repro/extract_embeddings.py'
+[19:02:28]   pushed extract_embeddings.py
+[colab] Uploaded 'run_cv.py' to '/content/protattba_repro/run_cv.py'
+[19:02:34]   pushed run_cv.py
+[colab] Uploaded 'compare.py' to '/content/protattba_repro/compare.py'
+[19:02:36]   pushed compare.py
+[colab] Uploaded 'fetch_esm2.py' to '/content/protattba_repro/fetch_esm2.py'
+[19:02:39]   pushed fetch_esm2.py
+[colab] Uploaded 'check_encoder_assumptions.py' to '/content/protattba_repro/check_encoder_assumptions.py'
+[19:02:42]   pushed check_encoder_assumptions.py
+[colab] Uploaded 'verify_published.py' to '/content/protattba_repro/verify_published.py'
+[19:02:45]   pushed verify_published.py
+[colab] Uploaded 'colab_job.py' to '/content/protattba_repro/colab_job.py'
+[19:02:47]   pushed colab_job.py
+[colab] Uploaded 'upstream/S1131.csv' to '/content/protattba_repro/upstream/S1131.csv'
+[19:03:00]   pushed upstream/S1131.csv
+[colab] Uploaded 'upstream/S1131_published_predictions.csv' to '/content/protattba_repro/upstream/S1131_published_predictions.csv'
+[19:03:03]   pushed upstream/S1131_published_predictions.csv
+[19:03:06] ### bootstrap
+
+$ nvidia-smi || echo 'NO GPU -- runtime has no accelerator'
+Mon Sep 21 19:03:17 2026
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.82.07              Driver Version: 580.82.07      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  Tesla T4                       Off |   00000000:00:04.0 Off |                    0 |
+| N/A   49C    P8              9W /   70W |       0MiB /  15360MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+$ git clone https://github.com/code4luck/ProtAttBA.git /content/protattba_repro/ProtAttBA
+Cloning into '/content/protattba_repro/ProtAttBA'...
+
+$ git -C /content/protattba_repro/ProtAttBA fetch --depth 50 origin && git -C /content/protattba_repro/ProtAttBA checkout 9adbf9899a7b3aa69da4ea00f5b3ca9e14bddbbd
+Note: switching to '9adbf9899a7b3aa69da4ea00f5b3ca9e14bddbbd'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at 9adbf98 Update readme.md
+
+$ git -C /content/protattba_repro/ProtAttBA rev-parse HEAD
+9adbf9899a7b3aa69da4ea00f5b3ca9e14bddbbd
+
+installing 31 of their pins; dropped ['numpy', 'scipy', 'torch', 'torchaudio', 'torchvision']
+
+$ pip install -q -r /content/protattba_repro/requirements_colab.txt
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 102.5/102.5 kB 7.2 MB/s eta 0:00:00
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 53.4/53.4 kB 6.2 MB/s eta 0:00:00
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 157.1/157.1 kB 16.6 MB/s eta 0:00:00
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.7/3.7 MB 126.2 MB/s eta 0:00:00
+  error: subprocess-exited-with-error
+
+  × Getting requirements to build wheel did not run successfully.
+  │ exit code: 1
+  ╰─> See above for output.
+
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+error: subprocess-exited-with-error
+
+× Getting requirements to build wheel did not run successfully.
+│ exit code: 1
+╰─> See above for output.
+
+note: This error originates from a subprocess, and is likely not a problem with pip.
+!!! STAGE_FAILED (1): pip install -q -r /content/protattba_repro/requirements_colab.txt
+An exception has occurred, use %tb to see the full traceback.
+[0;31mSystemExit[0m[0;31m:[0m 1
+
+/usr/local/lib/python3.13/dist-packages/IPython/core/interactiveshell.py:3561: UserWarning: To exit: use 'exit', 'quit', or Ctrl-D.
+  warn("To exit: use 'exit', 'quit', or Ctrl-D.", stacklevel=1)
+[19:03:32] FAILED bootstrap  (grep the log: /mnt/c/Users/tomto/workspaces/converge_bind/.claude/worktrees/baseline-protattba-repro-82952e/experiments/protattba_repro/colab_190102.log)
+[19:03:32] bootstrap failed, stopping

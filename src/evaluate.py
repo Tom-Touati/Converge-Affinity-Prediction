@@ -69,12 +69,28 @@ def _safe_pearson(a, b) -> float:
         return float(stats.pearsonr(a, b)[0])
 
 
-def per_complex(preds: pd.DataFrame, min_group: int = 10) -> pd.DataFrame:
-    """Per-complex correlation table, sorted worst first. The error analysis starts here."""
+MIN_GROUP = 5
+"""Mutations a group needs before its correlation is counted.
+
+Was 10, which is the common choice in the SKEMPI literature and is defensible on its own --
+a Spearman over fewer points is extremely noisy. But on this dataset it discarded 27 of 54
+complexes and 109 rows from the headline, and those excluded complexes carry the *highest*
+error (rmse 2.27 for complexes with 1-5 mutations against 1.33 for 11-20). The metric was
+being computed on the easy half of the data by construction.
+
+Lowering it to 5 is not free: a 5-point Spearman takes only values in a coarse lattice and
+its sampling noise is large. Both thresholds are therefore reported -- `per_complex_spearman`
+at 5, and `per_complex_spearman_min10` at the old rule, so every earlier number in this repo
+stays comparable.
+"""
+
+
+def _grouped(preds: pd.DataFrame, key: str, min_group: int) -> pd.DataFrame:
+    """Correlation table over one grouping key, worst first."""
     rows = []
-    for cx, g in preds.groupby("complex"):
+    for name, g in preds.groupby(key):
         rows.append({
-            "complex": cx,
+            key: name,
             "n": len(g),
             "ddG_sd": g["y_true"].std(),
             "spearman": _safe_spearman(g["y_true"], g["y_pred"]),
@@ -86,7 +102,72 @@ def per_complex(preds: pd.DataFrame, min_group: int = 10) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def metrics(preds: pd.DataFrame, min_group: int = 10) -> dict:
+def per_complex(preds: pd.DataFrame, min_group: int = MIN_GROUP) -> pd.DataFrame:
+    """Per-complex correlation table, sorted worst first. The error analysis starts here."""
+    return _grouped(preds, "complex", min_group)
+
+
+def per_cluster(preds: pd.DataFrame, min_group: int = MIN_GROUP) -> pd.DataFrame:
+    """Per-homology-cluster correlation table.
+
+    The complex is not the independent unit -- 54 complexes sit in 17 clusters, and a cluster
+    can hold ten near-identical complexes. Averaging per complex therefore weights a
+    well-sampled cluster ten times over a singleton, which is the same imbalance the grouped
+    split exists to control for on the training side but nothing controlled for on the
+    reporting side.
+    """
+    return _grouped(preds, "cluster", min_group)
+
+
+def pairwise_concordance(preds: pd.DataFrame, margin: float = 0.0,
+                         key: str = "complex") -> dict:
+    """Fraction of within-group pairs the model orders correctly. Defined from n >= 2.
+
+    Spearman needs enough points to be meaningful, which is why the headline drops any complex
+    under the threshold -- and that silently discards the hardest data. At min_group 5 that is
+    still 20 complexes and 111 rows; at 10 it was 27 complexes and 109 rows, and those carry
+    the largest errors in the dataset.
+
+    Concordance has no such floor. A complex with two mutations contributes exactly one
+    comparison, one with nine contributes 36, and every row in the dataset participates. It is
+    also the quantity the ranking loss optimises and the one that matters for "which of these
+    two mutations should I make", so it is arguably a better headline than Spearman regardless
+    of the small-group problem.
+
+    ``margin`` drops pairs closer than that in true ddG. Measurement noise is around
+    0.5 kcal/mol, so below it the true ordering is near a coin flip and the pair scores noise.
+
+    Returns micro (pool every pair) and macro (average the per-group fraction). They differ
+    when groups vary in size, which here they do by two orders of magnitude.
+    """
+    y, p_, g = preds["y_true"].to_numpy(float), preds["y_pred"].to_numpy(float), preds[key]
+    tot = ok = 0
+    per, sizes = [], []
+    for _, idx in g.groupby(g).groups.items():
+        i = preds.index.get_indexer(idx)
+        yy, pp = y[i], p_[i]
+        if len(yy) < 2:
+            continue
+        a, b = np.triu_indices(len(yy), 1)
+        dy = yy[a] - yy[b]
+        keep = np.abs(dy) > margin
+        if not keep.any():
+            continue
+        agree = np.sign(dy[keep]) == np.sign(pp[a][keep] - pp[b][keep])
+        tot += int(keep.sum())
+        ok += int(agree.sum())
+        per.append(float(agree.mean()))
+        sizes.append(int(keep.sum()))
+    return {
+        "pairs": tot,
+        "groups": len(per),
+        "micro": ok / tot if tot else np.nan,
+        "macro": float(np.mean(per)) if per else np.nan,
+        "median_group_pairs": int(np.median(sizes)) if sizes else 0,
+    }
+
+
+def metrics(preds: pd.DataFrame, min_group: int = MIN_GROUP) -> dict:
     """Every headline number, from one predictions table."""
     missing = [c for c in REQUIRED if c not in preds.columns]
     if missing:
@@ -104,6 +185,7 @@ def metrics(preds: pd.DataFrame, min_group: int = 10) -> dict:
         "per_complex_spearman": float(kept["spearman"].mean()),
         "per_complex_pearson": float(kept["pearson"].mean()),
         "per_complex_spearman_all": float(pc["spearman"].mean(skipna=True)),
+        "min_group": int(min_group),
         # --- comparability with the SKEMPI literature -----------------------------------
         "global_spearman": _safe_spearman(y, p),
         "global_pearson": _safe_pearson(y, p),
@@ -111,6 +193,39 @@ def metrics(preds: pd.DataFrame, min_group: int = 10) -> dict:
         "rmse": float(np.sqrt(np.mean((y - p) ** 2))),
         "mae": float(np.mean(np.abs(y - p))),
     }
+
+    # --- the old threshold, kept so every number reported before this change stays readable
+    kept10 = pc[pc["n"] >= 10]
+    m["per_complex_spearman_min10"] = (float(kept10["spearman"].mean())
+                                       if len(kept10) else np.nan)
+    m["n_complexes_counted_min10"] = int(len(kept10))
+
+    # --- cluster as the unit, since complexes inside a cluster are not independent ---------
+    if "cluster" in preds.columns:
+        cl = per_cluster(preds, min_group)
+        keptc = cl[cl["counted"]]
+        m["n_clusters"] = int(preds["cluster"].nunique())
+        m["n_clusters_counted"] = int(len(keptc))
+        m["per_cluster_spearman"] = float(keptc["spearman"].mean()) if len(keptc) else np.nan
+        m["per_cluster_spearman_all"] = float(cl["spearman"].mean(skipna=True))
+        # Complexes averaged with each cluster weighted once, so a ten-complex cluster does not
+        # count ten times. This is the number least flattered by the dataset's imbalance.
+        byc = pc.merge(preds[["complex", "cluster"]].drop_duplicates(), on="complex", how="left")
+        byc = byc[byc["counted"]]
+        m["per_complex_spearman_cluster_weighted"] = (
+            float(byc.groupby("cluster")["spearman"].mean().mean()) if len(byc) else np.nan)
+
+    # --- concordance: the slice-free metric, every complex and every row included ---------
+    for tag, margin in (("", 0.0), ("_m05", 0.5)):
+        c = pairwise_concordance(preds, margin=margin)
+        m[f"concordance_micro{tag}"] = c["micro"]
+        m[f"concordance_macro{tag}"] = c["macro"]
+        m[f"concordance_pairs{tag}"] = c["pairs"]
+        m[f"concordance_groups{tag}"] = c["groups"]
+    if "cluster" in preds.columns:
+        cc = pairwise_concordance(preds, margin=0.5, key="cluster")
+        m["concordance_cluster_micro_m05"] = cc["micro"]
+        m["concordance_cluster_macro_m05"] = cc["macro"]
 
     # --- the classification framing ------------------------------------------------------
     m["macro_f1"] = float(f1_score(to_classes(y), to_classes(p), average="macro",
@@ -194,9 +309,16 @@ def paired_bootstrap(a: pd.DataFrame, b: pd.DataFrame, metric: str = "per_comple
 def format_report(m: dict, ci: dict | None = None, title: str = "") -> str:
     ci = ci or {}
     lines = [f"== {title} ==" if title else "== results =="]
+    # The threshold is read from the metrics rather than hardcoded. It said "n>=10" for a
+    # while after the default moved to 5, which is exactly the kind of stale label that makes
+    # two different metrics look like one.
+    mg = m.get("min_group", MIN_GROUP)
     order = [
-        ("per_complex_spearman", "per-complex Spearman (n>=10)  HEADLINE"),
+        ("per_complex_spearman", f"per-complex Spearman (n>={mg})  HEADLINE"),
+        ("per_complex_spearman_min10", "per-complex Spearman (n>=10)"),
         ("per_complex_spearman_all", "per-complex Spearman (all)"),
+        ("per_cluster_spearman", f"per-cluster Spearman (n>={mg})"),
+        ("concordance_micro_m05", "pairwise concordance (margin 0.5)"),
         ("per_complex_pearson", "per-complex Pearson"),
         ("global_spearman", "global Spearman"),
         ("global_pearson", "global Pearson"),

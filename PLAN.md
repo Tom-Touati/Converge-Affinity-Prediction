@@ -23,7 +23,7 @@ Roughly 40 working hours, with about 40% on data, splits and evaluation, 25% on 
 | 2. Clustered splits | 5 | Frozen fold file committed; leakage checks pass | If clusters are too unbalanced for 5 folds, fall back to leave-one-cluster-out |
 | 3. Eval harness and trivial baselines | 4 | Report generator prints all metrics with CIs for mean and substitution-matrix baselines | None |
 | 4. Feature caching (PLM, structure) | 5 | Embeddings and structure features cached on disk, keyed by row id | If a structure model fights the install for over 1.5 h, swap it for the next option |
-| 5. Model ladder, rungs 2 to 5 | 8 | Each rung has a harness report and a one-line verdict | Max 2 h per rung before writing down the result as is |
+| 5. Model ladder, feature rungs 2-6 then learned rungs N0-N2 | 12 | Each rung has a harness report and a one-line verdict | Max 2 h per rung, 4 h for the N2 attention module, before writing down the result as is |
 | 6. Error analysis | 6 | Slice tables, residual plots, 10 hand-inspected worst cases | None; this is the graded part |
 | 7. README, results, next steps | 5 | A stranger can reproduce the headline table from the README | Freeze code 5 h before submission |
 
@@ -177,14 +177,97 @@ Each rung is one experiment on the frozen harness. A rung is kept only if it bea
 | 1 | Substitution features only (BLOSUM62 score, hydrophobicity Δ, volume Δ, charge Δ, is-proline, is-glycine) + gradient-boosted trees | How far does mutation chemistry alone get us, no protein context | minutes |
 | 2 | Sequence PLM: ESM-2 (8M then 35M), embedding difference wt vs mut at the mutated position + mean-pool, into a ridge/MLP head | Does a sequence model beat raw chemistry | 1 GPU-hour |
 | 3 | Structure only: ESM-IF1 or AntiFold inverse-folding log-likelihood ratio at the mutated position, plus rSASA and interface distance | Does structure alone beat sequence | 1–2 GPU-hr |
-| 4 | Late fusion: concatenate rung-2 and rung-3 features, one head | The core question, does combining modalities help, and by how much | +minutes |
+| 4 | Late fusion: concatenate rung-2 and rung-3 features, one head | Does combining modalities help at all, and by how much. **The control the learned models must beat** | +minutes |
 | 5 | Fusion + explicit interface features (contacts across the antibody–antigen interface, Δ contacts on mutation) | Is the interface the missing signal | +1 GPU-hr |
+| N2 | **Cross-attention fusion**: the mutation queries the interface residues around it, distance-biased, frozen encoders | Does an architecture that models *which* residues the mutation interacts with beat flat concatenation | +3-4 h |
+| N2a | Uniform-attention control: mean-pool the same residue set | Was the gain the residue filter rather than attention | +minutes |
+| N2b | Distance-bias-only control: attention weights from geometry, no content | Was the gain the physical prior rather than learned content | +minutes |
 
 Mutation representation, decided up front: the difference vector between wild-type and mutant embeddings at the mutated residue, concatenated with the position's structural context. Difference vectors are the standard, cheap and strong choice for ΔΔG; whole-sequence pooling alone washes out a single-residue change. Multi-point mutations sum the per-position difference vectors as a first approximation. The paper's double-mutant cycles show this is only half true, 345 additive against 421 context-dependent, so the approximation gets tested rather than assumed.
 
-Head: gradient-boosted trees or a 2-layer MLP with dropout. With this sample size a linear or tree head on good features will be hard to beat, and we say so rather than reaching for a transformer.
+Head: gradient-boosted trees or a 2-layer MLP with dropout for rungs 1 to 5; the attention module below for rung N2. With this sample size a linear or tree head on good features is genuinely hard to beat, so the feature rungs stay deliberately simple and N2 has to earn its parameters against them rather than replacing them.
 
 Antisymmetry: for every forward mutation the reverse should give −ΔΔG. We test this as an evaluation probe on rung 2 onward, and only if it fails badly do we add reverse mutations as augmentation (deferred below).
+
+## Cross-attention fusion (rung N2)
+
+> **Numbering.** Feature-concatenation rungs are 0-6; the learned fusion ladder is N0-N5. They
+> are separate sequences because `rung6_chem_geom_mpnn_gbt` on disk is a *feature* rung, not this.
+> [`ARCHITECTURE.md`](ARCHITECTURE.md) carries the implementation-level specification -- pipeline,
+> tensor shapes, parameter budget -- and supersedes this section wherever the two differ.
+>
+> **The target has moved.** N2 must beat **rungN0 at per-complex rho 0.475**, not rung 4 at 0.349.
+
+Concatenation is a weak model of what binding actually is. A mutation's effect on ΔΔG depends on
+*which residues it contacts across the interface*, and a concatenated feature vector has thrown
+that structure away before the head ever sees it. Rung 6 puts it back: the mutation is a query,
+the residues around it are keys and values, and the model learns what to attend to.
+
+**This is the component the evidence says matters least, and we build it anyway — with the
+experiment designed so a negative result is still a result.** `PRIOR_WORK.md` finds data volume,
+not architecture, is the binding constraint at n≈1,000, and `BACKBONE_COMPARISON.md` finds the
+training objective swings scores far more than the encoder or the fusion. The assignment grades
+multimodal fusion explicitly, and "we concatenated two vectors" is a thin answer to that. So the
+question is put properly and answered with evidence either way.
+
+### Architecture
+
+| Component | Content |
+| --- | --- |
+| **Query** (1 token) | The mutation: ESM-2 embedding difference (wild type vs mutant) at the mutated position, concatenated with the rung-1 chemistry vector, projected to d = 64 |
+| **Keys / values** (N ≈ 20–60 tokens) | Context residues: every residue with a heavy atom within 10 Å of the mutated residue, on both chains, with all across-interface partner residues forced in. Each token is [frozen per-residue ESM-2 embedding ‖ inverse-folding per-residue log-probability vector ‖ geometry: distance to the mutated residue, rSASA bound, rSASA unbound, ΔrSASA, is-partner-chain], projected to d = 64 |
+| **Attention** | One multi-head layer, 4 heads, d = 64. Logits carry a learned monotone **distance bias**, so the module initialises near "attend to what is close" and learns deviations from it |
+| **Head** | concat[query, attended context] → 64 → 32 → 1, dropout 0.2 |
+
+Encoders stay frozen. Only the projections, the attention layer and the head train — on the order
+of 50k parameters, which is reported next to every result.
+
+### Why this is defensible at 997 rows
+
+The honest risk is overfitting, so three of the four design decisions exist to manage it:
+
+1. **Attention runs over 20–60 pre-filtered residues, not the ~600 in the complex.** The physical
+   prior — binding effects are local to the interface — does the hard part of the problem. The
+   attention layer only reweights inside a set that is already almost all relevant.
+2. **The distance bias means the model starts from physics.** An untrained module behaves roughly
+   like distance-weighted pooling, which is already a sensible predictor, and training moves it
+   away from that only where the data supports it.
+3. **Frozen encoders keep the trainable parameter count comparable to the MLP head in rung 4**,
+   so the comparison against concatenation is about the *mechanism*, not about capacity.
+4. Early stopping uses an **inner split grouped by cluster**, never a random one. We measured why:
+   a constant-per-fold predictor already scores global ρ −0.36 on this data, so a random inner
+   split would leak homology straight back in.
+
+Ten seeds, ensembled, with seed variance reported. At this sample size a single run's number is
+not a result.
+
+### How we will know whether it worked
+
+Rung 6 is kept only if it beats **rung 4** by a paired-bootstrap Δ whose CI clears zero — and only
+if it also survives the two controls, which is where most of the honesty lives:
+
+- **6a, uniform attention.** Replace the learned weights with a plain mean over the same filtered
+  residue set. If this matches N2, the gain came from choosing the right residues, not from
+  attention, and the right conclusion is that a better *feature set* beat a better architecture.
+- **6b, distance-bias only.** Attention weights computed from geometry alone, with the content
+  term switched off. If this matches N2, the gain came from the physical prior we injected,
+  not from anything the model learned.
+
+The training objective is held fixed across rungs 4, 5, 6, 6a and 6b. Given how much the objective
+moves scores, varying it and the fusion mechanism together would make the comparison
+uninterpretable.
+
+**Stop rule: 4 hours.** If N2 does not clear the best feature rung, we report that, with the parameter count
+and the seed variance, and the write-up argues from our own evidence that flat concatenation is
+sufficient at this sample size. That is a defensible finding, and a more useful one than a fragile
+win.
+
+### The side benefit: attention weights are an explanation
+
+Every prediction comes with a distribution over the residues it attended to. For the ten
+hand-inspected worst cases in the error analysis, we can show *what the model looked at* and check
+it against the known hotspot residues for that complex. A model that attends to the wrong side of
+the interface is diagnosable in a way a gradient-boosted tree on pooled features is not.
 
 ## Error analysis
 
@@ -226,7 +309,7 @@ The whole point of the ladder and the slices is to attribute a disappointing sco
 | Split leakage | Random vs cluster-split gap | Large gap | Trust cluster split; the random number was the lie |
 | Sequence encoder | Rung 2 vs rung 1 Δ | Rung 2 barely beats chemistry | Bigger / antibody-specific PLM (AbLang2) |
 | Structure encoder | Rung 3 vs rung 2; residual vs interface features | Structure adds nothing where it should (COR mutations) | Better structure model, real interface geometry |
-| Fusion | Rung 4 vs max(rung 2, rung 3) | Fusion ≤ best single modality | Smarter fusion (deferred below) |
+| Fusion | Rung 4 vs max(rung 2, rung 3); then N2 vs the best feature rung | Fusion ≤ best single modality, or cross-attention ≤ concatenation | N2 is the fix, and N2a/N2b say whether it was the mechanism or the features |
 | Optimisation / head | Train vs test gap; floor comparison | Overfitting, or not beating the mean | Stronger regularisation, simpler head |
 
 The rule: we do not touch a moving part until its diagnostic says it is the binding constraint. Early on the likely constraints are label noise and data volume, not fusion sophistication, which is exactly why fusion upgrades are deferred and the ladder starts at a substitution-matrix baseline.
@@ -237,17 +320,51 @@ Each of these is written into the "next steps" section of the submission with th
 
 | Idea | Trigger | Note |
 | --- | --- | --- |
-| Cross-attention fusion (mutation attends to interface residues) instead of concat | Late fusion beats single modality, and residual-vs-interface plot still shows unused signal | Only worth it once concat has proven fusion helps at all |
 | Reverse-mutation augmentation (enforce ΔΔG(reverse) = −ΔΔG) | Antisymmetry probe fails badly | Cheap, and doubles data; keep pairs in one fold |
 | Cheap-negative pretraining: real antibodies vs random unrelated antigens as confident non-binders, then fine-tune on SKEMPI | Learning curve shows data volume is the constraint | Strong if volume is the bottleneck, but validate the non-binder assumption |
 | More labeled data (AB-Bind, other SKEMPI subsets, deep-mutational-scan sets) | Data-volume diagnostic positive; noise ceiling not yet reached | Watch for distribution shift and re-cluster jointly |
 | Antibody-specific encoders (AbLang2, AntiFold, IgFold) | Generic PLM/structure encoder is the weak rung | Drop-in swaps behind the cached-feature interface |
 | Ensemble / uncertainty | Only for the final report | Bootstrap ensemble gives per-prediction error bars, useful for a "which mutation to trust" story |
 
-| Pairwise within-complex ranking loss | Per-complex Spearman stalls while RMSE improves, or the censored/non-binder rows are wanted | Not augmentation -- 19,834 pairs from 997 rows is 19.9x the examples but zero new information. Real merits: it optimises the headline metric directly, cancels the per-complex offset exactly (a constant-per-fold predictor scores global rho -0.36, so the shortcut is live), and is invariant to per-complex rescaling, which matters when 47.7% of temperatures are assumed. Costs: the top 3 complexes hold 43.2% of pairs against 22.8% of rows, so pairs need 1/C(n,2) weighting; near-ties are noise, so filter to abs(delta) > 1, which keeps 10,703 pairs (54%); no kcal/mol scale, so pair it with the regression head rather than replacing it |
+| Pairwise within-complex ranking loss | **Deferred 2026-09-20.** Trigger is now narrow: build it only when we want the 80 non-binders and 86 censored rows back, i.e. as data recovery. Not for a score gain -- the efficiency argument was tested and failed | Not augmentation -- 19,834 pairs from 997 rows is 19.9x the examples but zero new information. Real merits: it optimises the headline metric directly, cancels the per-complex offset exactly (a constant-per-fold predictor scores global rho -0.36, so the shortcut is live), and is invariant to per-complex rescaling, which matters when 47.7% of temperatures are assumed. Costs: the top 3 complexes hold 43.2% of pairs against 22.8% of rows, so pairs need 1/C(n,2) weighting; near-ties are noise, so filter to abs(delta) > 1, which keeps 10,703 pairs (54%); no kcal/mol scale, so pair it with the regression head rather than replacing it. **Efficiency argument tested and not supported** -- see the centering result below. The data-recovery argument (80 non-binders, 86 censored rows) is untouched by that test and still stands |
 | Reverse-mutation augmentation, revisited | Antisymmetry probe fails, or the stabilising slice stays at chance | The strongest lever for the *actual* deficiency: 544 destabilising rows (> +0.5) reversed give 544 synthetic clearly-stabilising examples against the 130 real ones, a 5x increase in the class the model is blind to. Known weakness: no mutant structure exists, so the wild-type backbone is reused |
 | Distal-neutral augmentation (mutate far from the interface, label ~0) | Only as a regulariser or a probe, not as bulk training data | The labelling assumption is validated by our own data: SUR mutations average +0.09 with sd 0.37, below measurement noise, and 86.1% are neutral. But it targets the wrong gap -- it grows the neutral class (already 32.4%) and adds nothing stabilising -- and 83.8% of the test set is interface proper, so it trains a region the test set barely contains. It is also largely redundant with the rSASA / interface-distance features, which let the model learn "distal implies zero" from the 79 real SUR rows. Strongest forms: a penalty for predicting non-zero at distal positions, and a test-time probe that checks the interface prior was learned at all |
 | FoldX pseudo-label pretraining | Learning curve shows data volume is the constraint | Strictly more informative than distal-neutral for the same purpose: a graded, structure-aware signal across the whole label range rather than a point mass at zero, and `skempi-foldx` ships precomputed values so FoldX never has to run |
+
+### Negative result: within-complex target centering does not help
+
+The cheapest test of the "ranking fixes the offset problem" hypothesis, run before building any
+pair machinery. Train on `ddG - mean(ddG | complex)` using training-fold means only, predict the
+deviation, rank within complex as usual. This captures the whole efficiency argument for a
+ranking loss while changing exactly one thing and keeping the gradient-boosted head, so no
+head-architecture change confounds it.
+
+`python -m src.train --model gbt --features chem --center --name rung1c_chem_gbt_centered`
+
+| Metric | Uncentered | Centered | Paired delta | 95% CI | Clears zero |
+| --- | --- | --- | --- | --- | --- |
+| **Per-complex Spearman (n>=10)** | 0.180 | 0.167 | **-0.015** | [-0.078, +0.058] | no |
+| Per-complex Spearman (all) | 0.111 | 0.128 | +0.013 | [-0.072, +0.107] | no |
+| Global Spearman | 0.207 | 0.105 | -0.103 | [-0.226, -0.002] | yes |
+
+The global-Spearman drop is the **positive control**: centering removed the between-complex
+component exactly as designed, so this is a real null and not a broken experiment. On the
+headline metric 13 of 27 complexes improved, median delta -0.009 -- a coin flip, with individual
+complexes swinging between -0.35 and +0.44.
+
+What it rules out: that squared error wasting 38% of its gradient on an unlearnable per-complex
+offset is what limits our within-complex ranking. It is not, at least for a tree head on
+chemistry features.
+
+What it does not rule out, stated honestly: the harness's minimum detectable effect for a
+genuinely different model is about +0.10 (power analysis, `reports/`), so an effect of +0.05
+would have been invisible either way. The result is consistent with anything from -0.08 to
++0.06. What tilts it negative is that the point estimate is negative -- a real mechanism should
+at least have produced a positive one.
+
+What survives: a ranking loss is invariant to per-complex *monotone rescaling*, not just
+additive offsets, and it is the only route to using the 80 non-binders and 86 censored rows.
+Those arguments are independent of this test.
 
 The architecture is built so each of these is a swap behind a stable interface: encoders write cached feature files keyed by row id, and the fusion head reads features by name. Changing an encoder or adding a modality does not touch the split, the harness, or the error-analysis code.
 

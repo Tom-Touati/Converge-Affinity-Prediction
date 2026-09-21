@@ -19,6 +19,8 @@ biopython==1.88          # local Smith-Waterman identity, used by the homology c
 # the code depends on the version.
 torch==2.4.1
 fair-esm==2.0.0          # ESM-2 sequence encoders and ESM-IF1 inverse folding
+transformers==4.46.3     # lazy import in features/hf_plm.py -- any HF masked PLM
+antiberty==1.0.0         # antibody-specific PLM, features/antibody_plm.py
 biotite==1.2.0           # structure IO required by ESM-IF1
 
 # ESM-IF1 additionally needs torch-geometric / torch-scatter / torch-sparse, which are installed

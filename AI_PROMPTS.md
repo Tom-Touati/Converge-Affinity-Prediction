@@ -70,3 +70,186 @@ harness:
   pushing a system-level installer. Recorded in `requirements.txt`.
 - A failing test turned out to be a bug in the test's own helper (uneven complex sizes), not in
   the harness. Fixed the helper.
+
+---
+
+## Session, 2026-09-21 — GPU runs, and removing residual learning
+
+The longest session of the project. Full technical state is in [HANDOFF.md](HANDOFF.md); this
+records how the work was directed and where the assistant was wrong.
+
+### What was asked for, in order
+
+Move training to a GPU; add reverse-mutation augmentation; run the AbRank-style pairwise loss;
+deeper error analysis for both models; then a sequence of corrections that reshaped the results
+— change the ≥10-mutation rule to 5, add a per-cluster metric, add a distance metric usable
+below n=5, add an intermediate split, and finally **stop using residual methods entirely and
+compare the network to the random forest on its own**.
+
+### Corrections the assistant had to make to its own claims
+
+These are recorded because the pattern matters more than any single number: on this dataset a
+plausible mechanism attached to a small measurement is usually wrong.
+
+- **"The net beats the forest, 0.506 vs 0.498."** False. The net scored 830 rows and the forest
+  997. On matched rows the forest led, 0.518 to 0.506. Sweep rows now carry the forest's score
+  on exactly the rows the net scored.
+- **"Capacity reduction is the dominant lever."** False. `d=32` looked best as a single lever,
+  but combining the regularisers at full width matched it (0.506 vs 0.502) — the width
+  reduction contributed nothing.
+- **"Validation peaks at step 40 then decays."** That was noise on a coarse trace. On the loss,
+  at finer resolution, there is no decay in that window.
+- **"Tough regularisation is the fix."** It suppressed memorisation (train ρ 0.912 → 0.654)
+  without improving generalisation (validation ρ flat near 0.23 in every configuration).
+- **"`no_scalars` is the best configuration."** A one-fold, one-seed probe artefact: 0.499 on
+  the probe, 0.378 on the real sweep — *below* the control.
+- **"ESM-2 650M costs 0.026."** Overstated: the paired bootstrap CI was [−0.065, +0.013] and
+  does not clear zero. It is a tie, not a demonstrated harm.
+- **"The intrinsic-tier reversal is explained by cluster size."** Not supported —
+  corr(ρ, log cluster rows) = −0.148. The tiers differ in *composition* instead, and no
+  mechanism is established.
+
+### Where the user caught what the assistant did not
+
+- Reading the live loss curves: *"it doesn't look like the overfit is after 1 epoch"* — an
+  epoch had become 135–205 steps, so early stopping could not evaluate before step 146 and was
+  checkpointing a memorised model. The fix (step-level evaluation) roughly doubled the score.
+- *"Why does validation look like 0.2 correlation when we are talking about 0.5?"* — this is
+  what exposed residual learning as the thing carrying every reported number.
+- *"Correlation can be misleading"* — prompted adding MAE, median error and rmse/sd, which
+  showed destabilising mutations scoring ρ +0.439 while being worse than a constant.
+- *"Why do we need to extract? We should have everything."* — ~20 minutes of GPU time per run
+  was being spent rebuilding feature files that already existed locally.
+
+### Assistant errors in its own tooling
+
+Worth recording separately, because they cost more time than the modelling did: gating on exit
+codes from a CLI that always returns 0; `tail -f` silently doing nothing on `/mnt/c`; `grep`
+block-buffering off a TTY; emitting bare `NaN` in JSON and verifying it with `curl`, which does
+not parse the body; and grouping training curves by epoch when evaluation had moved to steps.
+
+### Closing the session: censored affinities
+
+Tom's final instruction was to mark the censored affinities as an issue to resolve, with the
+current policy being to drop them. Implemented in `src/data.py` with a `--keep-censored`
+escape hatch for reproducing earlier numbers.
+
+The cost turned out to be much larger than the 6% of rows suggested, and it is worth recording
+because the instinct "6% of rows, so a small effect" was wrong:
+
+    997 rows, 54 complexes  ->  940 rows, 53 complexes
+    forest, cluster split    0.388 -> 0.239
+    forest, complex split    0.413 -> 0.354
+    concordance              0.735 -> 0.668
+
+Censored rows average +2.09 kcal/mol against +0.97 for the rest — they are large,
+one-directional effects and therefore the *easiest* rows in the set to rank. Six percent of
+the data was carrying 0.149 of the headline.
+
+Two follow-on decisions, both deliberate:
+
+- **The frozen split was regenerated rather than the test relaxed.** `test_splits.py` asserts
+  folds.csv and dataset.parquet hold the same row_ids, and it failed — correctly, because the
+  dataset had changed underneath a frozen split. Relaxing it to a subset check would have
+  disarmed the guard; regenerating is the honest response to a deliberate data change.
+  `row_id` is `#Pdb|mutations`, content-based, so cached features survived untouched.
+- **Dropping is documented as a placeholder, not a fix.** It discards real evidence at exactly
+  the strongly-destabilising end the model is worst at. Censored regression or a ranking
+  constraint is the correct treatment.
+
+---
+
+## Session, 2026-09-21 (later) — reproducing ProtAttBA as an external baseline
+
+Separate branch, `baseline/protattba-repro`, under `experiments/protattba_repro/`. Nothing
+under `src/`, `configs/`, `data/` or the existing `Makefile` targets was modified.
+
+### What was asked for
+
+> Task: reproduce ProtAttBA as an isolated external baseline, on a new branch. Do not touch
+> any existing project code (src/, configs/, data/, evaluate.py, etc.) — this is a
+> validation exercise, not a new ladder rung.
+>
+> [...] Reproduce their S1131 result (S1131 = 1,131 single-point mutations from SKEMPI, Xiong
+> et al. 2017 curation — the same underlying source as this project's own dataset), ESM2
+> embedding variant, 10-fold cross-validation, from their Table 1: PCC 0.84 ± 0.05, Spearman
+> ρ 0.75 ± 0.06, RMSE 1.31 ± 0.09 kcal/mol. [...]
+>
+> Try to run their code as-is, unmodified, on their shipped S1131 data first. This is the
+> priority path — a faithful run of the original code is much more likely to land on their
+> numbers than a reimplementation from the paper's text, since papers routinely omit details
+> (init, exact preprocessing, minor architectural choices) that matter.
+>
+> Time-box debugging to reach the target numbers at 2 hours past having something training
+> end-to-end. [...] A documented near-miss with a clear reason is a fine outcome; an
+> open-ended tuning loop is not.
+
+The full prompt also specified the fallback reimplementation spec, the deliverables, and the
+instruction not to merge to main.
+
+Two mid-session redirections:
+
+> go through the repo at C:\Users\tomto\workspaces\converge_bind , start with handoff.md
+> we already have the esm2 features extracted, connection to launch training in colab, error
+> analysis and evaluation. copy those as well and perform the exact error analysis with the
+> dashboard. then make sure you copy the results
+
+This caught that the branch had been cut from `main` and was missing 30 commits of
+infrastructure — the current evaluation harness, the error analysis, the dashboard, the Colab
+runner, and the censored-affinity drop that moved the dataset from 997 rows to 940.
+
+> the forest works as written. we want to check if the external repo logic can be run on this
+> infrastructure and reach the same results
+
+Refocused the work: the point is not to re-validate our own forest but to establish that an
+external repository's logic runs on this infrastructure and lands on its published number.
+
+### What it produced
+
+- `experiments/protattba_repro/` — the reproduction: metrics, the published-number check, the
+  frozen-encoder assumption tests, the embedding cache, the CV runner, the comparison, and a
+  Colab runner following `scripts/colab_run.sh`'s conventions.
+- The branch brought up to the infrastructure branch's file contents.
+
+### Findings worth keeping
+
+- **Their Table 1 is internally consistent and their split is recoverable.** The repo commits
+  the full per-example output of one 10-fold run. Scoring it reproduces the published
+  0.84/0.75/1.31 exactly, and `KFold(10, shuffle=True, random_state=3407)` reproduces their
+  fold assignment for all 1131 rows. So the target needed no guessing, and the metric
+  definition turned out to be a per-fold mean with a *population* std.
+- **Model selection in their code runs on the test fold.** `WrapperDataset` assigns
+  `test_idxes` to `self.val_dataset`, and `get_val_loader`/`get_test_loader` return the same
+  object, so `EarlyStopping` and `ModelCheckpoint` monitor `val_pearson_corr` on the fold that
+  is then reported. The published number is best-of-120-epochs on the test fold. Reproduced
+  deliberately, with an `honest` protocol alongside it on identical folds.
+- **Their attention mask uses `1e-10` instead of `-inf`.** Padded keys keep softmax mass, so a
+  prediction depends on how wide its batch happened to be padded. This is why batch size 12
+  was held fixed rather than reduced to fit the local GPU.
+- **The ESM2 checkpoint the paper never names is 650M**, pinned independently by
+  `MODEL_LOCATE="./model/esm2_650m"` and by `HIDDEN_SIZE=1280`, which is 650M's hidden size
+  and no other ESM2 size's.
+- **Running their file literally is out of reach here, for an arithmetic reason rather than a
+  debugging one.** It calls ESM2-650M four times per example per step with the backbone
+  frozen — about 4 CPU-hours per epoch and ~1700 hours for the 10-fold run. The encoder was
+  cached instead, after measuring the three properties that make that an identity, and the
+  cache took 159 minutes on this CPU against about 3 on a T4.
+- **Colab has moved to python 3.13 and ProtAttBA's 2024 pins have no wheels for it.** Their
+  `requirments.txt` cannot be installed there at all. Only what the S1131 path imports was
+  installed, and the resulting library drift was cross-checked by re-embedding three sequences
+  on the VM and comparing against the cache built under their own pins.
+- **121 of the 123 run directories in `reports/` predate the censored-affinity drop.** Only
+  `ov_both_geom` and `rf_complex` report n=940. HANDOFF flags this; the count makes it
+  concrete.
+
+### Assistant errors and corrections during the session
+
+- Wrote a padding-invariance test that drew its four sequences from consecutive csv rows, which
+  were all the same PDB and the same length — it padded 191 to 193 and proved nearly nothing.
+  Rewritten to span 4.7x in length.
+- Consumed `get_K_fold_with_test_generator` lazily inside the fold loop. Its validation split
+  is drawn from the global numpy RNG, so fold k's split would have depended on how much
+  randomness training folds 0..k-1 burned. Made eager.
+- Assumed the 2 GB GTX 1050 would hold the run with gradient checkpointing. It does not; after
+  the CUDA context and the Windows display, PyTorch gets about 900 MB and it OOMs at batch 12
+  regardless.
