@@ -19,6 +19,12 @@ structure, on the antibody–antigen subset of SKEMPI 2.0.
 > (those are forest numbers), but the threshold under it moved and the fusion results did not
 > survive scrutiny.
 >
+> 0. **Censored affinities are dropped, and the dataset is now 940 rows, not 997.** SKEMPI
+>    writes a detection limit as `">1e-6"`; the pipeline was reading it as an exact value.
+>    Those rows average +2.09 kcal/mol against +0.97 for the rest and were the easiest in the
+>    set to rank, so removing them costs a great deal: the forest goes **0.388 → 0.239** on
+>    the cluster split and 0.413 → 0.354 on the complex split. Every table below predates this
+>    and is on 997 rows.
 > 1. **The headline threshold is now 5 mutations, not 10.** The old rule discarded 27 of 54
 >    complexes and the discarded ones carried the highest error. The model to beat reads
 >    **0.388** at the new threshold and 0.498 at the old one — same predictions. Every table
@@ -436,9 +442,14 @@ no-op on anything already computed.
 Open defects, quantified, with the fix each one needs. Detail and decisions in
 [`PLAN.md`](PLAN.md).
 
-- **86 censored affinities are trained on as exact measurements** (45 mutant, 41 wild-type).
-  SKEMPI parses `">1e-6"` into a bare number and `src/data.py` currently trusts it. That is 8.6%
-  of the dataset, and it should be fixed before the encoders are trained against these labels.
+- **Censored affinities are now DROPPED, which is a holding policy rather than a fix.**
+  SKEMPI parses `">1e-6"` into a bare number; `src/data.py` used to trust it, and now removes
+  those rows (72 measurements, 57 modelling rows, and `4I77_HL_Z` entirely). The cost is
+  real — the forest falls from 0.388 to 0.239 on the cluster split, because censored rows are
+  large one-directional effects and therefore the easiest to rank. Dropping also discards
+  genuine evidence at exactly the strongly-destabilising end the model is worst at. The right
+  treatment is **censored regression** (one-sided loss) or a ranking constraint.
+  `--keep-censored` reproduces the old behaviour and exists only for reproducing old numbers.
 - **80 qualitative non-binders (`n.b.`) are discarded**, losing the strongest destabilising
   evidence in the set. Recoverable as ranking constraints rather than point labels.
 - **37 rows are exactly 0.000, and 22 of them sit in one complex** (`2JEL_LH_P`) -- a reporting

@@ -127,3 +127,32 @@ Worth recording separately, because they cost more time than the modelling did: 
 codes from a CLI that always returns 0; `tail -f` silently doing nothing on `/mnt/c`; `grep`
 block-buffering off a TTY; emitting bare `NaN` in JSON and verifying it with `curl`, which does
 not parse the body; and grouping training curves by epoch when evaluation had moved to steps.
+
+### Closing the session: censored affinities
+
+Tom's final instruction was to mark the censored affinities as an issue to resolve, with the
+current policy being to drop them. Implemented in `src/data.py` with a `--keep-censored`
+escape hatch for reproducing earlier numbers.
+
+The cost turned out to be much larger than the 6% of rows suggested, and it is worth recording
+because the instinct "6% of rows, so a small effect" was wrong:
+
+    997 rows, 54 complexes  ->  940 rows, 53 complexes
+    forest, cluster split    0.388 -> 0.239
+    forest, complex split    0.413 -> 0.354
+    concordance              0.735 -> 0.668
+
+Censored rows average +2.09 kcal/mol against +0.97 for the rest — they are large,
+one-directional effects and therefore the *easiest* rows in the set to rank. Six percent of
+the data was carrying 0.149 of the headline.
+
+Two follow-on decisions, both deliberate:
+
+- **The frozen split was regenerated rather than the test relaxed.** `test_splits.py` asserts
+  folds.csv and dataset.parquet hold the same row_ids, and it failed — correctly, because the
+  dataset had changed underneath a frozen split. Relaxing it to a subset check would have
+  disarmed the guard; regenerating is the honest response to a deliberate data change.
+  `row_id` is `#Pdb|mutations`, content-based, so cached features survived untouched.
+- **Dropping is documented as a placeholder, not a fix.** It discards real evidence at exactly
+  the strongly-destabilising end the model is worst at. Censored regression or a ranking
+  constraint is the correct treatment.

@@ -6,6 +6,32 @@ trusting any number in the older documents: several headline figures in `README.
 
 ---
 
+## 0. Read this first — the dataset changed on 2026-09-21
+
+**Censored affinities are now dropped.** SKEMPI records a detection limit as `">1e-6"` and
+parses it to a bare number, so the row means "Kd is at least this" and the pipeline read "Kd
+is exactly this". Those rows are one-directionally biased: they average **+2.09 kcal/mol**
+against +0.97 for the rest, because a censored affinity means binding too weak to measure.
+
+    997 rows, 54 complexes   ->   940 rows, 53 complexes   (72 measurements, 4I77_HL_Z lost)
+
+The cost is large, and in the direction that matters:
+
+| | before (997 rows) | after (940 rows) |
+|---|---|---|
+| forest, cluster split | 0.388 | **0.239** |
+| forest, complex split | 0.413 | **0.354** |
+| concordance, cluster | 0.735 | **0.668** |
+
+Those censored rows were the easiest in the dataset to rank — large, one-directional effects
+— so 6% of the data was inflating the headline by 0.149. **Every network number in §1 and §6
+below was produced on the 997-row dataset and needs regenerating.** The forest numbers here
+are current; the net numbers are not.
+
+Dropping is a holding policy, not the right answer. See §9.
+
+---
+
 ## 1. The result
 
 **The random forest is the model. The neural network does not beat it, on either split.**
@@ -211,7 +237,16 @@ both splits), and removing the scalar bypass hurts (`dir_noscalars`).
   rather than "worse". `evaluate.paired_bootstrap(a, b, n_boot=2000)`.
 - **`AI_PROMPTS.md` is a required deliverable and is days stale.**
 - **`README.md`, `ARCHITECTURE.md`, `ERROR_ANALYSIS.md` carry pre-correction numbers.**
-- **86 censored affinities** are still trained on as exact point labels.
+- **Censored affinities: dropped, and that is a placeholder.** `src/data.py` removes any row
+  whose affinity was recorded as a detection limit (72 measurements, 57 modelling rows, one
+  whole complex). Dropping throws away real evidence — "binds worse than X" is informative,
+  and it is exactly the strongly-destabilising end of the range the model is worst at. The
+  right treatment is **censored regression** (a one-sided loss that penalises predicting below
+  the bound but not above it) or a ranking constraint, either of which uses the row as the
+  bound it actually is. `--keep-censored` reproduces the old behaviour and exists only for
+  that; it is wrong and should not be used for a reported number.
+- **The net sweeps need re-running on the 940-row dataset.** Every `dir_*` figure predates the
+  drop.
 - The intrinsic-tier reversal (§5) has a measured effect and no established mechanism.
 - `thoughts.md` is Tom's personal notes, swept into a commit by an early `git add -A`. Decide
   whether it should stay tracked.

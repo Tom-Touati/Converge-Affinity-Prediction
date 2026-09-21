@@ -44,7 +44,7 @@ def _first(s: pd.Series):
     return s.mode().iloc[0] if len(s) else np.nan
 
 
-def build(verbose: bool = True) -> pd.DataFrame:
+def build(verbose: bool = True, keep_censored: bool = False) -> pd.DataFrame:
     paths.ensure_dirs()
     raw = pd.read_csv(paths.RAW_CSV, sep=";", low_memory=False)
     ab = raw[raw["Hold_out_type"].fillna("").str.contains("AB/AG")].copy()
@@ -67,6 +67,26 @@ def build(verbose: bool = True) -> pd.DataFrame:
     ab["ddG"] = R_GAS * ab["T"] * np.log(ab["Affinity_mut_parsed"] / ab["Affinity_wt_parsed"])
     ab = ab[np.isfinite(ab["ddG"])].copy()
     audit.append(("after dropping unparsable affinities", len(ab), ab["#Pdb"].nunique()))
+
+    # Censored affinities are dropped. SKEMPI writes a detection limit as ">1e-6" and parses it
+    # into a bare number, so the row says "Kd is at least this" and the pipeline reads "Kd is
+    # exactly this". The resulting ddG is a lower bound presented as a measurement, and it is
+    # biased in one direction: censored rows average +2.09 kcal/mol against +0.97 for the rest,
+    # because a censored affinity means binding too weak to measure.
+    #
+    # Dropping is the conservative reading, not the right one. The correct treatment is
+    # censored regression (a one-sided loss that penalises predicting below the bound but not
+    # above it) or a ranking constraint, either of which would use the row as the real evidence
+    # it is. Until that exists, training on a bound as though it were a point estimate teaches
+    # the model a number nobody measured. See README, "Open defects".
+    censored = ab["mut_is_bound"] | ab["wt_is_bound"]
+    if keep_censored:
+        audit.append((f"KEEPING {int(censored.sum())} censored rows (--keep-censored)",
+                      len(ab), ab["#Pdb"].nunique()))
+    else:
+        ab = ab[~censored].copy()
+        audit.append((f"after dropping {int(censored.sum())} censored affinities",
+                      len(ab), ab["#Pdb"].nunique()))
 
     # --- identifiers ------------------------------------------------------------------------
     ab["pdb"] = ab["#Pdb"].str.split("_").str[0]
@@ -178,8 +198,12 @@ def build(verbose: bool = True) -> pd.DataFrame:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--keep-censored", action="store_true",
+                   help="keep affinities recorded as a detection limit (\">1e-6\") and treat "
+                        "them as exact. This is how every result before 2026-09-21 was "
+                        "produced; it is wrong and the flag exists only to reproduce them.")
     a = p.parse_args()
-    build(verbose=not a.quiet)
+    build(verbose=not a.quiet, keep_censored=a.keep_censored)
 
 
 if __name__ == "__main__":
