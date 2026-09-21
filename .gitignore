@@ -46,3 +46,13 @@ scripts/dashboard/_data/
 # GPU run artefacts: 20 MB tarballs pulled off the VM, and their extractions.
 # The runs that matter are unpacked into reports/ and tracked there.
 reports_colab/
+
+# --- overnight fusion run -------------------------------------------------
+# results/ is otherwise ignored; these are the morning deliverables.
+!results/results.csv
+!results/benchmarks.csv
+!results/summary.md
+!results/error_analysis.md
+!results/failures.md
+!results/predictions/
+!results/predictions/**
