@@ -64,11 +64,27 @@ def _block(g: pd.DataFrame) -> dict:
 
 
 def load(run: str) -> pd.DataFrame | None:
+    """Predictions joined to the mutation metadata the slices need.
+
+    predictions.csv carries only row_id/complex/cluster/fold/y_true/y_pred, so mut_side and
+    the mutation string have to come back from the dataset. The join is on row_id and is
+    strictly optional -- if the dataset is missing, the structural slices still work.
+    """
     p = ROOT / "reports" / run / "predictions.csv"
     if not p.exists():
         return None
-    d = pd.read_csv(p)
-    return d.dropna(subset=["y_pred"])
+    d = pd.read_csv(p).dropna(subset=["y_pred"])
+    try:
+        import sys
+        sys.path.insert(0, str(ROOT))
+        from src import splits
+        meta = splits.load()[["row_id", "mut_side", "mutations", "location"]]
+        d = d.merge(meta, on="row_id", how="left")
+        d["n_mut"] = d.mutations.fillna("").str.count(",") + 1
+        d["multiplicity"] = np.where(d.n_mut > 1, "multi-point", "single-point")
+    except Exception:
+        pass
+    return d
 
 
 def analyse(run: str) -> dict:
@@ -94,6 +110,17 @@ def analyse(run: str) -> dict:
     labels = ["1-5", "6-10", "11-20", "21-50", "50+"]
     d["support"] = pd.cut(d.cx_n, bins=bins, labels=labels, right=True)
     out["support"] = {str(k): _block(g) for k, g in d.groupby("support", observed=True)}
+
+    # ---- what kind of mutation. Both of these looked decisive earlier in this project and
+    # both collapsed once micro was replaced by macro (antibody-side +0.152 -> -0.048,
+    # multi-point +0.222 -> -0.006), so they are reported at both aggregations here.
+    if "multiplicity" in d.columns:
+        out["multiplicity"] = {str(k): _block(g) for k, g in d.groupby("multiplicity")}
+        by_n = d[d.n_mut <= 4].copy()
+        by_n["k"] = by_n.n_mut.map(lambda v: f"{int(v)}-point")
+        out["n_mut"] = {str(k): _block(g) for k, g in by_n.groupby("k")}
+    if "mut_side" in d.columns and d.mut_side.notna().any():
+        out["mut_side"] = {str(k): _block(g) for k, g in d.dropna(subset=["mut_side"]).groupby("mut_side")}
 
     # ---- per-complex scatter: size against error, the picture behind the slice tables
     pts = []
@@ -124,10 +151,22 @@ def analyse(run: str) -> dict:
     if tp.exists() and "fold" in d:
         t = pd.read_csv(tp)
         m = d.merge(t, on=["fold", "complex"], how="left")
-        if m.tier.notna().any():
+        # The per-fold tier is constant here (every complex is `hard`, because the homology
+        # clustering keeps each structural twin in its own fold), so it is reported for
+        # completeness but discriminates nothing. The intrinsic tier is the one that varies:
+        # it asks whether the antigen fold has ANY relative in SKEMPI-AB, split aside, and
+        # separates the 8 complexes that no split could ever make easy.
+        if "tier" in m and m.tier.notna().any():
             out["tier"] = {str(k): _block(g) for k, g in m.dropna(subset=["tier"]).groupby("tier")}
             out["tier_counts"] = (t.drop_duplicates(["fold", "complex"])
                                   .groupby("tier").size().to_dict())
+        if "intrinsic_tier" in m and m.intrinsic_tier.notna().any():
+            mi = m.dropna(subset=["intrinsic_tier"])
+            out["intrinsic"] = {str(k): _block(g) for k, g in mi.groupby("intrinsic_tier")}
+            out["intrinsic_counts"] = (t.drop_duplicates("complex")
+                                       .groupby("intrinsic_tier").size().to_dict())
+            hard = mi[mi.intrinsic_tier == "hard"]
+            out["intrinsic_hard_complexes"] = sorted(hard.complex.unique().tolist())
     else:
         out["tier_note"] = "run `python -m src.tmscore` to build data/tm_tiers.csv"
 

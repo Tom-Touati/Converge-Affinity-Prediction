@@ -228,7 +228,7 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
 
 
 BASE = dict(heads=4, dropout=0.2, lr=3e-4, wd=1e-2, epochs=300, batch=64, patience=25, d=64,
-            mut_token=True, scalars=True, residual=True, loss="huber",
+            mut_token=True, scalars=True, residual=False, loss="huber",
             pairs=("sg",), chem_token=False)
 
 

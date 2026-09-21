@@ -103,6 +103,30 @@
   <div class="card"><h2>Complex size vs per-complex ρ</h2><canvas id="cSizeRho"></canvas></div>
 
   <div class="card wide">
+    <h2>Single-point vs multi-point</h2>
+    <table id="tMult"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
+      <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
+      <th>cluster ρ</th><th>rmse</th><th>bias</th>
+    </tr></thead><tbody></tbody></table>
+    <div class="note">ΔΔG for a multi-point mutant is only additive when the sites do not
+      interact, and the label spread is much wider (sd 2.25 against 1.61), so a good micro
+      number here can come entirely from separating big effects from small ones rather than
+      from ranking within a complex.</div>
+  </div>
+
+  <div class="card wide">
+    <h2>Which side carries the mutation</h2>
+    <table id="tSide"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
+      <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
+      <th>cluster ρ</th><th>rmse</th><th>bias</th>
+    </tr></thead><tbody></tbody></table>
+    <div class="note">Antibody-side mutations are the affinity-maturation case and dominate
+      the dataset (584 of 997 rows); antigen-side are the escape case. This slice looked
+      decisive earlier in this project at micro aggregation and collapsed under macro, which
+      is why both are shown side by side.</div>
+  </div>
+
+  <div class="card wide">
     <h2>Per homology cluster — the actual independent unit</h2>
     <table id="tClust"><thead><tr><th>cluster</th><th>rows</th><th>complexes</th>
       <th>sd(true)</th><th>ρ</th><th>rmse</th></tr></thead><tbody></tbody></table>
@@ -227,6 +251,9 @@ async function loadError(){
   if(ERR.error){ document.getElementById('tierNote').textContent=ERR.error; return; }
   fillTable('tDir', ERR.direction, ['stabilising (<-0.5)','neutral (|ddG|<=0.5)','destabilising (>+0.5)']);
   fillTable('tTier', ERR.tier, ['easy','medium','hard']);
+  fillTable('tMult', Object.assign({}, ERR.multiplicity, ERR.n_mut),
+            ['single-point','multi-point','1-point','2-point','3-point','4-point']);
+  fillTable('tSide', ERR.mut_side, ['antibody','antigen','both','ab_vs_ab']);
   fillTable('tSup', Object.assign({}, ERR.support, ERR.extra));
   if(ERR.tier_note) document.getElementById('tierNote').textContent=ERR.tier_note;
   else if(ERR.tier_counts) document.getElementById('tierNote').textContent +=

@@ -119,6 +119,54 @@ def per_cluster(preds: pd.DataFrame, min_group: int = MIN_GROUP) -> pd.DataFrame
     return _grouped(preds, "cluster", min_group)
 
 
+def pairwise_concordance(preds: pd.DataFrame, margin: float = 0.0,
+                         key: str = "complex") -> dict:
+    """Fraction of within-group pairs the model orders correctly. Defined from n >= 2.
+
+    Spearman needs enough points to be meaningful, which is why the headline drops any complex
+    under the threshold -- and that silently discards the hardest data. At min_group 5 that is
+    still 20 complexes and 111 rows; at 10 it was 27 complexes and 109 rows, and those carry
+    the largest errors in the dataset.
+
+    Concordance has no such floor. A complex with two mutations contributes exactly one
+    comparison, one with nine contributes 36, and every row in the dataset participates. It is
+    also the quantity the ranking loss optimises and the one that matters for "which of these
+    two mutations should I make", so it is arguably a better headline than Spearman regardless
+    of the small-group problem.
+
+    ``margin`` drops pairs closer than that in true ddG. Measurement noise is around
+    0.5 kcal/mol, so below it the true ordering is near a coin flip and the pair scores noise.
+
+    Returns micro (pool every pair) and macro (average the per-group fraction). They differ
+    when groups vary in size, which here they do by two orders of magnitude.
+    """
+    y, p_, g = preds["y_true"].to_numpy(float), preds["y_pred"].to_numpy(float), preds[key]
+    tot = ok = 0
+    per, sizes = [], []
+    for _, idx in g.groupby(g).groups.items():
+        i = preds.index.get_indexer(idx)
+        yy, pp = y[i], p_[i]
+        if len(yy) < 2:
+            continue
+        a, b = np.triu_indices(len(yy), 1)
+        dy = yy[a] - yy[b]
+        keep = np.abs(dy) > margin
+        if not keep.any():
+            continue
+        agree = np.sign(dy[keep]) == np.sign(pp[a][keep] - pp[b][keep])
+        tot += int(keep.sum())
+        ok += int(agree.sum())
+        per.append(float(agree.mean()))
+        sizes.append(int(keep.sum()))
+    return {
+        "pairs": tot,
+        "groups": len(per),
+        "micro": ok / tot if tot else np.nan,
+        "macro": float(np.mean(per)) if per else np.nan,
+        "median_group_pairs": int(np.median(sizes)) if sizes else 0,
+    }
+
+
 def metrics(preds: pd.DataFrame, min_group: int = MIN_GROUP) -> dict:
     """Every headline number, from one predictions table."""
     missing = [c for c in REQUIRED if c not in preds.columns]
@@ -166,6 +214,18 @@ def metrics(preds: pd.DataFrame, min_group: int = MIN_GROUP) -> dict:
         byc = byc[byc["counted"]]
         m["per_complex_spearman_cluster_weighted"] = (
             float(byc.groupby("cluster")["spearman"].mean().mean()) if len(byc) else np.nan)
+
+    # --- concordance: the slice-free metric, every complex and every row included ---------
+    for tag, margin in (("", 0.0), ("_m05", 0.5)):
+        c = pairwise_concordance(preds, margin=margin)
+        m[f"concordance_micro{tag}"] = c["micro"]
+        m[f"concordance_macro{tag}"] = c["macro"]
+        m[f"concordance_pairs{tag}"] = c["pairs"]
+        m[f"concordance_groups{tag}"] = c["groups"]
+    if "cluster" in preds.columns:
+        cc = pairwise_concordance(preds, margin=0.5, key="cluster")
+        m["concordance_cluster_micro_m05"] = cc["micro"]
+        m["concordance_cluster_macro_m05"] = cc["macro"]
 
     # --- the classification framing ------------------------------------------------------
     m["macro_f1"] = float(f1_score(to_classes(y), to_classes(p), average="macro",

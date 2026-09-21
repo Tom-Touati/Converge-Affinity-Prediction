@@ -99,6 +99,42 @@ def cached_matrix(verbose: bool = True) -> pd.DataFrame:
     return M
 
 
+def intrinsic_tiers(M: pd.DataFrame | None = None, verbose: bool = True) -> pd.DataFrame:
+    """Difficulty ignoring the split: does this antigen fold have ANY relative in SKEMPI-AB?
+
+    The per-fold tiering is degenerate here -- every complex is `hard` because the homology
+    clustering puts each structural twin in the same fold as its twins. That is a fact about
+    the evaluation, not about the targets, and it hides a real distinction: 21 complexes have
+    50 or more structurally similar measurements *somewhere* in the dataset, while 8 have none
+    at all.
+
+    Those 8 are hard in a way no split can create or remove. They are the only rows that ask
+    whether the model generalises to an unseen antigen fold rather than to an unseen mutation
+    on a familiar one, so they deserve reporting on their own rather than averaged into a
+    number the lysozyme family dominates.
+    """
+    d = splits.load()
+    M = cached_matrix(verbose=verbose) if M is None else M
+    rows_per_cx = d.groupby("#Pdb").size()
+    keys = [k for k in M.index if k in set(d["#Pdb"])]
+
+    out = []
+    for k in keys:
+        sim = [c for c in keys if c != k and M.loc[k, c] > TM_THRESHOLD]
+        n = int(rows_per_cx.reindex(sim).fillna(0).sum())
+        out.append({"complex": k, "n_similar_any": n, "n_similar_complexes": len(sim),
+                    "intrinsic_tier": "hard" if n == 0 else
+                                      ("easy" if n >= EASY_MIN else "medium")})
+    t = pd.DataFrame(out)
+    if verbose:
+        print(t.groupby("intrinsic_tier").size().to_string())
+        hard = t[t.intrinsic_tier == "hard"]
+        print(f"\nthe {len(hard)} complexes with no structural relative anywhere:")
+        print(hard.merge(rows_per_cx.rename("rows"), left_on="complex", right_index=True)
+              [["complex", "rows"]].to_string(index=False))
+    return t
+
+
 def tiers(M: pd.DataFrame | None = None, verbose: bool = True) -> pd.DataFrame:
     """Per (fold, complex): training rows above the TM threshold, and the resulting tier."""
     d = splits.load()
@@ -124,10 +160,13 @@ def tiers(M: pd.DataFrame | None = None, verbose: bool = True) -> pd.DataFrame:
 
 
 def main():
-    t = tiers()
+    M = cached_matrix()
+    t = tiers(M)
+    it = intrinsic_tiers(M)
+    t = t.merge(it, on="complex", how="left")
     paths.DATA.mkdir(parents=True, exist_ok=True)
     t.to_csv(paths.DATA / "tm_tiers.csv", index=False)
-    print(f"wrote {paths.DATA / 'tm_tiers.csv'}")
+    print(f"\nwrote {paths.DATA / 'tm_tiers.csv'}")
 
 
 if __name__ == "__main__":

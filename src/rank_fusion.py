@@ -363,6 +363,16 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
                              "test_cx": int(len(np.unique(cx[te]))),
                              "train_rows": int(tr.sum())})
 
+            # residual=False by default, and it should stay that way. Training on
+            # y - forest_prediction made every reported number uninterpretable: the net's own
+            # validation correlation (~0.23) measured how well it ranked the FOREST's mistakes,
+            # while the headline (~0.50) came from adding the forest back at inference -- a net
+            # with zero skill still scored ~0.50, because 0 + forest_pred = forest_pred. The
+            # forest was carrying the result and the net's real contribution was invisible.
+            #
+            # It did not even buy an easier target: sd(residual) measured 1.214 against
+            # sd(ddG) 1.156 -- 105% of the original spread -- because the forest predicts a
+            # narrow band near zero while the labels range far wider.
             target, base_te = y.copy(), None
             if cfg["residual"]:
                 inner = _inner_forest_residuals(Xs, y, np.where(tr)[0], clusters, seed)
@@ -419,9 +429,22 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
           f"({dropped} never in a test half), median "
           f"{int(np.median(seen[seen > 0])) if (seen > 0).any() else 0} seeds per scored row",
           flush=True)
-    m = evaluate.metrics(ens, 10)
+    m = evaluate.metrics(ens)
     m["n_scored"] = len(ens)
     m["n_dropped"] = dropped
+
+    # The forest scored on EXACTLY these rows. Each seed scores only the half of a fold it did
+    # not validate on, so a net covers ~830 of 997 rows while the forest covers all of them --
+    # and an earlier comparison made a net look like a winner (0.506 vs 0.498) purely on that
+    # difference. Carrying the matched number in the same row of the table makes that mistake
+    # hard to repeat.
+    rf_m = {}
+    rf_path = paths.REPORTS / "ov_both_geom" / "predictions.csv"
+    if rf_path.exists():
+        rf = pd.read_csv(rf_path)
+        rf = rf[rf.row_id.isin(ens.row_id)]
+        if len(rf):
+            rf_m = evaluate.metrics(rf)
     out_dir = paths.REPORTS / cfg["name"]
     out_dir.mkdir(parents=True, exist_ok=True)
     ens.to_csv(out_dir / "predictions.csv", index=False)
@@ -446,10 +469,20 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
             "noise": cfg.get("noise_std", 0.0), "fdrop": cfg.get("feat_drop", 0.0),
             "dropout": cfg["dropout"], "wd": cfg["wd"], "d": cfg["d"],
             "scalars": cfg.get("use_scalars", True), "attn": cfg.get("mut_token", True),
-            "had": bool(cfg.get("pairs", ())),
+            "had": bool(cfg.get("pairs", ())), "residual": cfg.get("residual", False),
             "train_rho": round(tr_rho, 3), "gap": round(gap, 3),
+            "n_scored": len(ens),
             "per_cx_rho": round(m["per_complex_spearman"], 3),
-            "global_rho": round(m["global_spearman"], 3), "rmse": round(m["rmse"], 3)}
+            "per_cx_rho10": round(m["per_complex_spearman_min10"], 3),
+            "global_rho": round(m["global_spearman"], 3),
+            "conc": round(m.get("concordance_micro_m05", float("nan")), 3),
+            "rmse": round(m["rmse"], 3),
+            # the forest, same rows, same metric -- the only fair comparison
+            "rf_per_cx_rho": round(rf_m["per_complex_spearman"], 3) if rf_m else None,
+            "rf_per_cx_rho10": round(rf_m["per_complex_spearman_min10"], 3) if rf_m else None,
+            "rf_conc": round(rf_m.get("concordance_micro_m05", float("nan")), 3) if rf_m else None,
+            "beats_rf": (round(m["per_complex_spearman"] - rf_m["per_complex_spearman"], 3)
+                         if rf_m else None)}
 
 
 def plot_history(hdf, name, out_png):
@@ -512,7 +545,7 @@ def plot_history(hdf, name, out_png):
 
 
 BASE = dict(heads=4, dropout=0.2, lr=3e-4, wd=1e-2, epochs=200, batch=64, patience=20, d=64,
-            mut_token=True, residual=True, pairs=("sg",), chem_token=False,
+            mut_token=True, residual=False, pairs=("sg",), chem_token=False,
             rank_w=1.0, huber_w=1.0, margin=0.5, weighted=False, max_steps=None,
             noise_std=0.0, feat_drop=0.0, eval_every=0, use_scalars=True, device="auto")
 
@@ -562,6 +595,44 @@ def aug_configs():
     # The control for the control: per-epoch stopping, so the size of the checkpoint-policy
     # effect is measured here rather than asserted.
     add("epoch_stop",   eval_every=0, patience=20)
+    return C
+
+
+def direct_configs():
+    """The network predicting ddG directly, measured against the forest on identical rows.
+
+    Residual learning is gone. It made every number uninterpretable: the net was trained on
+    y - forest_prediction, so its validation correlation described how well it ranked the
+    FOREST's errors, while the headline came from adding the forest back -- a net with no
+    skill at all still scored ~0.50. It did not even simplify the target: sd(residual) was
+    1.214 against sd(ddG) 1.156.
+
+    So these configs stand on their own. The comparison that matters is against
+    `ov_both_geom` restricted to the same rows, because each seed scores only the half of a
+    fold it did not validate on, and an earlier comparison flattered the net purely by scoring
+    830 rows against the forest's 997.
+
+    The regularisation settings carry over what the ablation established, which was that the
+    combination matters and the width reduction does not (ab_heavy_d64 0.506, ab_heavy_d32
+    0.502). Both are kept so that holds without residual learning too.
+    """
+    HEAVY = dict(noise_std=0.35, feat_drop=0.3, dropout=0.5, wd=1e-1)
+    C = []
+
+    def add(name, **kw):
+        cfg = dict(BASE, name=name, rank_w=1.0, huber_w=1.0, eval_every=10, patience=25,
+                   residual=False)
+        cfg.update(kw)
+        C.append(cfg)
+
+    add("dir_plain")                                   # no regularisation, the floor
+    add("dir_heavy",        **HEAVY)                    # the ablation's winner, no residual
+    add("dir_heavy_d32",    d=32, **HEAVY)
+    add("dir_huber_only",   rank_w=0.0, **HEAVY)        # regression only, no ranking term
+    add("dir_margin0",      margin=0.0, **HEAVY)        # every within-complex pair, unfiltered
+    add("dir_noattn",       mut_token=False, **HEAVY)   # does the mutation token still carry it
+    add("dir_nohadamard",   pairs=(), **HEAVY)
+    add("dir_noscalars",    use_scalars=False, **HEAVY)
     return C
 
 
@@ -621,6 +692,8 @@ def main():
                    help="regularisation and representation-augmentation ladder")
     p.add_argument("--ablation-sweep", action="store_true",
                    help="head ablations and regularisation on one footing")
+    p.add_argument("--direct-sweep", action="store_true",
+                   help="no residual learning: the net predicts ddG itself")
     p.add_argument("--seeds", type=int, default=5)
     p.add_argument("--device", default="auto", help="auto|cpu|cuda")
     p.add_argument("--only", default=None,
@@ -632,7 +705,8 @@ def main():
     seeds = tuple(range(a.seeds))
     rows = []
     want = set(a.only.split(",")) if a.only else None
-    pool = (ablation_configs() if a.ablation_sweep
+    pool = (direct_configs() if a.direct_sweep
+            else ablation_configs() if a.ablation_sweep
             else aug_configs() if a.aug_sweep else sweep_configs())
     configs = [c for c in pool if want is None or c["name"] in want]
     if want and not configs:

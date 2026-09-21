@@ -165,6 +165,11 @@ def stage_ablate():
     sh(f"{_py()} -m src.rank_fusion --ablation-sweep --device cuda --seeds 3", check=False)
 
 
+def stage_direct():
+    """The net predicting ddG itself, no residual learning, against the forest on same rows."""
+    sh(f"{_py()} -m src.rank_fusion --direct-sweep --device cuda --seeds 5", check=False)
+
+
 def stage_v3():
     """The chem-as-third-modality sweep, runnable for the first time now the NameError is gone."""
     sh(f"{_py()} -m src.fusion_v3 --sweep --seeds 3", check=False)
@@ -185,7 +190,7 @@ def stage_collect():
 
 STAGES = {
     "bootstrap": stage_bootstrap, "extract": stage_extract, "runs": stage_runs,
-    "plots": stage_plots, "aug": stage_aug, "ablate": stage_ablate, "v3": stage_v3, "esm650": stage_esm650, "collect": stage_collect,
+    "plots": stage_plots, "aug": stage_aug, "ablate": stage_ablate, "direct": stage_direct, "v3": stage_v3, "esm650": stage_esm650, "collect": stage_collect,
 }
 
 if __name__ == "__main__":
