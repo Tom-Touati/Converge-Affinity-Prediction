@@ -202,6 +202,10 @@ def run(cfg, seeds=(0, 1, 2, 3, 4)):
                        (s3[1], g3[1], ch3[1], cats[va], sc[1], target[va], groups[va]),
                        cfg, seed)
             with torch.no_grad():
+                # `dev` is local to _fit; referencing it here raised NameError on the first
+                # fold of every configuration, so this module had never once run to completion.
+                # Take the device from the trained net, as rank_fusion does.
+                dev = next(net.parameters()).device
                 T = lambda a, dt=torch.float32: None if a is None else torch.as_tensor(a, dtype=dt, device=dev)
                 p = net(T(s3[2]), T(g3[2]), T(ch3[2]), T(cats[te], torch.long), T(sc[2])).cpu().numpy()
             oof[te] = p + base_te if base_te is not None else p

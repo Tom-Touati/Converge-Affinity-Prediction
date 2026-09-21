@@ -130,12 +130,24 @@ def stage_runs():
     py = _py()
     # Each is allowed to fail without taking the others down -- a wedged sweep should not
     # cost the two that would have finished.
-    # No --max-steps: it now caps rather than frees. Training holds the full k-1 folds, so a
-    # fold has ~230-310 full pair batches and a cap of 200 would clip a third of them back off
-    # -- reintroducing the exact defect this run exists to measure.
     sh(f"{py} -m src.rank_fusion --sweep --device cuda --seeds 5", check=False)
     sh(f"{py} -m src.fusion_v3 --sweep --seeds 5", check=False)
-    sh(f"{py} -m src.compare_models", check=False)
+    # The default --net is v2_h4_residual, a local artefact that does not exist on a fresh VM;
+    # name a run this machine actually produced.
+    sh(f"{py} -m src.compare_models --net rk_huber_only", check=False)
+
+
+def stage_plots():
+    """Regenerate loss curves for two representative configs.
+
+    The first GPU run produced the full sweep table but the VM was reclaimed before collect,
+    so history.csv and losses.png were lost with it. The numbers are already known; this is
+    only to recover the curves, so it runs the no-rank control and one rank configuration
+    rather than repeating three and a half hours.
+    """
+    py = _py()
+    sh(f"{py} -m src.rank_fusion --only rk_huber_only,rk_both --device cuda --seeds 5",
+       check=False)
 
 
 def stage_esm650():
@@ -153,7 +165,7 @@ def stage_collect():
 
 STAGES = {
     "bootstrap": stage_bootstrap, "extract": stage_extract, "runs": stage_runs,
-    "esm650": stage_esm650, "collect": stage_collect,
+    "plots": stage_plots, "esm650": stage_esm650, "collect": stage_collect,
 }
 
 if __name__ == "__main__":

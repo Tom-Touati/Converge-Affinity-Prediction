@@ -436,12 +436,20 @@ def main():
     p.add_argument("--sweep", action="store_true")
     p.add_argument("--seeds", type=int, default=5)
     p.add_argument("--device", default="auto", help="auto|cpu|cuda")
+    p.add_argument("--only", default=None,
+                   help="comma list of config names; regenerate a few without repeating the "
+                        "whole 3.5-hour sweep")
     p.add_argument("--max-steps", type=int, default=None,
                    help="pair-batches per epoch; raise it on a GPU, where the cap is not needed")
     a = p.parse_args()
     seeds = tuple(range(a.seeds))
     rows = []
-    for cfg in sweep_configs():
+    want = set(a.only.split(",")) if a.only else None
+    configs = [c for c in sweep_configs() if want is None or c["name"] in want]
+    if want and not configs:
+        raise SystemExit(f"no config matched {sorted(want)}; "
+                         f"available: {[c['name'] for c in sweep_configs()]}")
+    for cfg in configs:
         cfg = dict(cfg, device=a.device)
         if a.max_steps:
             cfg["max_steps"] = a.max_steps
