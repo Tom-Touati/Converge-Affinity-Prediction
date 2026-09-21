@@ -70,3 +70,60 @@ harness:
   pushing a system-level installer. Recorded in `requirements.txt`.
 - A failing test turned out to be a bug in the test's own helper (uneven complex sizes), not in
   the harness. Fixed the helper.
+
+---
+
+## Session, 2026-09-21 — GPU runs, and removing residual learning
+
+The longest session of the project. Full technical state is in [HANDOFF.md](HANDOFF.md); this
+records how the work was directed and where the assistant was wrong.
+
+### What was asked for, in order
+
+Move training to a GPU; add reverse-mutation augmentation; run the AbRank-style pairwise loss;
+deeper error analysis for both models; then a sequence of corrections that reshaped the results
+— change the ≥10-mutation rule to 5, add a per-cluster metric, add a distance metric usable
+below n=5, add an intermediate split, and finally **stop using residual methods entirely and
+compare the network to the random forest on its own**.
+
+### Corrections the assistant had to make to its own claims
+
+These are recorded because the pattern matters more than any single number: on this dataset a
+plausible mechanism attached to a small measurement is usually wrong.
+
+- **"The net beats the forest, 0.506 vs 0.498."** False. The net scored 830 rows and the forest
+  997. On matched rows the forest led, 0.518 to 0.506. Sweep rows now carry the forest's score
+  on exactly the rows the net scored.
+- **"Capacity reduction is the dominant lever."** False. `d=32` looked best as a single lever,
+  but combining the regularisers at full width matched it (0.506 vs 0.502) — the width
+  reduction contributed nothing.
+- **"Validation peaks at step 40 then decays."** That was noise on a coarse trace. On the loss,
+  at finer resolution, there is no decay in that window.
+- **"Tough regularisation is the fix."** It suppressed memorisation (train ρ 0.912 → 0.654)
+  without improving generalisation (validation ρ flat near 0.23 in every configuration).
+- **"`no_scalars` is the best configuration."** A one-fold, one-seed probe artefact: 0.499 on
+  the probe, 0.378 on the real sweep — *below* the control.
+- **"ESM-2 650M costs 0.026."** Overstated: the paired bootstrap CI was [−0.065, +0.013] and
+  does not clear zero. It is a tie, not a demonstrated harm.
+- **"The intrinsic-tier reversal is explained by cluster size."** Not supported —
+  corr(ρ, log cluster rows) = −0.148. The tiers differ in *composition* instead, and no
+  mechanism is established.
+
+### Where the user caught what the assistant did not
+
+- Reading the live loss curves: *"it doesn't look like the overfit is after 1 epoch"* — an
+  epoch had become 135–205 steps, so early stopping could not evaluate before step 146 and was
+  checkpointing a memorised model. The fix (step-level evaluation) roughly doubled the score.
+- *"Why does validation look like 0.2 correlation when we are talking about 0.5?"* — this is
+  what exposed residual learning as the thing carrying every reported number.
+- *"Correlation can be misleading"* — prompted adding MAE, median error and rmse/sd, which
+  showed destabilising mutations scoring ρ +0.439 while being worse than a constant.
+- *"Why do we need to extract? We should have everything."* — ~20 minutes of GPU time per run
+  was being spent rebuilding feature files that already existed locally.
+
+### Assistant errors in its own tooling
+
+Worth recording separately, because they cost more time than the modelling did: gating on exit
+codes from a CLI that always returns 0; `tail -f` silently doing nothing on `/mnt/c`; `grep`
+block-buffering off a TTY; emitting bare `NaN` in JSON and verifying it with `curl`, which does
+not parse the body; and grouping training curves by epoch when evaluation had moved to steps.

@@ -1,5 +1,12 @@
 # Error analysis
 
+> **Superseded in places — see [HANDOFF.md](HANDOFF.md).** Numbers here predate two
+> corrections: the per-complex threshold moved from 10 mutations to 5 (the model to beat
+> reads 0.388, not 0.498, on the same predictions), and residual learning was removed.
+> Any figure produced by a net trained on `ddG - forest_prediction` had the forest added
+> back at inference and is not that network's own score.
+
+
 Model: `rungN0_chem_geom_mpnn_rf` — chemistry + interface geometry + ProteinMPNN into a random
 forest, per-complex Spearman **0.475 [0.393, 0.552]**. Regenerate everything here with:
 

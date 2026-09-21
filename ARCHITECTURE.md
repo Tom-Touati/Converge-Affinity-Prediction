@@ -1,5 +1,12 @@
 # Architecture: encoders, pipeline, and what 750 training rows can actually support
 
+> **Superseded in places — see [HANDOFF.md](HANDOFF.md).** Numbers here predate two
+> corrections: the per-complex threshold moved from 10 mutations to 5 (the model to beat
+> reads 0.388, not 0.498, on the same predictions), and residual learning was removed.
+> Any figure produced by a net trained on `ddG - forest_prediction` had the forest added
+> back at inference and is not that network's own score.
+
+
 This document is the design spec for the learned models. It exists because the fusion question
 deserves an explicit answer rather than an assertion, and because the honest answer involves
 saying which parts of an attractive architecture we cannot afford.
