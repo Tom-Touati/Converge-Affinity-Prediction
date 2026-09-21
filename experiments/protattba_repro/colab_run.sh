@@ -134,25 +134,41 @@ pull_folds () {   # pull_folds <protocol>
   return 0
 }
 
+first_missing () {   # first_missing <protocol> -> fold index, or 10 when all are held
+  for k in 0 1 2 3 4 5 6 7 8 9; do
+    [[ -s "$HERE/results/$1_fold$k.csv" ]] || { echo "$k"; return; }
+  done
+  echo 10
+}
+
 for st in "${STAGES[@]}"; do
-  for k in 1 2 3 4 5 6 7 8 9 10; do
-    [[ -f "$HERE/results/${st}_fold$((k-1)).csv" ]] && continue
-    ok=no
-    for attempt in 1 2 3; do
-      ensure || { say "cannot get a session for $st fold $((k-1))"; break; }
-      push_folds "$st"
-      # A fresh VM needs the environment and the cache back before it can train. Both stages
-      # are idempotent and skip their own work when the outputs are already there -- ~30 s and
-      # ~5 s on a session that has already run them, ~4 min on a brand new VM -- so they are
-      # called unconditionally rather than tracked.
-      stage bootstrap 2400
-      stage extract 3600
-      if stage "$st:$k" 7200; then ok=yes; fi
-      pull_folds "$st"
-      [[ $ok == yes ]] && break
-      say "  $st fold $((k-1)) attempt $attempt did not finish; retrying on whatever session exists"
-    done
-    [[ $ok == yes ]] || say "GIVING UP on $st fold $((k-1))"
+  # Always work on the FIRST fold we do not hold, and only advance when it lands. An earlier
+  # version looped k=1..10 and moved on after three failed attempts, which meant a session
+  # that was broken for session reasons -- reclaimed VM, lost connection -- burned through all
+  # ten folds in a couple of minutes without computing anything. Progress is now defined by
+  # files on local disk, so a bad patch costs attempts rather than folds.
+  budget=$(( 10 * 4 ))       # attempts across the whole protocol; ~4 per fold
+  while :; do
+    k=$(first_missing "$st")
+    [[ $k -ge 10 ]] && { say "### $st: all 10 folds held locally"; break; }
+    [[ $budget -le 0 ]] && { say "### $st: attempt budget exhausted at fold $k"; break; }
+    budget=$((budget - 1))
+    say "--- $st fold $k  (attempts left $budget)"
+
+    if ! ensure; then
+      say "  no session available; waiting 120s"
+      sleep 120
+      continue
+    fi
+    push_folds "$st"
+    # A fresh VM needs the environment and the cache back before it can train. Both stages are
+    # idempotent and skip their own work when the outputs are present -- seconds on a session
+    # that has already run them, ~4 min on a brand new VM -- so they are called every time
+    # rather than tracked.
+    stage bootstrap 2400
+    stage extract 3600
+    stage "$st:$((k + 1))" 7200
+    pull_folds "$st"
   done
   say "### $st: $(ls "$HERE"/results/"$st"_fold*.csv 2>/dev/null | wc -l) of 10 folds on disk"
   grab "$st"
