@@ -348,6 +348,41 @@ data/folds.csv   the frozen split, committed on purpose
 rebuild it deliberately; it is not a dependency of any model target, so no run can silently
 re-split the data underneath itself.
 
+## Running on a GPU
+
+```bash
+git clone <repo> && cd converge_bind
+scp data/skempi_v2.csv data/SKEMPI2_PDBs.tgz <host>:~/converge_bind/data/   # not in git
+bash scripts/setup_remote.sh --big
+```
+
+`setup_remote.sh` is idempotent -- every step checks for its own output and skips it -- so it
+survives a dropped connection without repeating an hour of extraction. It creates the venv,
+replaces the CPU torch pin with a CUDA wheel, clones ProteinMPNN, runs the whole feature
+pipeline, and finishes by re-scoring the baseline and the test suite.
+
+The `torch==2.4.1` pin in `requirements.txt` is a Windows-only constraint on the development
+machine (MSVC runtime 14.28 against torch >= 2.5 needing >= 14.40). **Lift it anywhere else** --
+no code depends on the version.
+
+**What a GPU actually buys, honestly:**
+
+| Workload | Status on CPU | GPU benefit |
+| --- | --- | --- |
+| ESM-2 650M extraction | never run; 35M took 16 min and 650M is ~20x | **Large** -- the one open question left in the sequence arm |
+| ESM-IF1 as a second structure encoder | never attempted | **Large**, if torch-geometric installs |
+| Pairwise ranking sweeps | ~28x a regression epoch; the first run had to be killed | **Moderate** -- two forward passes per step over ~11k pairs |
+| The fusion networks themselves | 30k-200k parameters, batch 64 | **Small** -- per-step launch overhead competes with the compute |
+| Random forest, bootstraps, SASA | pure CPU | **None**, though a GPU box usually brings more cores |
+
+The binding constraint on this project is data, not compute: `PRIOR_WORK.md` records published
+learning curves only plateauing near 90,000 mutations against our 997. A GPU unlocks the
+extractions we could not run and makes the sweeps comfortable; it will not transform a
+30k-parameter model trained on 750 rows.
+
+`--max-steps` caps pair-batches per epoch (40 on CPU, to keep an epoch comparable to the
+regression baseline). Raise it to 200 on a GPU, or drop it and walk all ~11,000 pairs.
+
 ## Hardware and runtime
 
 Development machine: **Intel Core i7-8650U, 4 cores @ 1.9 GHz, 8 GB RAM, no GPU**, Windows 10.
