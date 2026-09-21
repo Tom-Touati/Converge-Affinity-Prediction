@@ -65,6 +65,10 @@ def stage_bootstrap():
     sh("nvidia-smi || echo 'NO GPU -- runtime has no accelerator'", cwd="/content", check=False)
     if not os.path.isdir(ROOT):
         sh(f"git clone --branch {BRANCH} {REPO} {ROOT}", cwd="/content")
+    else:
+        # Re-running bootstrap on a live VM has to pick up pushes since the clone, or a fix
+        # made after a failed stage is invisible to the retry.
+        sh(f"git fetch origin {BRANCH} && git reset --hard origin/{BRANCH}")
     sh("git log --oneline -3")
 
     os.makedirs(f"{ROOT}/data", exist_ok=True)
@@ -81,8 +85,14 @@ def stage_bootstrap():
     # transformers is a lazy import in features/hf_plm.py; without it the ESM-2 steps fail.
     # Written to a file rather than piped via process substitution: subprocess(shell=True)
     # runs /bin/sh, which has no <(...).
-    sh("grep -v '^torch==' requirements.txt > /tmp/req_colab.txt")
+    # torch and numpy are both pinned for the Windows box and both wrong here. torch==2.4.1
+    # would replace the CUDA build; numpy==1.26.4 (which that torch requires) downgrades
+    # Colab's numpy 2, and Colab's preinstalled jax -- pulled in transitively by transformers
+    # -- then dies on np.dtypes.StringDType, taking every ESM-2 step with it.
+    sh("grep -vE '^(torch|numpy)==' requirements.txt > /tmp/req_colab.txt")
     sh("pip install -q -r /tmp/req_colab.txt 'transformers==4.46.3' antiberty 2>&1 | tail -5")
+    sh("pip install -q -U 'numpy>=2' 2>&1 | tail -3")
+    sh("python -c \"import numpy, jax; print('numpy', numpy.__version__, '| jax ok')\"")
     sh("python -c \"import torch; print('torch', torch.__version__,"
        " '| cuda', torch.cuda.is_available())\"")
 
@@ -90,7 +100,7 @@ def stage_bootstrap():
 def stage_extract():
     # --system-site-packages so the venv sees the VM's CUDA torch; REQ_FILE strips the
     # torch==2.4.1 pin, which exists only for the Windows dev box's MSVC 14.28 runtime.
-    sh("grep -v '^torch==' requirements.txt > /tmp/req_colab.txt")
+    sh("grep -vE '^(torch|numpy)==' requirements.txt > /tmp/req_colab.txt")
     # A venv from a previous failed attempt is worse than none -- remove it before starting.
     sh(f"rm -rf {ROOT}/.venv", check=False)
     # PYTHON_BIN is the kernel's own interpreter, which is where the bootstrap stage pip
@@ -120,7 +130,10 @@ def stage_runs():
     py = _py()
     # Each is allowed to fail without taking the others down -- a wedged sweep should not
     # cost the two that would have finished.
-    sh(f"{py} -m src.rank_fusion --sweep --device cuda --max-steps 200 --seeds 5", check=False)
+    # No --max-steps: it now caps rather than frees. Training holds the full k-1 folds, so a
+    # fold has ~230-310 full pair batches and a cap of 200 would clip a third of them back off
+    # -- reintroducing the exact defect this run exists to measure.
+    sh(f"{py} -m src.rank_fusion --sweep --device cuda --seeds 5", check=False)
     sh(f"{py} -m src.fusion_v3 --sweep --seeds 5", check=False)
     sh(f"{py} -m src.compare_models", check=False)
 
