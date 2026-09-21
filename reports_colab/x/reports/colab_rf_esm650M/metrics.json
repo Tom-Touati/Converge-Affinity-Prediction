@@ -1,0 +1,34 @@
+{
+  "metrics": {
+    "n": 997,
+    "n_complexes": 54,
+    "n_complexes_counted": 27,
+    "per_complex_spearman": 0.2619412187657836,
+    "per_complex_pearson": 0.27093624073956396,
+    "per_complex_spearman_all": 0.23948228069280061,
+    "global_spearman": 0.13918753305793372,
+    "global_pearson": 0.12348127925631161,
+    "rmse": 1.8127960534425362,
+    "mae": 1.3263615607300547,
+    "macro_f1": 0.2895771053930471,
+    "auroc": 0.5836083447718622,
+    "n_big": 490,
+    "sign_acc_big": 0.8612244897959184,
+    "sign_acc_big_base": 0.8591836734693877,
+    "sign_acc_big_balanced": 0.5133051051671313
+  },
+  "ci": {
+    "per_complex_spearman": [
+      0.18066728886004152,
+      0.33867150114437167
+    ],
+    "global_spearman": [
+      0.03501408339170854,
+      0.2565557943279644
+    ],
+    "rmse": [
+      1.508269089531171,
+      2.1192317871058175
+    ]
+  }
+}

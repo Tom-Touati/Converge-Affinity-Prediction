@@ -76,6 +76,25 @@ def build_pairs(y: np.ndarray, groups: np.ndarray, margin: float = 0.5):
     return np.concatenate(I), np.concatenate(J)
 
 
+def _objective(pred, Y, I, J, cfg, dev):
+    """The training objective, evaluated on a whole split. Used for train-vs-validation loss.
+
+    Same weights and same margin as training, so the two numbers are directly comparable.
+    Returns a float; the rank term is skipped when its weight is zero or no pair survives.
+    """
+    total = 0.0
+    if cfg["huber_w"] > 0:
+        total += cfg["huber_w"] * float(nn.HuberLoss(delta=2.0)(pred, Y))
+    if cfg["rank_w"] > 0 and len(I):
+        pi = torch.as_tensor(I, device=dev)
+        pj = torch.as_tensor(J, device=dev)
+        dy = Y[pi] - Y[pj]
+        w = dy.abs() if cfg["weighted"] else torch.ones_like(dy)
+        r = (w * nn.functional.softplus(-torch.sign(dy) * (pred[pi] - pred[pj]))).sum() / w.sum()
+        total += cfg["rank_w"] * float(r)
+    return total
+
+
 def _augment(t, cfg):
     """Augment an encoder's output in feature space, during training only.
 
@@ -178,7 +197,7 @@ def _row_batches(rng, n_rows, batch):
 
 def _fit(tr, va, cfg, seed):
     s_tr, g_tr, ch_tr, c_tr, x_tr, y_tr, grp_tr = tr
-    s_va, g_va, ch_va, c_va, x_va, y_va, _ = va
+    s_va, g_va, ch_va, c_va, x_va, y_va, grp_va = va
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     dev = resolve_device(cfg.get("device", "auto"))
@@ -200,6 +219,11 @@ def _fit(tr, va, cfg, seed):
     Cv = T(c_va, torch.long)
 
     I, J = build_pairs(y_tr, grp_tr, cfg["margin"])
+    # Validation pairs exist only so the SAME objective can be evaluated on both sides. Until
+    # now history held a training loss next to a validation rmse -- different quantities, so
+    # the one question that matters ("is the train/validation gap there from step one?") could
+    # not be read off it at all.
+    Iv, Jv = build_pairs(y_va, grp_va, cfg["margin"])
     if len(I) == 0:
         cfg = dict(cfg, huber_w=1.0, rank_w=0.0)
 
@@ -228,8 +252,14 @@ def _fit(tr, va, cfg, seed):
         nonlocal best, state, waited
         net.eval()
         with torch.no_grad():
-            pv = net(Sv, Gv, CHv, Cv, Xv).cpu().numpy()
-            pt = net(S, G, CH, C, X).cpu().numpy()
+            fv = net(Sv, Gv, CHv, Cv, Xv)
+            ft = net(S, G, CH, C, X)
+            pv, pt = fv.cpu().numpy(), ft.cpu().numpy()
+            # Both sides in eval mode on clean inputs: no dropout, no augmentation, whole set
+            # rather than a batch. The training figure here is therefore NOT the running
+            # training loss above -- it is the comparable one.
+            tl = _objective(ft, Y, I, J, cfg, dev)
+            vl = _objective(fv, Yv, Iv, Jv, cfg, dev)
         net.train()
         v = evaluate._safe_spearman(yv, pv)
         v = -np.inf if not np.isfinite(v) else v
@@ -242,6 +272,7 @@ def _fit(tr, va, cfg, seed):
                      "huber_loss": ep_huber / max(seen, 1) if cfg["huber_w"] > 0 else np.nan,
                      "val_rho": np.nan if not np.isfinite(v) else v,
                      "val_rmse": float(np.sqrt(np.mean((pv - yv) ** 2))),
+                     "train_loss_eval": tl, "val_loss_eval": vl, "loss_gap": vl - tl,
                      "train_rho": evaluate._safe_spearman(yt, pt),
                      "rejected": bool(clipped)})
         if v > best + 1e-4:

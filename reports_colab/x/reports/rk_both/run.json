@@ -1,0 +1,27 @@
+{
+  "name": "rk_both",
+  "model": "rank_fusion",
+  "config": {
+    "heads": 4,
+    "dropout": 0.2,
+    "lr": 0.0003,
+    "wd": 0.01,
+    "epochs": 200,
+    "batch": 64,
+    "patience": 20,
+    "d": 64,
+    "mut_token": true,
+    "residual": true,
+    "pairs": [
+      "sg"
+    ],
+    "chem_token": false,
+    "rank_w": 1.0,
+    "huber_w": 1.0,
+    "margin": 0.5,
+    "weighted": false,
+    "max_steps": null,
+    "device": "cuda",
+    "name": "rk_both"
+  }
+}

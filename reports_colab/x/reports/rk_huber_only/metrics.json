@@ -1,0 +1,23 @@
+{
+  "metrics": {
+    "n": 977,
+    "n_complexes": 53,
+    "n_complexes_counted": 26,
+    "per_complex_spearman": 0.41970774198644867,
+    "per_complex_pearson": 0.42214339383367283,
+    "per_complex_spearman_all": 0.3355816294519671,
+    "global_spearman": 0.44497360262401753,
+    "global_pearson": 0.3971563745816662,
+    "rmse": 1.758027905888706,
+    "mae": 1.2580870868311194,
+    "macro_f1": 0.48855962145343823,
+    "auroc": 0.7005763659773074,
+    "n_big": 482,
+    "sign_acc_big": 0.8008298755186722,
+    "sign_acc_big_base": 0.8568464730290456,
+    "sign_acc_big_balanced": 0.6182054251324701,
+    "n_scored": 977,
+    "n_dropped": 20
+  },
+  "ci": {}
+}

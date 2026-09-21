@@ -257,9 +257,45 @@ predictor given the GearNet-extracted representations of the two complexes" — 
 ΔΔG(reverse) = −ΔΔG(forward) constraint is built into the architecture rather than tested after
 the fact, which is how `PLAN.md` currently treats it.
 
-**It is a geometric GNN, not attention.** GearNet does multi-relational, multi-level message
-passing over a relational interface graph. That is the architecture the `ARCHITECTURE.md` §5.3
-note argues for over cross-attention, here shown working on exactly our task.
+**It is a graph network *with* attention, not an alternative to attention.** An earlier draft
+of this section claimed GearBind supports "GNN over cross-attention". It does not, on two counts.
+The paper runs no such comparison — its baselines are FoldX, Flex-ddG and Bind-ddG, none of which
+isolates that axis. And GearBind itself is attentional:
+
+> "Edge-level interactions are then captured by performing message passing on the line graph,
+> **similar to a sparse version of AlphaFold's triangle attention**. Finally, after aggregating
+> atom and edge representations for each residue, **a geometric graph attention layer** is applied
+> to pass messages between residues."
+
+That is the *hybrid* the `ARCHITECTURE.md` note lists as a middle option — attention computed only
+over edges the graph admits, rather than over all pairs. The paper supports the hybrid. It says
+nothing about pure message passing versus full cross-attention.
+
+### 9.4b The ablation is the useful part, and it is not flattering to our design
+
+| Ablation | Effect on SpearmanR |
+| --- | --- |
+| Multi-relational interface graph → **plain KNN graph** | **−23%** |
+| Remove side-chain atoms from the graph | −15% |
+| Full GearBind → simple RGCN (plain message passing) | −9% |
+
+The ordering is the finding: **graph construction dominates the architecture built on it.**
+Replacing typed, multi-relational edges with a KNN graph costs 23% Spearman; removing the
+attention and line-graph machinery entirely costs 9%.
+
+`ARCHITECTURE.md` Step 5 currently specifies a **top-48 nearest-neighbour** set — a KNN graph with
+one edge type. By GearBind's measurement that is the weaker construction, and it costs more than
+any of the fusion mechanisms we have been comparing.
+
+The fix is cheap and it points at something already established here. §2.1 showed the binding
+signal is the with-partner / without-partner *contrast*, and an earlier note observed that this is
+naturally an **edge attribute**. Typed edges are how that gets expressed: at minimum
+**same-chain vs cross-chain**, and plausibly also sequential-adjacency vs spatial-proximity, and a
+side-chain vs backbone distinction given the −15% above. None of that costs parameters — it is
+graph construction, not architecture.
+
+The −15% for dropping side-chain atoms is a third independent vote for breaking the §2.2 ceiling:
+GearBind's graph is full-atom, ours is not.
 
 ### 9.5 Their label-noise observation matches ours
 
@@ -279,7 +315,9 @@ constraint.
 | FoldX features | recommended twice, not built | **stronger** — best individual Spearman in their table |
 | Rotamer enumeration for mutant structures | proposed as the no-dependency option | **validated** — it is what GearBind does |
 | Structural pretraining | argued down as low value for us | **partly corrected** — it works, but buys only +0.027 Spearman |
-| GNN over cross-attention | argued from parameter counts | **supported** — GearBind is a GNN and leads its table |
+| GNN over cross-attention | argued from parameter counts | **not tested by this paper** — GearBind is itself attentional over graph edges, i.e. the hybrid |
+| Neighbourhood as top-48 KNN | the Step 5 plan | **weakened** — KNN costs 23% Spearman against a typed multi-relational graph |
+| Full-atom vs backbone graph | not considered | **add it** — dropping side chains costs 15% |
 | Antisymmetry | a probe in `PLAN.md` | consider making it **architectural** |
 | This dataset as a test set | our recommendation | **exactly what they do** |
 

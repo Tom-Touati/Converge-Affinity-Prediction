@@ -373,6 +373,30 @@ inspectability and the sparsity, at roughly 4d² ≈ 4,100 per layer.
 Sequencing: if N1 passes, try the GNN before the attention block. It is cheaper, its prior is
 stronger, and if it fails the attention version is very unlikely to succeed.
 
+**Update after reading GearBind** (Nat Commun 15:7785; see `ABSCI_DATASET.md` §9). Two
+corrections to the framing above.
+
+*The dichotomy is partly false.* GearBind is a graph network whose edge-level stage is "a sparse
+version of AlphaFold's triangle attention" and whose residue-level stage is "a geometric graph
+attention layer". It is the attention-gated hybrid described two paragraphs up, not an
+alternative to attention. Nothing in that paper compares pure message passing against full
+cross-attention, so it cannot be cited for "GNN beats attention".
+
+*What it does establish is that the graph matters more than the layer.* Their ablation, on
+SKEMPI n=5,729:
+
+| Ablation | SpearmanR |
+| --- | --- |
+| multi-relational graph → **plain KNN graph** | **−23%** |
+| drop side-chain atoms | −15% |
+| full GearBind → simple RGCN | −9% |
+
+**Step 5 as written builds the −23% option.** A top-48 nearest-neighbour set is a KNN graph with a
+single untyped edge relation. Before spending anything on the head, the neighbourhood should carry
+**typed edges** — same-chain vs cross-chain at minimum, which is §2.1's contrast expressed as an
+edge attribute rather than recovered from node features — and should be **full-atom** rather than
+backbone-only. Both are graph construction, so both cost zero parameters.
+
 ### 5.4 The ladder
 
 Each step is kept only if it beats the one below by a paired-bootstrap Δ whose CI clears zero.

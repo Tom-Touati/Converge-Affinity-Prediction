@@ -1,0 +1,3 @@
+name,rank_w,huber_w,margin,weighted,per_cx_rho,global_rho,rmse,minutes
+rk_huber_only,0.0,1.0,0.5,False,0.42,0.445,1.758,2.8
+rk_both,1.0,1.0,0.5,False,0.394,0.419,1.773,26.3
