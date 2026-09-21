@@ -1,18 +1,19 @@
 # AbSci HER2 dataset — profile and verdict
 
 Assessment of [AbSciBio/unlocking-de-novo-antibody-design](https://github.com/AbSciBio/unlocking-de-novo-antibody-design),
-the experimental release accompanying *Unlocking de novo antibody design with generative
-artificial intelligence* (Absci; [bioRxiv 2023.01.08.523187](https://www.biorxiv.org/content/10.1101/2023.01.08.523187v1),
-published in Nature Communications as
-[s41467-024-51563-8](https://www.nature.com/articles/s41467-024-51563-8)).
+the experimental release accompanying Shanehsazzadeh et al., *Unlocking de novo antibody design
+with generative artificial intelligence* (Absci;
+[bioRxiv 2023.01.08.523187](https://www.biorxiv.org/content/10.1101/2023.01.08.523187v1)).
 
 Every number below was computed by downloading the three CSVs and profiling them against our
 pipeline's requirements. Licence is **Clear BSD** — permissive, no barrier to use.
 
-> **Note on the paper itself.** nature.com redirects to an authentication gate, so the paper text
-> was not read directly. The description here comes from the repository README, the bioRxiv
-> preprint listing and the dataset itself. Claims attributed to the paper are limited to what
-> those sources state.
+**Two different papers are involved, and §9 covers the second one.** The dataset comes from
+Absci. [Nature Communications 15:7785 (s41467-024-51563-8)](https://www.nature.com/articles/s41467-024-51563-8)
+is a *different* paper — **GearBind**, Cai, Zhang, Wang, Zhong et al., *Pretrainable geometric
+graph neural network for antibody affinity maturation* — which **consumes** this dataset as an
+independent held-out test set. That paper is read and analysed in §9, and it independently
+confirms most of the profile below.
 
 ## Verdict up front
 
@@ -179,3 +180,112 @@ The dataset does not address the two things actually limiting us:
 
 It is an excellent evaluation resource and a poor training resource, and the distinction is worth
 stating plainly in the write-up.
+
+---
+
+## 9. GearBind — the paper that uses this dataset, and what it tells us
+
+[Nature Communications 15:7785](https://www.nature.com/articles/s41467-024-51563-8), Cai, Zhang,
+Wang, Zhong, Li, Zhong, Wu, Ying & Tang — *Pretrainable geometric graph neural network for
+antibody affinity maturation*. GearBind trains on SKEMPI and uses the Absci HER2 data as an
+**independent test set**, which is precisely the use §7 recommends.
+
+### 9.1 It independently confirms this profile
+
+> "This dataset contains high-quality binding affinity data, measured by surface plasmon
+> resonance (SPR) on 419 HER2 binders with de novo designed CDR loops. The antibodies in the
+> dataset are variants of Trastuzumab that have high edit distance (**7.6 on average**), making
+> them **potentially challenging for ΔΔG_bind predictors trained on low-edit-distance data**."
+
+They report mean edit distance 7.6; we measured median 8. And their stated concern is the same
+one §2 reaches independently: this is a different mutation regime from the point mutations
+SKEMPI-trained models see. It is the reason they use it as a test set rather than training data.
+
+### 9.2 Their SKEMPI numbers, and why FoldX is the headline
+
+Table 1 — split-by-complex fivefold CV on **full** SKEMPI v2.0, n = 5,729:
+
+| Model | MAE ↓ | RMSE ↓ | Pearson ↑ | **Spearman ↑** |
+| --- | --- | --- | --- | --- |
+| FoldX | 1.364 | 2.027 | 0.491 | **0.526** |
+| Flex-ddG | 1.236 | 1.849 | 0.497 | 0.484 |
+| Bind-ddG | 1.255 | 1.759 | 0.581 | 0.443 |
+| GearBind | 1.143 | 1.639 | 0.659 | 0.498 |
+| GearBind+P *(pretrained)* | 1.115 | 1.611 | 0.676 | 0.525 |
+| **Ensemble of all five** | **1.028** | **1.503** | **0.729** | **0.643** |
+
+Three things fall out of this table that bear directly on our decisions.
+
+**FoldX has the best Spearman of any individual model — 0.526, above the pretrained GNN's
+0.525 and the plain GNN's 0.498.** It has the *worst* MAE and RMSE at the same time, so it ranks
+well while being badly calibrated in absolute terms. The authors note the same asymmetry:
+removing FoldX costs the ensemble more Spearman than removing anything else. For a project whose
+headline metric is a rank correlation, that is a strong argument for the FoldX feature we have
+twice recommended and not yet built.
+
+**Geometric pretraining buys little.** GearBind → GearBind+P is +0.017 Pearson and +0.027
+Spearman, from contrastive pretraining on mass-scale CATH structures. That is real but small,
+and it is well inside our own harness's ±0.08 detectability floor. It is evidence against
+expecting a pretraining stage to rescue a model at our sample size.
+
+**The ensemble beats every member by a wide margin** — 0.643 Spearman against 0.526 for the best
+single model. Our chem+geom+mpnn fusion is the same shape of result, arrived at independently.
+
+*Comparability caveat:* their split is by complex on full SKEMPI; ours is by homology cluster on
+the antibody–antigen subset only, and our headline averages Spearman within complexes rather than
+pooling. Both differences make their numbers easier. These are not our numbers minus a constant.
+
+### 9.3 They break the §2.2 ceiling the way we proposed — with a rotamer library
+
+GearBind encodes **both** the wild-type and the mutant complex with a shared GNN, and the mutant
+structure is built by **sampling side-chain torsion angles from a rotamer library**. The same
+device powers their pretraining:
+
+> "The model is trained to contrast between native structures and randomly mutated structures
+> with **side-chain torsion angles sampled from a rotamer library**. Pretraining helps GearBind+P
+> explore the energy landscape of native protein structures."
+
+This is the rotamer-enumeration route proposed as option (b) for breaking §2.2, validated in a
+Nature Communications paper and used for two jobs at once — generating mutant structures for
+prediction, and generating decoys for self-supervision. It raises the priority of that option
+relative to waiting on FoldX downloads.
+
+### 9.4 Two more architectural confirmations
+
+**The predictor is antisymmetric by construction.** ΔΔG is produced by "an antisymmetric
+predictor given the GearNet-extracted representations of the two complexes" — the
+ΔΔG(reverse) = −ΔΔG(forward) constraint is built into the architecture rather than tested after
+the fact, which is how `PLAN.md` currently treats it.
+
+**It is a geometric GNN, not attention.** GearNet does multi-relational, multi-level message
+passing over a relational interface graph. That is the architecture the `ARCHITECTURE.md` §5.3
+note argues for over cross-attention, here shown working on exactly our task.
+
+### 9.5 Their label-noise observation matches ours
+
+> "When |ΔΔG_bind| is small, predictions from all methods have very low correlation with
+> experimental ΔΔG_bind values, hinting either the **noises in data** or a deficiency of current
+> tools in modeling weaker, more intricate interactions."
+
+On the large-effect subset they report Pearson **0.707 against FoldX's 0.411**; on small-effect
+rows, every method degrades. That is the same conclusion our GBT-vs-random-forest gap reached
+from the other direction — near the measurement floor, model capacity stops being the binding
+constraint.
+
+### 9.6 What changes for us
+
+| | Before reading GearBind | After |
+| --- | --- | --- |
+| FoldX features | recommended twice, not built | **stronger** — best individual Spearman in their table |
+| Rotamer enumeration for mutant structures | proposed as the no-dependency option | **validated** — it is what GearBind does |
+| Structural pretraining | argued down as low value for us | **partly corrected** — it works, but buys only +0.027 Spearman |
+| GNN over cross-attention | argued from parameter counts | **supported** — GearBind is a GNN and leads its table |
+| Antisymmetry | a probe in `PLAN.md` | consider making it **architectural** |
+| This dataset as a test set | our recommendation | **exactly what they do** |
+
+One correction to an earlier position. Contrastive pretraining was argued down on the grounds
+that aligning sequence and structure maximises *shared* information while fusion needs
+*complementary* information. GearBind's pretraining is a different objective — native versus
+rotamer-perturbed **decoy discrimination**, entirely within the structure modality — so that
+objection does not apply to it. The argument against sequence–structure *alignment* stands; the
+blanket scepticism about structural self-supervision does not.
