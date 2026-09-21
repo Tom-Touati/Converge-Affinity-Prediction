@@ -7,6 +7,10 @@
 #   bash scripts/setup_remote.sh            # full bootstrap, then the cheap extractions
 #   bash scripts/setup_remote.sh --big      # also ESM-2 650M, which is what the GPU is for
 #
+# On a host that already has a working CUDA torch outside a venv (Colab, some images):
+#   VENV_ARGS=--system-site-packages bash scripts/setup_remote.sh --big
+# Otherwise the fresh venv cannot see it and a CPU wheel gets installed over it.
+#
 # The two data files are NOT in git (they are large and SKEMPI asks you to register). Either
 # download them from https://life.bsc.es/pid/skempi2/ into data/, or copy them from a machine
 # that already has them:
@@ -24,7 +28,7 @@ echo "=== converge_bind bootstrap in $ROOT ==="
 # ---------------------------------------------------------------- python environment
 if [[ ! -d .venv ]]; then
   echo "--- creating .venv"
-  python3 -m venv .venv
+  python3 -m venv ${VENV_ARGS:-} .venv
 fi
 PY=.venv/bin/python
 [[ -x "$PY" ]] || PY=.venv/Scripts/python.exe        # windows layout, just in case
