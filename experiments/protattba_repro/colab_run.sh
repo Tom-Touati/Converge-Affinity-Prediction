@@ -102,8 +102,21 @@ stage crosscheck 900 || {
   exit 1
 }
 stage extract 3600 || { say "extract failed, stopping"; exit 1; }
+# The run stages are hours long and `colab exec` dropped its connection 35 minutes into the
+# first attempt ("RuntimeError: Connection was lost."), losing the whole fold. run_cv.py now
+# writes one file per fold and skips folds already on disk, so a retry resumes rather than
+# restarts -- which makes retrying the right response to a dropped connection.
 for st in "${STAGES[@]}"; do
-  stage "$st" 21600
+  for attempt in 1 2 3 4 5; do
+    say "--- $st attempt $attempt"
+    if stage "$st" 21600; then break; fi
+    grab "$st"                      # salvage whatever folds completed before the drop
+    if grep -q "STAGE_FAILED" "$LOG" && ! tail -400 "$LOG" | grep -q "Connection was lost"; then
+      say "$st failed for a reason other than a dropped connection; not retrying"
+      break
+    fi
+    say "$st lost its connection; resuming from the folds already on disk"
+  done
   grab "$st"
 done
 stage compare 600

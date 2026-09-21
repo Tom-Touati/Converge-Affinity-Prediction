@@ -234,6 +234,8 @@ def main() -> None:
     ap.add_argument("--tag", default=None, help="suffix for output filenames")
     ap.add_argument("--grad-checkpoint", action="store_true",
                     help="recompute attention blocks in backward; needed under ~4 GB VRAM")
+    ap.add_argument("--fresh", action="store_true",
+                    help="discard per-fold files already on disk instead of resuming")
     cli = ap.parse_args()
 
     if cli.grad_checkpoint:
@@ -266,7 +268,23 @@ def main() -> None:
     ckpt_root = RESULTS / f"checkpoints_{tag}"
     RESULTS.mkdir(parents=True, exist_ok=True)
 
+    # One file per fold, written the moment the fold finishes, and folds already on disk are
+    # skipped. A 10-fold run on a Colab VM is hours long and `colab exec` lost its connection
+    # 35 minutes into the first attempt -- with results written only at the end, that lost
+    # everything. HANDOFF.md §7 records the same lesson for the project's own runner.
     records, fold_log = [], []
+    done = {}
+    for p in sorted(RESULTS.glob(f"{tag}_fold*.csv")):
+        k = int(p.stem.rsplit("fold", 1)[1])
+        done[k] = pd.read_csv(p)
+    if done and not cli.fresh:
+        print(f"\nresuming: folds {sorted(done)} already on disk, "
+              f"{sum(len(v) for v in done.values())} predictions")
+    elif cli.fresh:
+        for p in RESULTS.glob(f"{tag}_fold*.csv"):
+            p.unlink()
+        done = {}
+
     t_start = time.time()
 
     splits = folds_for(cli.protocol, n_rows, args)
@@ -274,6 +292,12 @@ def main() -> None:
         splits = splits[: cli.folds]
 
     for fold, (train_idx, mon_idx, test_idx) in enumerate(splits):
+        if fold in done:
+            records.extend(done[fold].to_dict("records"))
+            one = score_by_fold(done[fold]).iloc[0]
+            print(f"fold {fold}: reused from disk | test PCC {one.pcc:.4f} "
+                  f"rho {one.rho:.4f} RMSE {one.rmse:.4f}", flush=True)
+            continue
         t_fold = time.time()
 
         # Their WrapperDataset takes (train, test) and exposes train/val/test loaders where val
@@ -321,9 +345,10 @@ def main() -> None:
         # get_test_loader is shuffle=False, so row k of the loader is test_idx[k].
         np.testing.assert_allclose(trues, np.asarray(labels)[test_idx], rtol=0, atol=1e-5)
 
-        for row, p, t in zip(test_idx, preds, trues):
-            records.append({"fold": fold, "row": int(row), "y_pred": float(p),
-                            "y_true": float(t)})
+        fold_rows = [{"fold": fold, "row": int(row), "y_pred": float(p), "y_true": float(t)}
+                     for row, p, t in zip(test_idx, preds, trues)]
+        records.extend(fold_rows)
+        pd.DataFrame(fold_rows).to_csv(RESULTS / f"{tag}_fold{fold}.csv", index=False)
 
         mins = (time.time() - t_fold) / 60
         fold_log.append({
@@ -342,7 +367,7 @@ def main() -> None:
             torch.cuda.empty_cache()
 
     wall = (time.time() - t_start) / 60
-    preds_df = pd.DataFrame(records)
+    preds_df = pd.DataFrame(records).sort_values(["fold", "row"]).reset_index(drop=True)
     per_fold = score_by_fold(preds_df)
 
     preds_df.to_csv(RESULTS / f"{tag}_predictions.csv", index=False)
