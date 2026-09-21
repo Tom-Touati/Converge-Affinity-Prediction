@@ -1,3 +1,0 @@
-name,rank_w,huber_w,margin,weighted,noise,fdrop,dropout,wd,d,train_rho,gap,per_cx_rho,global_rho,rmse,minutes
-aug_none,1.0,1.0,0.5,False,0.0,0.0,0.2,0.01,64,0.97,0.748,0.444,0.452,1.769,14.1
-aug_noise,1.0,1.0,0.5,False,0.2,0.0,0.2,0.01,64,0.974,0.766,0.454,0.483,1.769,15.8

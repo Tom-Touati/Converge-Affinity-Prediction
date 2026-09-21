@@ -39,3 +39,6 @@ Converge Bio - Machine Learning Researcher - Home Assignment - External.pdf
 # Claude Code tooling. Vendored skill packages are environment setup, not project code.
 # A project-level .claude/settings.json would be worth committing; the skills bundle is not.
 .claude/skills/
+
+# live dashboard pulls these off a running VM; transient
+scripts/dashboard/_data/
