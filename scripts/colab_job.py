@@ -38,10 +38,26 @@ DATA = {
 
 
 def sh(cmd, cwd=ROOT, check=True):
+    """Run a shell command, relaying its output through Python's stdout.
+
+    `colab exec` only streams what the kernel process itself writes. A plain
+    subprocess.run inherits the kernel descriptors, so a child process's stdout and
+    stderr go somewhere we never see -- the first attempt reported a bare "failed (1)"
+    from setup_remote.sh without one line of its output. Reading the pipe and
+    re-printing puts it back in the stream.
+    """
     print(f"\n$ {cmd}", flush=True)
-    rc = subprocess.run(cmd, shell=True, cwd=cwd).returncode
+    proc = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1,
+                            errors="replace")
+    for line in proc.stdout:
+        print(line.rstrip(), flush=True)
+    rc = proc.wait()
     if rc and check:
-        sys.exit(f"!!! failed ({rc}): {cmd}")
+        # `colab exec` always exits 0, so a non-zero child cannot be seen in the exit
+        # status. The runner greps for these markers instead.
+        print(f"!!! STAGE_FAILED ({rc}): {cmd}", flush=True)
+        raise SystemExit(rc)
     return rc
 
 
@@ -75,12 +91,29 @@ def stage_extract():
     # --system-site-packages so the venv sees the VM's CUDA torch; REQ_FILE strips the
     # torch==2.4.1 pin, which exists only for the Windows dev box's MSVC 14.28 runtime.
     sh("grep -v '^torch==' requirements.txt > /tmp/req_colab.txt")
-    sh("REQ_FILE=/tmp/req_colab.txt VENV_ARGS=--system-site-packages "
-       "bash scripts/setup_remote.sh --big")
+    # A venv from a previous failed attempt is worse than none -- remove it before starting.
+    sh(f"rm -rf {ROOT}/.venv", check=False)
+    # PYTHON_BIN is the kernel's own interpreter, which is where the bootstrap stage pip
+    # installed everything and which already carries a CUDA torch.
+    sh(f"REQ_FILE=/tmp/req_colab.txt PYTHON_BIN={sys.executable} "
+       f"bash scripts/setup_remote.sh --big")
 
 
 def _py():
-    return f"{ROOT}/.venv/bin/python" if os.path.exists(f"{ROOT}/.venv/bin/python") else "python"
+    """Prefer the venv interpreter, but only if it actually imports the stack.
+
+    A half-built venv from a failed extract is worse than none: every later stage then
+    invokes a python that cannot import torch, and with check=False those failures are
+    indistinguishable from success. That is exactly how the first run reported four
+    clean stages having done nothing at all.
+    """
+    cand = f"{ROOT}/.venv/bin/python"
+    if os.path.exists(cand):
+        if subprocess.run([cand, "-c", "import torch, sklearn, pandas"], cwd=ROOT,
+                          capture_output=True).returncode == 0:
+            return cand
+        print(f"!!! {cand} cannot import the stack -- using system python", flush=True)
+    return sys.executable
 
 
 def stage_runs():
@@ -116,4 +149,4 @@ if __name__ == "__main__":
         sys.exit(f"unknown stage {want!r}; pick one of {', '.join(STAGES)}")
     print(f"=== stage: {want} ===", flush=True)
     STAGES[want]()
-    print(f"=== stage {want} done ===", flush=True)
+    print(f"=== STAGE_OK {want} ===", flush=True)

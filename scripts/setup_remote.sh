@@ -13,6 +13,9 @@
 # Pair it with REQ_FILE to drop the torch pin so the existing build survives:
 #   grep -v '^torch==' requirements.txt > /tmp/req.txt
 #   REQ_FILE=/tmp/req.txt VENV_ARGS=--system-site-packages bash scripts/setup_remote.sh --big
+# On Colab the venv cannot be built at all (ensurepip fails) and is unnecessary, since the
+# system interpreter already has a CUDA torch. Skip it:
+#   PYTHON_BIN=$(which python3) bash scripts/setup_remote.sh --big
 #
 # The two data files are NOT in git (they are large and SKEMPI asks you to register). Either
 # download them from https://life.bsc.es/pid/skempi2/ into data/, or copy them from a machine
@@ -29,12 +32,21 @@ ROOT=$(pwd)
 echo "=== converge_bind bootstrap in $ROOT ==="
 
 # ---------------------------------------------------------------- python environment
-if [[ ! -d .venv ]]; then
-  echo "--- creating .venv"
-  python3 -m venv ${VENV_ARGS:-} .venv
+# PYTHON_BIN skips the venv entirely and uses the interpreter given. Needed on hosts where
+# the venv is both broken and pointless: on Colab, `python3 -m venv --system-site-packages`
+# fails outright in ensurepip, and the system interpreter already carries a CUDA torch, so
+# building a venv at all was solving a problem that did not exist there.
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  PY="$PYTHON_BIN"
+  echo "--- using $PY directly (no venv)"
+else
+  if [[ ! -d .venv ]]; then
+    echo "--- creating .venv"
+    python3 -m venv ${VENV_ARGS:-} .venv
+  fi
+  PY=.venv/bin/python
+  [[ -x "$PY" ]] || PY=.venv/Scripts/python.exe      # windows layout, just in case
 fi
-PY=.venv/bin/python
-[[ -x "$PY" ]] || PY=.venv/Scripts/python.exe        # windows layout, just in case
 
 $PY -m pip install --quiet --upgrade pip
 # REQ_FILE lets a caller substitute a filtered requirements file. On hosts that already
