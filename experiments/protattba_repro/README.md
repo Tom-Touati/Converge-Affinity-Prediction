@@ -358,3 +358,39 @@ bash colab_run.sh upstream honest
 - **AB645 / AB1101 were out of scope** and are the obvious follow-up; the harness takes a
   `--data-name` change and their `src_ab645` / `src_ab1101` modules are already in the
   checkout.
+
+## Looking at runs: TensorBoard
+
+The custom dashboard is replaced by TensorBoard. `scripts/to_tensorboard.py` is a one-way
+mirror of `reports/` -- it reads the CSVs the trainers already write and changes nothing, so
+it can be re-run at any time and nothing depends on it.
+
+```bash
+python scripts/to_tensorboard.py          # the live comparison: perturb_* and the E0 forests
+tensorboard --logdir runs/tb              # http://localhost:6006
+```
+
+Older families are added by substring (`python scripts/to_tensorboard.py arch_ ab_`), and
+`--all` mirrors all 131. The default is deliberately small: TensorBoard plots every run in
+the log directory checked, so mirroring everything reproduces exactly the problem the old
+dashboard had.
+
+What is where:
+
+| tab | shows |
+|---|---|
+| TIME SERIES / SCALARS | `val/pearson`, `val/rmse`, `train/loss` per epoch, one series per fold |
+| | `test/*` on the run summary, indexed by fold, so step 3 is fold 3 |
+| | `oof/*` pooled over all held-out rows, including `bias` and `rmse_debiased` |
+| IMAGES | predicted-vs-true scatter with the fitted offset; per-complex Pearson bars |
+| HPARAMS | every run in one sortable table -- this replaces the old Runs tab |
+| TEXT | the per-fold results table |
+
+Run naming is flat, `<run>` and `<run>__fold<k>`, not nested: TensorBoard derives a run name
+from its path with `os.sep`, so a nested layout produces `perturb_v2_full\fold0` on Windows
+and a backslash inside the filter box's regex is unusable. Flat, typing `perturb_v2_full`
+selects the summary and all five folds, `perturb_v2_full$` just the summary, and `fold0`
+overlays fold 0 across every run.
+
+`oof/rmse_debiased` next to `oof/label_sd` is the one to watch: equal means the model is no
+better than predicting that run's own mean, whatever its correlation says.

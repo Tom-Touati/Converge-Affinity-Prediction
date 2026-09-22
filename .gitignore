@@ -61,3 +61,4 @@ reports_colab/
 !results/plots/**
 # per-residue ProteinMPNN cache (18 MB, regenerable in ~3 min: python -m src.fusion.mpnn_per_residue)
 data/features/mpnn_per_residue/
+runs/tb/
