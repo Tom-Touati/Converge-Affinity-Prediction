@@ -225,6 +225,11 @@ def run(frame: pd.DataFrame, seeds=(0, 1, 2)) -> pd.DataFrame:
                     oof[te] = est.predict(X[te])
                 mins = (time.time() - t0) / 60
 
+                # Keep the predictions, not just the metrics. Without them the benchmark
+                # runs cannot be published as report directories, so the dashboard's "other
+                # datasets" tick box has nothing to reveal -- which looks like a broken
+                # toggle rather than an empty category.
+                publish_run(f"{dataset}__{protocol}_seed{seed}", dataset, g, folds, y, oof)
                 per_fold = []
                 for i in range(k):
                     te = folds == i
@@ -245,6 +250,39 @@ def run(frame: pd.DataFrame, seeds=(0, 1, 2)) -> pd.DataFrame:
                       f"PCC {pf.pearson.mean():.3f} +/- {pf.pearson.std(ddof=0):.3f}  "
                       f"rho {pf.spearman.mean():.3f}  RMSE {pf.rmse.mean():.3f}")
     return pd.DataFrame(out)
+
+
+def publish_run(name: str, dataset: str, frame: pd.DataFrame, folds, y_true, y_pred) -> None:
+    """Write one benchmark run into reports/<name>/, tagged with its dataset.
+
+    Same layout src/fusion/export.py writes for our own runs, so src/error_analysis.py and
+    the dashboard read a benchmark run with no special-casing. ``cluster`` falls back to the
+    pdb id: these sets have no homology clustering of their own, and inventing one would be
+    worse than saying so.
+    """
+    out = paths.REPORTS / name
+    out.mkdir(parents=True, exist_ok=True)
+    preds = pd.DataFrame({
+        "row_id": frame.row_id.to_numpy(), "complex": frame.pdb.to_numpy(),
+        "cluster": frame.pdb.to_numpy(), "fold": folds,
+        "y_true": np.asarray(y_true, float), "y_pred": np.asarray(y_pred, float),
+    }).dropna(subset=["y_pred"])
+    preds.to_csv(out / "predictions.csv", index=False)
+
+    m = metrics.score(preds.y_true, preds.y_pred, complexes=preds["complex"])
+    (out / "metrics.json").write_text(json.dumps({"metrics": {
+        "n": int(len(preds)), "n_complexes": int(preds["complex"].nunique()),
+        "per_complex_spearman": m.get("per_complex_spearman"),
+        "global_spearman": m["spearman"], "global_pearson": m["pearson"],
+        "rmse": m["rmse"], "mae": m["mae"],
+    }, "ci": None}, indent=2))
+    (out / "run.json").write_text(json.dumps({
+        "name": name, "dataset": dataset, "source": "src.fusion.run_benchmarks",
+        "model": "rf chem+geom+geomrev+mpnn_site", "features": [],
+        "note": "ProtAttBA benchmark, not our antibody-antigen SKEMPI subset; "
+                "cluster column falls back to the pdb id",
+        "git_sha": results.git_sha(),
+    }, indent=2))
 
 
 #: ProtAttBA Table 1, ESM2 column. S1131 verified against their shipped predictions.

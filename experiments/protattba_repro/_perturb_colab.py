@@ -98,12 +98,18 @@ def fold_pca(rows, fold, cache, n_components, seed=0):
 
 
 class DS(Dataset):
-    def __init__(self, frame, pca, cache, cfg, augment, seed):
+    """One split's rows. The PCA cache is SHARED across train/val/test.
+
+    It used to be per instance, so the same transformed sequence was held three times over.
+    That is ~1 GB of host RAM for nothing, and host RAM is the plausible OOM here, not VRAM.
+    """
+
+    def __init__(self, frame, pca, cache, cfg, augment, seed, pc_cache=None):
         self.f = frame.reset_index(drop=True)
         self.pca, self.c, self.cfg = pca, cache, cfg
         self.augment, self.rng = augment, np.random.default_rng(seed)
         self.bl = blosum62()
-        self._pc = {}
+        self._pc = pc_cache if pc_cache is not None else {}
 
     def pc(self, s):
         if s not in self._pc:
@@ -207,7 +213,7 @@ def history(exp, row):
     p = OUT / f"perturb_{exp}" / "history.csv"
     p.parent.mkdir(parents=True, exist_ok=True)
     cols = ["epoch", "step", "steps", "loss", "val_rho", "train_rho", "val_rmse",
-            "seconds", "fold", "seed", "n_train", "n_val", "name"]
+            "seconds", "fold", "seed", "n_train", "n_val", "name", "host_gb", "gpu_gb"]
     if not p.exists():
         p.write_text(",".join(cols) + "\n")
     with open(p, "a") as f:
@@ -237,7 +243,8 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
     train = tr_all[~tr_all.complex_key.isin(val_cx)]
     val = tr_all[tr_all.complex_key.isin(val_cx)]
 
-    mk = lambda f, a: DataLoader(DS(f, pca, cache, cfg, a, seed), batch_size=BATCH,
+    pc_cache = {}          # one PCA cache for all three splits of this fold
+    mk = lambda f, a: DataLoader(DS(f, pca, cache, cfg, a, seed, pc_cache), batch_size=BATCH,
                                  shuffle=a, collate_fn=collate, num_workers=0)
     tr, va, te = mk(train, augment), mk(val, False), mk(test, False)
     model = PerturbModel(cfg).to(device)
@@ -262,12 +269,18 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
                 p.append(model(x).cpu().numpy()); t.append(b["y"].numpy())
         pv, tv = np.concatenate(p), np.concatenate(t)
         r = pear(pv, tv)
+        import resource
+        host_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+        gpu_gb = (torch.cuda.max_memory_allocated() / 1e9) if torch.cuda.is_available() else 0.0
+        if ep % 5 == 0:
+            print(f"      mem: host {host_gb:.1f} GB peak, gpu {gpu_gb:.1f} GB peak", flush=True)
         history(exp, dict(epoch=ep, step=(ep + 1) * max(ns, 1), steps=ns,
                           loss=round(tot / max(ns, 1), 5),
                           val_rho="" if np.isnan(r) else round(r, 5), train_rho="",
                           val_rmse=round(float(np.sqrt(((pv - tv) ** 2).mean())), 5),
                           seconds=round(time.time() - t0, 1), fold=fold, seed=seed,
-                          n_train=len(train), n_val=len(val), name=f"perturb_{exp}"))
+                          n_train=len(train), n_val=len(val), name=f"perturb_{exp}",
+                          host_gb=round(host_gb, 2), gpu_gb=round(gpu_gb, 2)))
         if ep % 5 == 0:
             print(f"    fold {fold} seed {seed} epoch {ep:3d} val r {r:+.4f} "
                   f"({time.time()-t0:.0f}s)", flush=True)
@@ -293,6 +306,7 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exp", default="full")
+    ap.add_argument("--rows", default=str(ROWS))
     ap.add_argument("--folds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     ap.add_argument("--max-epochs", type=int, default=60)
@@ -302,14 +316,30 @@ def main():
     cfg = PerturbConfig(**json.loads(a.overrides))
     augment = json.loads(a.overrides).get("_augment", True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    rows = pd.read_parquet(ROWS)
+    rows = pd.read_parquet(a.rows)
     cache = Cache()
     OUT.mkdir(parents=True, exist_ok=True)
     print(f"=== {a.exp} === {len(rows)} rows, device {device}, cfg {cfg}", flush=True)
 
+    # Resume: a Colab runtime is reclaimed as soon as the local keep-alive dies, which has
+    # happened four times. Completed (fold, seed) pairs are restored from whatever was pulled
+    # down before the last death, so a reclaim costs the fold in flight rather than the run.
     recs, oof = [], []
+    done = set()
+    rp, op = OUT / f"{a.exp}_results.csv", OUT / f"{a.exp}_oof.csv"
+    if rp.exists():
+        prev = pd.read_csv(rp)
+        recs = prev.to_dict("records")
+        done = {(int(r["fold"]), int(r["seed"])) for r in recs}
+        if op.exists():
+            oof = [pd.read_csv(op)]
+        print(f"resuming: {sorted(done)} already done", flush=True)
+
     for fold in a.folds:
         for seed in a.seeds:
+            if (fold, seed) in done:
+                print(f"  fold {fold} seed {seed}: reused from disk", flush=True)
+                continue
             ids, yt, yp, eps, mins, n_params = run_fold(
                 rows, fold, seed, cfg, cache, a.exp, device, a.max_epochs, augment)
             recs.append(dict(exp=a.exp, split="frozen5", fold=fold, seed=seed,

@@ -38,13 +38,6 @@
          border-radius:8px;padding:6px 10px;font:inherit;font-size:13px;margin-left:auto}
   .hide{display:none}
   .note{color:var(--dim);font-size:12px;margin-top:8px}
-  .figwrap{position:relative;height:210px}
-  .figwrap.tall{height:300px}
-  .stat{margin:2px 0 10px 0}
-  body:not(.verbose) .card table.detail{display:none}
-  body:not(.verbose) .card .foot{display:none}
-  body:not(.verbose) .detailcard{display:none}
-  .tabs{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -60,10 +53,6 @@
     <input type="checkbox" id="otherds" style="vertical-align:-1px"> other datasets
   </label>
   <span id="dsbadge" style="margin-left:8px;font-size:12px"></span>
-  <label title="Show the underlying numbers. Off by default: each card states one metric and draws the slice; the table is for when you need the rest."
-         style="margin-left:auto;color:var(--dim);font-size:12px;cursor:pointer">
-    <input type="checkbox" id="verbose" style="vertical-align:-1px"> verbose tables
-  </label>
 </div>
 
 <div class="grid" id="view-train">
@@ -81,18 +70,15 @@
     </div>
   </div>
 
-  <div class="card detailcard"><h2>Generalisation gap by config</h2><div class="figwrap"><canvas id="cGap"></canvas></div></div>
-  <div class="card detailcard"><h2>Gap vs headline ρ</h2><div class="figwrap"><canvas id="cScatter"></canvas></div></div>
-  <div class="card wide"><h2>Validation Pearson by epoch — <span id="selA">—</span></h2>
-    <div class="stat" id="statVal"></div>
-    <div class="figwrap tall"><canvas id="cVal"></canvas></div>
+  <div class="card"><h2>Generalisation gap by config</h2><canvas id="cGap"></canvas></div>
+  <div class="card"><h2>Gap vs headline ρ</h2><canvas id="cScatter"></canvas></div>
+  <div class="card"><h2>Validation ρ — <span id="selA">—</span></h2><canvas id="cVal"></canvas>
     <div class="note">Read the units before comparing runs. A run trained with residual
       learning is scored here against <i>ΔΔG minus the forest's prediction</i>, and one without
       is scored against ΔΔG itself — the same axis, two different targets. The residual runs
       sit near 0.2 and the direct ones near 0.4 largely for that reason. Check the
       <b>resid</b> column on the Runs tab.</div></div>
-  <div class="card wide"><h2>Training loss by epoch — <span id="selB">—</span></h2>
-    <div class="figwrap"><canvas id="cTV"></canvas></div></div>
+  <div class="card"><h2>Train (solid) vs validation (dashed) — <span id="selB">—</span></h2><canvas id="cTV"></canvas></div>
 </div>
 
 <div class="grid hide" id="view-runs">
@@ -117,9 +103,7 @@
 <div class="grid hide" id="view-error">
   <div class="card wide">
     <h2>Direction of effect — where a destabilising-heavy dataset hides failure</h2>
-    <div class="stat" id="sdir"></div>
-    <div class="figwrap"><canvas id="cDir"></canvas></div>
-    <table class="detail" id="tDir"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
+    <table id="tDir"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
       <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
       <th>cluster ρ</th><th>rmse</th><th>mae</th><th>med|err|</th>
       <th>rmse/sd</th><th>bias</th>
@@ -131,9 +115,7 @@
 
   <div class="card wide">
     <h2>Structural-similarity tier (TM-score &gt; 0.8 vs that fold's training set)</h2>
-    <div class="stat" id="stier"></div>
-    <div class="figwrap"><canvas id="cTier"></canvas></div>
-    <table class="detail" id="tTier"><thead><tr><th>tier</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
+    <table id="tTier"><thead><tr><th>tier</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
       <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
       <th>cluster ρ</th><th>rmse</th><th>mae</th><th>med|err|</th>
       <th>rmse/sd</th><th>bias</th>
@@ -154,9 +136,7 @@
 
   <div class="card wide">
     <h2>Single-point vs multi-point</h2>
-    <div class="stat" id="smult"></div>
-    <div class="figwrap"><canvas id="cMult"></canvas></div>
-    <table class="detail" id="tMult"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
+    <table id="tMult"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
       <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
       <th>cluster ρ</th><th>rmse</th><th>mae</th><th>med|err|</th>
       <th>rmse/sd</th><th>bias</th>
@@ -169,9 +149,7 @@
 
   <div class="card wide">
     <h2>Which side carries the mutation</h2>
-    <div class="stat" id="sside"></div>
-    <div class="figwrap"><canvas id="cSide"></canvas></div>
-    <table class="detail" id="tSide"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
+    <table id="tSide"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
       <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
       <th>cluster ρ</th><th>rmse</th><th>mae</th><th>med|err|</th>
       <th>rmse/sd</th><th>bias</th>
@@ -184,9 +162,7 @@
 
   <div class="card wide">
     <h2>Per homology cluster — the actual independent unit</h2>
-    <div class="stat" id="sclust"></div>
-    <div class="figwrap tall"><canvas id="cClust"></canvas></div>
-    <table class="detail" id="tClust"><thead><tr><th>cluster</th><th>rows</th><th>complexes</th>
+    <table id="tClust"><thead><tr><th>cluster</th><th>rows</th><th>complexes</th>
       <th>sd(true)</th><th>ρ</th><th>rmse</th></tr></thead><tbody></tbody></table>
     <div class="note">54 complexes sit in 17 clusters, and one of them (1MLC_AB_E) holds 274 of
       997 rows. Averaging per complex weights a ten-complex cluster ten times over a singleton
@@ -196,9 +172,7 @@
 
   <div class="card wide">
     <h2>Support and other thin slices</h2>
-    <div class="stat" id="ssup"></div>
-    <div class="figwrap"><canvas id="cSup"></canvas></div>
-    <table class="detail" id="tSup"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
+    <table id="tSup"><thead><tr><th>slice</th><th>n</th><th>cx</th><th>cnt≥5</th><th>cnt≥10</th>
       <th>sd(true)</th><th>micro ρ</th><th>macro ρ<br>(≥5)</th><th>macro ρ<br>(≥10)</th>
       <th>cluster ρ</th><th>rmse</th><th>mae</th><th>med|err|</th>
       <th>rmse/sd</th><th>bias</th>
@@ -207,13 +181,7 @@
 </div>
 
 <script>
-// Categorical hues in FIXED order, from the validated dark-mode set. Checked with the
-// palette validator against this surface (#171a21): lightness band, chroma floor, CVD
-// separation (worst adjacent dE 8.4 protan), normal-vision floor (19.8) and contrast all
-// pass. Never cycle past the list: a 9th fold would fold into "other", not a new hue.
-const FOLD=['#3987e5','#d95926','#199e70','#c98500','#d55181'];
-const INK='#e6e8ee', MUTED='#98a0b3', GRIDC='#272b35';
-let VERBOSE=false;
+const FOLD=['#60a5fa','#fbbf24','#4ade80','#f87171'];
 let sel=null, charts={}, S=null, HIST={};
 const num=(v)=>{const n=parseFloat(v);return isNaN(n)?null:n;};
 const fmt=(v,d=3)=>v===null?'—':v.toFixed(d);
@@ -245,12 +213,6 @@ async function tick(){
     tr.onclick=()=>{sel=r.name;draw(s);};
     tb.appendChild(tr);
   });
-  // Pick a run with history so the curve is on screen immediately. Requiring a click meant
-  // the Training tab looked empty even while a run was streaming epochs into it.
-  if(!sel || !(s.history||{})[sel]){
-    const withHistory=rows.map(r=>r.name).filter(n=>(s.history||{})[n]);
-    if(withHistory.length) sel=withHistory[withHistory.length-1];
-  }
   if(!sel&&rows.length) sel=rows[0].name;
   draw(s);
 }
@@ -273,94 +235,26 @@ function draw(s){
       options:{plugins:{legend:{display:false}},scales:axes('optimiser step','ρ')}})); return; }
 
   const folds=Object.keys(h).sort();
-  // Folds have different lengths (early stopping), so plot {x,y} pairs rather than one
-  // shared label array -- otherwise a short fold is silently truncated to the first fold's
-  // length, or padded with nulls that read as a line falling to zero.
-  const series=folds.map((f,i)=>({label:'fold '+f,
-    data:h[f].epoch.map((e,j)=>({x:e,y:h[f].val[j]})).filter(pt=>pt.y!=null),
-    borderColor:FOLD[i%FOLD.length],backgroundColor:FOLD[i%FOLD.length],
-    pointRadius:0,pointHoverRadius:5,borderWidth:2,tension:.15}));
-  const best=series.map(d=>d.data.length?Math.max(...d.data.map(pt=>pt.y)):null)
-                   .filter(v=>v!=null);
-  const bs=document.getElementById('statVal');
-  if(bs) bs.innerHTML = best.length
-    ? '<span style="font-size:22px;font-weight:600">'+Math.max(...best).toFixed(3)+
-      '</span><span style="color:var(--dim);font-size:12px"> best validation ρ · '+
-      series.length+' folds · '+series.reduce((a,d)=>a+d.data.length,0)+' epochs logged</span>'
-    : '';
+  mk('cVal',{type:'line',data:{labels:h[folds[0]].epoch,
+    datasets:folds.map((f,i)=>({label:'fold '+f,data:h[f].val,borderColor:FOLD[i%4],
+      pointRadius:0,borderWidth:2,tension:.15}))},
+    options:{plugins:leg,scales:axes('optimiser step','validation ρ (target depends on resid flag)')}});
 
-  mk('cVal',{type:'line',data:{datasets:series},
-    options:{responsive:true,maintainAspectRatio:false,
-      interaction:{mode:'nearest',axis:'x',intersect:false},
-      plugins:{legend:{labels:{color:INK,boxWidth:10,usePointStyle:true}},
-        tooltip:{callbacks:{title:(c)=>'epoch '+c[0].parsed.x,
-                            label:(c)=>c.dataset.label+': ρ '+c.parsed.y.toFixed(3)}}},
-      scales:{x:{type:'linear',title:{display:true,text:'epoch',color:MUTED},
-                 ticks:{color:MUTED},grid:{color:GRIDC}},
-              y:{title:{display:true,text:'validation Pearson ρ',color:MUTED},
-                 ticks:{color:MUTED},grid:{color:GRIDC}}}}});
-
-  const ds=folds.map((f,i)=>({label:'fold '+f,
-    data:h[f].epoch.map((e,j)=>({x:e,y:h[f].loss[j]})).filter(pt=>pt.y!=null),
-    borderColor:FOLD[i%FOLD.length],pointRadius:0,borderWidth:2,tension:.15}));
-  mk('cTV',{type:'line',data:{datasets:ds},
-    options:{responsive:true,maintainAspectRatio:false,
-      interaction:{mode:'nearest',axis:'x',intersect:false},
-      plugins:{legend:{labels:{color:INK,boxWidth:10,usePointStyle:true}},
-        tooltip:{callbacks:{title:(c)=>'epoch '+c[0].parsed.x,
-                            label:(c)=>c.dataset.label+': loss '+c.parsed.y.toFixed(3)}}},
-      scales:{x:{type:'linear',title:{display:true,text:'epoch',color:MUTED},
-                 ticks:{color:MUTED},grid:{color:GRIDC}},
-              y:{title:{display:true,text:'training loss (MSE)',color:MUTED},
-                 ticks:{color:MUTED},grid:{color:GRIDC}}}}});
+  const ds=[];
+  folds.forEach((f,i)=>{
+    ds.push({label:'fold '+f+' train',data:h[f].train,borderColor:FOLD[i%4],
+             pointRadius:0,borderWidth:2,tension:.15});
+    ds.push({label:'fold '+f+' val',data:h[f].val,borderColor:FOLD[i%4],borderDash:[5,4],
+             pointRadius:0,borderWidth:2,tension:.15});
+  });
+  mk('cTV',{type:'line',data:{labels:h[folds[0]].epoch,datasets:ds},
+    options:{plugins:{legend:{labels:{color:'#e6e8ee',boxWidth:10,filter:i=>i.text.endsWith('train')}}},
+             scales:axes('optimiser step','ρ')}});
 }
 
 // ---------------------------------------------------------------- error analysis
 let ERR=null, RUN=null;
 const f3=(v,d=3)=>v===null||v===undefined?'—':(typeof v==='number'?v.toFixed(d):v);
-
-// A slice is magnitude-by-category, so it reads as a horizontal bar, not a table. The
-// table still exists for anyone who wants the numbers; it is hidden unless "verbose" is on.
-function sliceChart(canvasId, obj, order, opts){
-  const el=document.getElementById(canvasId); if(!el) return;
-  if(!obj){ if(charts[canvasId]) charts[canvasId].destroy(); return; }
-  const keys=(order?order.filter(k=>k in obj):Object.keys(obj));
-  const metric=(opts&&opts.metric)||'macro_rho';
-  const vals=keys.map(k=>obj[k]&&obj[k][metric]!=null?obj[k][metric]:null);
-  const ns=keys.map(k=>obj[k]?obj[k].n:0);
-  // one series, so no legend box: the card title names it. Bars carry their own value.
-  mk(canvasId,{type:'bar',data:{labels:keys.map((k,i)=>k+'  (n='+ns[i]+')'),
-    datasets:[{data:vals,backgroundColor:vals.map(v=>v==null?MUTED:(v<0?'#d95926':'#3987e5')),
-               borderRadius:4,borderSkipped:false,barThickness:14}]},
-    options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
-      plugins:{legend:{display:false},
-        tooltip:{callbacks:{label:(c)=>{const b=obj[keys[c.dataIndex]]||{};
-          return [ (opts&&opts.label||'macro ρ')+': '+f3(b[metric]),
-                   'n '+b.n+' · complexes '+b.n_complexes,
-                   'rmse '+f3(b.rmse)+' · rmse/sd '+f3(b.rmse_over_sd,2) ];}}}},
-      scales:{x:{title:{display:true,text:(opts&&opts.label)||'macro ρ',color:MUTED},
-                 ticks:{color:MUTED},grid:{color:GRIDC},
-                 suggestedMin:(opts&&opts.min!=null)?opts.min:-0.2,
-                 suggestedMax:(opts&&opts.max!=null)?opts.max:0.8},
-              y:{ticks:{color:INK},grid:{display:false}}}}});
-}
-
-// The one number a card is actually about, stated above the figure.
-function statTile(id, obj, order, opts){
-  const el=document.getElementById(id); if(!el) return;
-  if(!obj){ el.textContent=''; return; }
-  const metric=(opts&&opts.metric)||'macro_rho';
-  const keys=(order?order.filter(k=>k in obj):Object.keys(obj))
-              .filter(k=>obj[k]&&obj[k][metric]!=null);
-  if(!keys.length){ el.textContent=''; return; }
-  let worst=keys[0];
-  keys.forEach(k=>{ if(obj[k][metric]<obj[worst][metric]) worst=k; });
-  const b=obj[worst];
-  el.innerHTML='<span style="font-size:22px;font-weight:600;color:'+
-    (b[metric]<0.1?'var(--bad)':'var(--fg)')+'">'+f3(b[metric])+'</span>'+
-    '<span style="color:var(--dim);font-size:12px"> worst slice · <b>'+worst+
-    '</b> · n='+b.n+' over '+b.n_complexes+' complexes</span>';
-}
 
 function fillTable(id, obj, order){
   const tb=document.querySelector('#'+id+' tbody'); tb.innerHTML='';
@@ -426,47 +320,16 @@ async function loadError(){
   if(!RUN) return;
   ERR=await (await fetch('/api/error?run='+encodeURIComponent(RUN))).json();
   if(ERR.error){ document.getElementById('tierNote').textContent=ERR.error; return; }
-  const ORD_DIR=['stabilising (<-0.5)','neutral (|ddG|<=0.5)','destabilising (>+0.5)'];
-  fillTable('tDir', ERR.direction, ORD_DIR);
-  sliceChart('cDir', ERR.direction, ORD_DIR); statTile('sdir', ERR.direction, ORD_DIR);
+  fillTable('tDir', ERR.direction, ['stabilising (<-0.5)','neutral (|ddG|<=0.5)','destabilising (>+0.5)']);
   fillTable('tTier', ERR.tier, ['easy','medium','hard']);
-  sliceChart('cTier', ERR.tier, ['easy','medium','hard']);
-  statTile('stier', ERR.tier, ['easy','medium','hard']);
-  const MULT=Object.assign({}, ERR.multiplicity, ERR.n_mut);
-  const ORD_M=['single-point','multi-point','1-point','2-point','3-point','4-point'];
-  fillTable('tMult', MULT, ORD_M);
-  sliceChart('cMult', MULT, ORD_M); statTile('smult', MULT, ORD_M);
-  const ORD_S=['antibody','antigen','both','ab_vs_ab'];
-  fillTable('tSide', ERR.mut_side, ORD_S);
-  sliceChart('cSide', ERR.mut_side, ORD_S); statTile('sside', ERR.mut_side, ORD_S);
-  const SUP=Object.assign({}, ERR.support, ERR.extra);
-  fillTable('tSup', SUP); sliceChart('cSup', SUP); statTile('ssup', SUP);
+  fillTable('tMult', Object.assign({}, ERR.multiplicity, ERR.n_mut),
+            ['single-point','multi-point','1-point','2-point','3-point','4-point']);
+  fillTable('tSide', ERR.mut_side, ['antibody','antigen','both','ab_vs_ab']);
+  fillTable('tSup', Object.assign({}, ERR.support, ERR.extra));
   if(ERR.tier_note) document.getElementById('tierNote').textContent=ERR.tier_note;
   else if(ERR.tier_counts) document.getElementById('tierNote').textContent +=
       '  Complex-folds per tier: '+JSON.stringify(ERR.tier_counts);
 
-  const clAll=(ERR.per_cluster||[]).slice().filter(c=>c.rho!=null)
-      .sort((a,b)=>a.rho-b.rho);
-  if(clAll.length){
-    mk('cClust',{type:'bar',data:{labels:clAll.map(c=>c.cluster+'  (n='+c.n+')'),
-      datasets:[{data:clAll.map(c=>c.rho),
-        backgroundColor:clAll.map(c=>c.rho<0?'#d95926':'#3987e5'),
-        borderRadius:4,borderSkipped:false,barThickness:12}]},
-      options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
-        plugins:{legend:{display:false},tooltip:{callbacks:{label:(c)=>{
-          const k=clAll[c.dataIndex];
-          return ['ρ '+f3(k.rho),'n '+k.n+' · complexes '+k.n_complexes,
-                  'rmse '+f3(k.rmse)+' · sd '+f3(k.sd_true)];}}}},
-        scales:{x:{title:{display:true,text:'Spearman ρ within cluster',color:MUTED},
-                   ticks:{color:MUTED},grid:{color:GRIDC}},
-                y:{ticks:{color:INK,font:{size:10}},grid:{display:false}}}}});
-    const neg=clAll.filter(c=>c.rho<0).length;
-    document.getElementById('sclust').innerHTML=
-      '<span style="font-size:22px;font-weight:600;color:'+(neg?'var(--bad)':'var(--fg)')+'">'+
-      neg+'</span><span style="color:var(--dim);font-size:12px"> of '+clAll.length+
-      ' clusters anti-correlated · median ρ '+
-      f3(clAll[Math.floor(clAll.length/2)].rho)+'</span>';
-  }
   const cl=ERR.per_cluster||[];
   const ctb=document.querySelector('#tClust tbody'); ctb.innerHTML='';
   cl.slice().sort((a,b)=>(a.rho??9)-(b.rho??9)).forEach(c=>{
@@ -494,10 +357,6 @@ async function loadError(){
         `${c.raw.cx}  n=${c.raw.x}  rho=${c.raw.y.toFixed(3)}`}}},
       scales:axes('mutations in complex','per-complex ρ')}});
 }
-
-const vb=document.getElementById('verbose');
-if(vb){ vb.onchange=()=>{ VERBOSE=vb.checked;
-  document.body.classList.toggle('verbose', VERBOSE); }; }
 
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
