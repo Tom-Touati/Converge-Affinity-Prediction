@@ -180,3 +180,62 @@ def test_residue_indices_align_across_sequence_and_structure():
         print("   ", row)
     assert not bad_struct, f"{len(bad_struct)} rows disagree with the PDB, e.g. {bad_struct[:3]}"
     assert not bad_seq, f"{len(bad_seq)} rows disagree with the ESM input, e.g. {bad_seq[:3]}"
+
+
+def test_blosum_letters_follow_the_site_not_its_rank():
+    """The substitution stored at a crop's flagged token must be the one that lands there.
+
+    ``Row.wt_aa`` lists the parts of a multi-point mutation in the order the mutation string
+    writes them, which is neither per-side nor sorted by position. Counting within one side --
+    ``wt_aa[j]`` for the j-th flagged token -- therefore reads a different mutation's residue
+    whenever the two orders disagree: on 8.7% of rows, including every row mutated on both
+    sides. It produced no error, only a wrong BLOSUM row, so the check is against the mutation
+    string itself rather than against the code that writes the crop.
+    """
+    pd = pytest.importorskip("pandas")
+    from src import paths
+    from src.perturb import data as D
+    from src.perturb.build_crops import OUT
+    from src.structures import load_structures, parse_mutations
+
+    if not OUT.exists() or not paths.PDB_DIR.exists():
+        pytest.skip("crop file or PDB directory not present")
+
+    crops = np.load(OUT, allow_pickle=False)
+    rows = D.load_rows()
+    meta = pd.read_parquet(paths.DATASET).set_index("row_id")
+    structures = load_structures({r.pdb for r in rows})
+
+    bad, n_interleaved = [], 0
+    for r in rows:
+        st = structures[r.pdb]
+        ab = meta.loc[r.row_id, "ab_chains"] or meta.loc[r.row_id, "side1"]
+        ag = meta.loc[r.row_id, "ag_chains"] or meta.loc[r.row_id, "side2"]
+        truth = {}
+        for mut in parse_mutations(meta.loc[r.row_id, "mutations"]):
+            group = ab if mut.chain in ab else ag
+            offset = sum(len(st.chains[c].seq) for c in group[: group.index(mut.chain)])
+            side = "ab" if mut.chain in ab else "ag"
+            truth[(side, offset + st.chains[mut.chain].index[mut.key])] = (mut.wt, mut.mut)
+
+        for side in ("ab", "ag"):
+            idx = crops[f"{r.row_id}|{side}_idx"]
+            flags = crops[f"{r.row_id}|{side}_site"]
+            wt = crops[f"{r.row_id}|{side}_wt_aa"]
+            mt = crops[f"{r.row_id}|{side}_mt_aa"]
+            hits = np.flatnonzero(flags)
+            assert len(wt) == len(mt) == len(hits), \
+                f"{r.row_id} {side}: {len(wt)} letters for {len(hits)} flagged tokens"
+            for j, t in enumerate(hits):
+                want = truth.get((side, int(idx[t])))
+                assert want is not None, f"{r.row_id} {side}: flagged token {idx[t]} is not mutated"
+                if want != (str(wt[j]), str(mt[j])):
+                    bad.append((r.row_id, side, int(idx[t]), want, (str(wt[j]), str(mt[j]))))
+                # what indexing the interleaved list by rank-within-side would have read
+                if j < len(r.wt_aa) and r.wt_aa[j] != want[0]:
+                    n_interleaved += 1
+
+    print(f"\nBLOSUM letter audit over {len(rows)} rows: {len(bad)} wrong; "
+          f"rank-within-side would have been wrong at {n_interleaved} sites")
+    assert n_interleaved > 0, "no row exercises the interleaving; the test proves nothing"
+    assert not bad, f"{len(bad)} sites carry another mutation's residue, e.g. {bad[:3]}"

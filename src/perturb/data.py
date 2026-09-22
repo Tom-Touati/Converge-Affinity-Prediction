@@ -114,8 +114,16 @@ class Row:
     ag_mt: str
     sites_ab: list[int]
     sites_ag: list[int]
-    wt_aa: list[str]
+    wt_aa: list[str]              # in mutation-string order, i.e. INTERLEAVED across sides
     mt_aa: list[str]
+    # The same substitutions split per side and kept in step with sites_ab / sites_ag.
+    # A multi-point mutation lists its parts in string order, which need not be the order
+    # they fall in on either side, so indexing wt_aa by a position within one side reads
+    # the wrong residue. Anything that pairs a letter with a site must use these.
+    wt_ab: list[str]
+    mt_ab: list[str]
+    wt_ag: list[str]
+    mt_ag: list[str]
     ddg: float
     fold: int
 
@@ -144,15 +152,20 @@ def load_rows(split_json: Path | None = None) -> list[Row]:
         ab = r.ab_chains or r.side1
         ag = r.ag_chains or r.side2
         sites_ab, sites_ag, wt_aa, mt_aa = [], [], [], []
+        wt_ab, mt_ab, wt_ag, mt_ag = [], [], [], []
         for mut in parse_mutations(r.mutations):
             pos = st.chains[mut.chain].index[mut.key]
             group = ab if mut.chain in ab else ag
             offset = sum(len(st.chains[c].seq) for c in group[: group.index(mut.chain)])
-            (sites_ab if mut.chain in ab else sites_ag).append(offset + pos)
+            on_ab = mut.chain in ab
+            (sites_ab if on_ab else sites_ag).append(offset + pos)
+            (wt_ab if on_ab else wt_ag).append(mut.wt)
+            (mt_ab if on_ab else mt_ag).append(mut.mut)
             wt_aa.append(mut.wt)
             mt_aa.append(mut.mut)
         rows.append(Row(r.row_id, r.complex_key, r.pdb, r.ab_wt, r.ag_wt, r.ab_mt, r.ag_mt,
-                        sites_ab, sites_ag, wt_aa, mt_aa, float(r.ddG), int(r.fold)))
+                        sites_ab, sites_ag, wt_aa, mt_aa, wt_ab, mt_ab, wt_ag, mt_ag,
+                        float(r.ddG), int(r.fold)))
     return rows
 
 

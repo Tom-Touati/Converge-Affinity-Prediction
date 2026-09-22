@@ -90,13 +90,14 @@ class PerturbDataset(Dataset):
     def __getitem__(self, i):
         r = self.rows[i]
         ab_wt, ag_wt, ab_mt, ag_mt = r.ab_wt, r.ag_wt, r.ab_mt, r.ag_mt
-        wt_aa, mt_aa, y = r.wt_aa, r.mt_aa, r.ddg
+        wt_ab, mt_ab, wt_ag, mt_ag, y = r.wt_ab, r.mt_ab, r.wt_ag, r.mt_ag, r.ddg
 
         # reverse mutation: swap the branches, swap the BLOSUM pair, negate the label
         if self.augment and self.rng.random() < 0.5:
             ab_wt, ab_mt = ab_mt, ab_wt
             ag_wt, ag_mt = ag_mt, ag_wt
-            wt_aa, mt_aa = mt_aa, wt_aa
+            wt_ab, mt_ab = mt_ab, wt_ab
+            wt_ag, mt_ag = mt_ag, wt_ag
             y = -y
 
         s_ab_wt, s_ab_mt = self.seq_tokens(ab_wt), self.seq_tokens(ab_mt)
@@ -118,8 +119,9 @@ class PerturbDataset(Dataset):
             if p < l_ag:
                 site_ag[p] = 1.0
 
-        b_ab_wt, b_ab_mt = self.blosum_rows(l_ab, r.sites_ab, wt_aa, mt_aa)
-        b_ag_wt, b_ag_mt = self.blosum_rows(l_ag, r.sites_ag, wt_aa, mt_aa)
+        # per-side letters, in step with the per-side site list; see Row's comment
+        b_ab_wt, b_ab_mt = self.blosum_rows(l_ab, r.sites_ab, wt_ab, mt_ab)
+        b_ag_wt, b_ag_mt = self.blosum_rows(l_ag, r.sites_ag, wt_ag, mt_ag)
 
         d = self.distances(r.complex_key)
         d = d[:l_ab, :l_ag]
