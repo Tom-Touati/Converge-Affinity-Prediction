@@ -1,0 +1,7 @@
+exp: heads_8x32
+seeds:
+- 0
+- 1
+- 2
+n_heads: 8
+head_dim: 32

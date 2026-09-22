@@ -1,0 +1,6 @@
+exp: pca_512
+seeds:
+- 0
+- 1
+- 2
+seq_dim: 512

@@ -1,0 +1,6 @@
+exp: site_pool
+seeds:
+- 0
+- 1
+- 2
+site_pool: true

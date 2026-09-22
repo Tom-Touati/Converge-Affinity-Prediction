@@ -201,3 +201,35 @@ defensible option, write it down, keep going.
   flagged 188 rows; "NAN" is Asn-Ala-Asn and occurs in real sequences. Checking every
   character against the amino-acid alphabet gives zero non-residue characters and zero
   sequences equal to "nan" across all four columns.
+
+## Perturbation model
+
+- **D37. The head is bias-free, so a null edit gives exactly zero.** With no mutation both
+  branches compute identical vectors and the difference is the zero vector; a bias would turn
+  that into a learned constant, which is wrong on its face for a no-op edit. This is what
+  makes required test (a) an equality rather than a tolerance.
+- **D38. Masked attention uses -inf, not ProtAttBA's 1e-10.** Their mask lets padded keys keep
+  softmax mass, so a prediction depends on its batch's padding width. That is reproduced
+  faithfully in the reproduction and deliberately not copied here: every ablation would
+  otherwise depend on batch composition.
+- **D39. The distance-bin off-by-one was caught by a test, not by a failure.** Taking
+  `linspace(0, 20, 17)[1:-1]` leaves 15 boundaries, caps the bin index at 15, and silently
+  merges "beyond 20 A" into the 18.75-20 A bin -- leaving the bias no parameter for
+  non-contacts at all, which is the one thing that bin exists for. Nothing raised.
+- **D40. The alignment audit (test d) found zero mismatches over all 940 rows.** Every
+  mutation's wild-type residue matches both the PDB residue list and the concatenated ESM
+  input at the same index, so nothing had to be dropped.
+- **D41. Training runs on Colab, not locally.** A CPU epoch did not finish in ten minutes; a
+  T4 epoch takes 24 s. The same applied to ESM extraction: 3 min on the GPU against 2.2 hours
+  locally. I initially ran the extraction on the CPU "because the GPU was busy", which was the
+  wrong trade and was corrected.
+- **D42. The VM is bootstrapped from scratch rather than kept warm.** Sessions were reclaimed
+  three times, wiping /content each time. The bundle uploaded is 41 MB (resolved rows,
+  ProteinMPNN cache, distance cache, model and scripts) and the 0.86 GB ESM cache is
+  re-extracted on the GPU in under three minutes, which beats pushing it over the wire. Rows
+  are shipped with their mutation sites already resolved, so the VM needs no PDB files and no
+  structure parser.
+- **D43. Results are polled off the VM while it trains.** The exec client times out long
+  before a 5-fold run finishes, but the remote process survives it and `colab download` works
+  against a BUSY kernel. Polling is therefore both the progress view and the thing that makes
+  results survive a reclaimed session.

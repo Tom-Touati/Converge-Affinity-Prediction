@@ -1,0 +1,6 @@
+exp: no_blosum
+seeds:
+- 0
+- 1
+- 2
+use_blosum: false

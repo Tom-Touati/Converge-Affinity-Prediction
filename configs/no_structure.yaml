@@ -1,0 +1,6 @@
+exp: no_structure
+seeds:
+- 0
+- 1
+- 2
+use_structure: false

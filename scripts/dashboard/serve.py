@@ -15,6 +15,7 @@ import csv
 import io
 import json
 import pathlib
+import shutil
 import subprocess
 import sys
 import threading
@@ -47,10 +48,37 @@ def pull(session: str, remote: str, local: pathlib.Path) -> bool:
         return False
 
 
+LOCAL_REPORTS = ROOT / "reports"
+
+
+def pull_local(remote: str, local: pathlib.Path) -> bool:
+    """Copy from the local reports/ tree instead of a VM.
+
+    Runs that execute on this machine write their history straight into reports/, so there is
+    nothing to download. Without this the dashboard could only ever show remote work, and a
+    local training run would look like no run at all.
+    """
+    rel = remote[len(REMOTE):].lstrip("/")
+    src = LOCAL_REPORTS / rel
+    if not src.exists():
+        return False
+    local.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copyfile(src, local)
+        return True
+    except Exception:
+        return False
+
+
+def fetch(session: str, remote: str, local: pathlib.Path) -> bool:
+    """Remote first, then local. A VM that is gone must not hide a local run."""
+    return pull(session, remote, local) or pull_local(remote, local)
+
+
 def poll_loop(session: str):
     while True:
         try:
-            if pull(session, f"{REMOTE}/rank_fusion_sweep.csv", DATA / "sweep.csv"):
+            if fetch(session, f"{REMOTE}/rank_fusion_sweep.csv", DATA / "sweep.csv"):
                 rows = list(csv.DictReader(io.StringIO(
                     (DATA / "sweep.csv").read_text(encoding="utf-8", errors="replace"))))
                 with LOCK:
@@ -60,7 +88,7 @@ def poll_loop(session: str):
                     if not name:
                         continue
                     f = DATA / f"{name}_history.csv"
-                    if pull(session, f"{REMOTE}/{name}/history.csv", f):
+                    if fetch(session, f"{REMOTE}/{name}/history.csv", f):
                         with LOCK:
                             STATE["history"][name] = summarise(f)
             with LOCK:

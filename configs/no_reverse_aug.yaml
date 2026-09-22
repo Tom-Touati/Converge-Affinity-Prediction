@@ -1,0 +1,6 @@
+exp: no_reverse_aug
+seeds:
+- 0
+- 1
+- 2
+note: augment off (train-time flag)

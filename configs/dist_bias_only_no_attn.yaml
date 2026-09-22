@@ -1,0 +1,6 @@
+exp: dist_bias_only_no_attn
+seeds:
+- 0
+- 1
+- 2
+dist_bias_only: true

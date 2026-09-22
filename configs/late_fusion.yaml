@@ -1,0 +1,6 @@
+exp: late_fusion
+seeds:
+- 0
+- 1
+- 2
+late_fusion: true

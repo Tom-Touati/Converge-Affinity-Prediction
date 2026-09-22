@@ -1,0 +1,6 @@
+exp: learned_aa_table
+seeds:
+- 0
+- 1
+- 2
+blosum_mode: learned

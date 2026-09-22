@@ -1,0 +1,7 @@
+exp: heads_2x64
+seeds:
+- 0
+- 1
+- 2
+n_heads: 2
+head_dim: 64

@@ -1,0 +1,6 @@
+exp: no_struct_film
+seeds:
+- 0
+- 1
+- 2
+struct_film: false

@@ -1,0 +1,6 @@
+exp: full_mutant_tokens
+seeds:
+- 0
+- 1
+- 2
+full_mutant_tokens: true

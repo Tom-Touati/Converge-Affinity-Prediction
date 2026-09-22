@@ -1,0 +1,6 @@
+exp: shuffled_structure
+seeds:
+- 0
+- 1
+- 2
+shuffle_structure: true

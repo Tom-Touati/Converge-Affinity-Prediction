@@ -1,0 +1,6 @@
+exp: blosum_only
+seeds:
+- 0
+- 1
+- 2
+use_delta: false
