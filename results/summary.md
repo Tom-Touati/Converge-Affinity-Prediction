@@ -23,9 +23,36 @@ project's headline metric computed on this split, for orientation only.
 | E0e_mean | 5 | 3 | n/a | n/a | 1.768 ± 0.000 | 0.413 ± 0.000 | 0.193 ± 0.000 | n/a |
 | E0e_mean__cluster | 4 | 3 | n/a | n/a | 1.764 ± 0.000 | 0.414 ± 0.000 | 0.194 ± 0.000 | n/a |
 
-## vs. ProtAttBA Table 1
 
-*`results/benchmarks.csv` not written yet (E6b).*
+## vs. ProtAttBA Table 1 (ESM2 column)
+
+Their protocol: 10-fold CV on S1131 and AB645, 5-fold on AB1101, per-fold mean and
+population standard deviation. Published figures were verified against the
+predictions their repo ships (`experiments/protattba_repro/verify_published.py`).
+
+### S1131
+
+| model | PCC | Spearman | RMSE |
+|---|---|---|---|
+| ProtAttBA (published) | 0.84 ± 0.05 | 0.75 ± 0.06 | 1.31 ± 0.09 |
+| rf_chem_mpnnsite__grouped | 0.396 | 0.277 | 2.443 |
+| rf_chem_mpnnsite__paper | 0.747 | 0.709 | 1.621 |
+
+### AB645
+
+| model | PCC | Spearman | RMSE |
+|---|---|---|---|
+| ProtAttBA (published) | 0.66 ± 0.10 | 0.62 ± 0.10 | 1.40 ± 0.16 |
+| rf_chem_mpnnsite__grouped | 0.452 | 0.393 | 1.684 |
+| rf_chem_mpnnsite__paper | 0.406 | 0.487 | 1.857 |
+
+### AB1101
+
+| model | PCC | Spearman | RMSE |
+|---|---|---|---|
+| ProtAttBA (published) | 0.63 ± 0.05 | 0.59 ± 0.05 | 1.62 ± 0.09 |
+| rf_chem_mpnnsite__grouped | 0.409 | 0.393 | 2.044 |
+| rf_chem_mpnnsite__paper | 0.689 | 0.691 | 1.619 |
 
 ## Failures
 
