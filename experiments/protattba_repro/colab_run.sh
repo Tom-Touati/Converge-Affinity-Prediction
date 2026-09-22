@@ -63,7 +63,12 @@ PY
 
 stage () {  # stage <name> <timeout-seconds>
   ensure || { say "NO SESSION for $1"; return 1; }
-  { printf 'import sys, os\nsys.argv = ["colab_job.py", "%s"]\nos.chdir("%s")\n' "$1" "$REMOTE"
+  # makedirs before chdir, or a fresh VM deadlocks: /content is wiped when a session is
+  # replaced, so the wrapper chdir'd into a directory that only `bootstrap` would have
+  # created, and bootstrap could therefore never run. Every stage then failed in under a
+  # second with FileNotFoundError and the retry budget drained without computing anything.
+  { printf 'import sys, os\nsys.argv = ["colab_job.py", "%s"]\nos.makedirs("%s", exist_ok=True)\nos.chdir("%s")\n' \
+      "$1" "$REMOTE" "$REMOTE"
     cat colab_job.py; } > "/tmp/pab_$1.py"
   say "### $1"
   timeout "$2" colab exec -s "$SESSION" -f "/tmp/pab_$1.py" >>"$LOG" 2>&1
@@ -160,7 +165,13 @@ for st in "${STAGES[@]}"; do
       sleep 120
       continue
     fi
+    # Re-push the harness every attempt, not once at startup. /content is wiped when a session
+    # is replaced, so after a VM swap the eight .py files and the vendored csv are gone and
+    # `python run_cv.py` cannot run. Fourteen small uploads cost ~30 s against a ~25 min fold,
+    # and being idempotent is worth more here than being minimal.
+    push
     push_folds "$st"
+    before=$(ls "$HERE"/results/"$st"_fold*.csv 2>/dev/null | wc -l)
     # A fresh VM needs the environment and the cache back before it can train. Both stages are
     # idempotent and skip their own work when the outputs are present -- seconds on a session
     # that has already run them, ~4 min on a brand new VM -- so they are called every time
@@ -169,6 +180,16 @@ for st in "${STAGES[@]}"; do
     stage extract 3600
     stage "$st:$((k + 1))" 7200
     pull_folds "$st"
+
+    # Back off when an attempt made no progress. Without this a fast-failing session (a swap,
+    # a 500 from the contents API) burns the whole budget in a couple of minutes; a fold that
+    # is genuinely training takes ~25 min, so a sub-minute attempt means something is wrong
+    # rather than slow.
+    after=$(ls "$HERE"/results/"$st"_fold*.csv 2>/dev/null | wc -l)
+    if [[ "$after" -le "$before" ]]; then
+      say "  no progress on fold $k; backing off 90s"
+      sleep 90
+    fi
   done
   say "### $st: $(ls "$HERE"/results/"$st"_fold*.csv 2>/dev/null | wc -l) of 10 folds on disk"
   grab "$st"
