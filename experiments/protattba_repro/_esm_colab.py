@@ -3,7 +3,11 @@ import pickle, time
 import numpy as np, pandas as pd, torch
 from transformers import AutoTokenizer, EsmModel
 
-ROOT = "/content/protattba_repro"
+import os
+# The bootstrap stages everything under /content/perturb; this script predates that and
+# hardcoded the older directory, so a fresh VM got as far as the ESM pass and then failed
+# on a missing parquet. PERTURB_ROOT keeps both layouts working.
+ROOT = os.environ.get("PERTURB_ROOT", "/content/perturb")
 TABLE = f"{ROOT}/project_sequences.parquet"
 ESM   = f"{ROOT}/model/esm2_650m"
 OUT   = f"{ROOT}/esm2_650m_tokens.npy"

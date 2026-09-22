@@ -77,6 +77,40 @@ class PerturbV2Config:
     pairwise_hadamard: bool = False
     array_index_rope: bool = False
 
+    #: How the token sequence collapses to one vector. ``mean`` is section 1's unweighted
+    #: masked mean over the whole crop, which costs no parameters and dilutes the edit: on
+    #: our rows the mutated residue's ESM embedding moves 3.23 while off-site tokens move
+    #: 0.33, but averaged over a ~42-token crop the difference between the two pooled
+    #: vectors is only 2.5% of the pooled vector itself (p10-p90 1.6-4.8%). The head then
+    #: has to find ddG in a 2.5% perturbation whose remaining 97.5% is complex identity.
+    #: ``site`` pools over the mutated residues instead -- after cross-attention those
+    #: tokens already carry interface context, so this is not the same as discarding it --
+    #: and ``site_mean`` concatenates both, keeping the global view at the cost of doubling
+    #: the head's input. A side with no mutation has no site and falls back to the crop.
+    pool: str = "mean"               # {mean, site, site_mean}
+
+    #: Input-side regularisation, both off by default and both training-only. The model
+    #: carries 85 parameters per training row and reaches train R2 0.83 against test R2
+    #: 0.036 on fold 4, so dropout 0.2 in two places and weight decay 1e-2 are not holding
+    #: it. These are the two knobs the earlier fusion sweeps had and the v2 rewrite dropped.
+    #:
+    #: Both are sampled ONCE PER ROW and applied identically to the ITW and MUT branches.
+    #: Sampling them independently would inject noise straight into the difference the head
+    #: reads, which is only 2.5% of the pooled vector to begin with -- it would regularise
+    #: by destroying the signal, and it would break the null-edit-is-zero property during
+    #: training. Shared, the difference is untouched and the property still holds exactly.
+    input_noise: float = 0.0         # sd of Gaussian noise on the PCA features
+    feature_dropout: float = 0.0     # probability of zeroing a whole PCA channel
+
+    #: Draw the SAME dropout mask in both branches. The head reads f_mut - f_itw, and with
+    #: independent masks the attention dropout disagrees between the two calls: on a null
+    #: edit, where the true difference is exactly zero, the branches still differ by 0.42
+    #: against a real edit of 0.60. That is 71% as much noise as signal, injected into a
+    #: difference that is already only 2.5% of the pooled vector -- and it is present in
+    #: every step of every run trained so far. Sharing the mask regularises each branch
+    #: exactly as before while leaving their difference clean.
+    shared_branch_dropout: bool = True
+
     @property
     def head_dim(self) -> int:
         return self.width // self.n_heads
@@ -237,21 +271,38 @@ class BranchV2(nn.Module):
             h = h + add * site.unsqueeze(-1)
         return h
 
-    def forward(self, batch, mutated: bool):
+    def forward(self, batch, mutated: bool, perturb: dict | None = None):
         cfg = self.cfg
         feats = {}
+
+        def px(x, key):
+            """Apply this row's shared noise and channel mask; identical in both branches.
+
+            Noise is added before the mask so a dropped channel is exactly zero rather than
+            pure noise. Both operations commute with the WT/MUT difference -- the additive
+            noise cancels and the multiplicative mask factors out -- so the edit the head
+            reads is masked but never contaminated.
+            """
+            if perturb is None:
+                return x
+            n, m = perturb[key]
+            if n is not None:
+                x = x + n
+            return x if m is None else x * m
+
         for side in ("ab", "ag"):
             seq_key = (f"seq_{side}_mt" if (mutated and cfg.full_mutant_tokens)
                        else f"seq_{side}_wt")
-            seq_pca = batch[seq_key]
-            str_pca = batch[f"struct_{side}"]
+            seq_pca = px(batch[seq_key], f"seq_{side}")
+            str_pca = px(batch[f"struct_{side}"], f"struct_{side}")
             if not cfg.use_structure:
                 str_pca = torch.zeros_like(str_pca)
             elif cfg.shuffle_structure:
                 str_pca = str_pca[:, torch.randperm(str_pca.shape[1], device=str_pca.device)]
 
             if mutated and cfg.use_delta and not cfg.full_mutant_tokens:
-                d = self.red_seq(batch[f"seq_{side}_mt"]) - self.red_seq(batch[f"seq_{side}_wt"])
+                d = (self.red_seq(px(batch[f"seq_{side}_mt"], f"seq_{side}"))
+                     - self.red_seq(px(batch[f"seq_{side}_wt"], f"seq_{side}")))
                 if cfg.delta_scope == "site":
                     d = d * batch[f"site_{side}"].unsqueeze(-1)
             else:
@@ -290,11 +341,29 @@ class BranchV2(nn.Module):
             a = self.attn(h_ab, h_ab, batch["mask_ab"], pos_ab, pos_ab, None)
             g = self.attn(h_ag, h_ag, batch["mask_ag"], pos_ag, pos_ag, None)
 
-        f_ab = masked_mean(a, batch["mask_ab"])
-        f_ag = masked_mean(g, batch["mask_ag"])
+        f_ab = self.pool(a, batch["mask_ab"], batch["site_ab"])
+        f_ag = self.pool(g, batch["mask_ag"], batch["site_ag"])
         if cfg.pooled_hadamard:
             return torch.cat([f_ab * f_ag, f_ab + f_ag], dim=-1)
         return torch.cat([f_ab, f_ag], dim=-1)
+
+    def pool(self, x: torch.Tensor, mask: torch.Tensor, site: torch.Tensor) -> torch.Tensor:
+        """Collapse one side's tokens to one vector; see ``PerturbV2Config.pool``."""
+        mode = self.cfg.pool
+        if mode == "mean":
+            return masked_mean(x, mask)
+        # A side with no mutation on it has an all-zero site mask. Pooling over nothing
+        # would divide by the clamp and return zeros, which silently deletes that whole
+        # side for every antibody-only or antigen-only row -- most of the dataset. Fall
+        # back to the crop for exactly those rows, per row, not per batch.
+        w = mask * site
+        w = torch.where(w.sum(1, keepdim=True) < 0.5, mask, w)
+        f_site = masked_mean(x, w)
+        if mode == "site":
+            return f_site
+        if mode == "site_mean":
+            return torch.cat([f_site, masked_mean(x, mask)], dim=-1)
+        raise ValueError(f"unknown pool {mode!r}")
 
 
 def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -308,17 +377,54 @@ class PerturbV2(nn.Module):
         super().__init__()
         self.cfg = cfg or PerturbV2Config()
         self.branch = BranchV2(self.cfg)
-        f = self.cfg.width * 2
+        # site_mean returns two pooled vectors per side rather than one
+        f = self.cfg.width * 2 * (2 if self.cfg.pool == "site_mean" else 1)
         n_in = f * 2 if self.cfg.concat_head else f
         # bias-free, so a null edit maps to exactly zero
         self.head = nn.Sequential(
             nn.Linear(n_in, self.cfg.width, bias=False), nn.GELU(),
             nn.Dropout(self.cfg.dropout), nn.Linear(self.cfg.width, 1, bias=False))
 
+    def make_perturb(self, batch) -> dict | None:
+        """One sample of input noise and channel dropout per row, shared by both branches.
+
+        Returns None outside training or when both are off, so inference and every existing
+        test are bit-identical to before.
+        """
+        cfg = self.cfg
+        if not self.training or (cfg.input_noise <= 0 and cfg.feature_dropout <= 0):
+            return None
+        out = {}
+        for key in ("seq_ab", "seq_ag", "struct_ab", "struct_ag"):
+            ref = batch[f"{key}_wt"] if key.startswith("seq") else batch[key]
+            n = torch.randn_like(ref) * cfg.input_noise if cfg.input_noise > 0 else None
+            m = None
+            if cfg.feature_dropout > 0:
+                # whole PCA channels, shared across tokens, inverted so the scale is kept
+                keep = torch.rand(ref.shape[0], 1, ref.shape[2], device=ref.device,
+                                  dtype=ref.dtype) >= cfg.feature_dropout
+                m = keep.to(ref.dtype) / (1.0 - cfg.feature_dropout)
+            out[key] = (n, m)
+        return out
+
     def forward(self, batch) -> torch.Tensor:
-        f_mut = self.branch(batch, mutated=True)
+        p = self.make_perturb(batch)
+        share = self.training and self.cfg.shared_branch_dropout
+        # Rewinding the generator is what makes the two branches draw the same masks. It
+        # works because both calls issue the same sequence of random ops -- same modules,
+        # same shapes, and nothing stochastic is conditional on `mutated`. The null-edit
+        # test below runs in train mode precisely so that stops being an assumption.
+        state = torch.get_rng_state() if share else None
+        dev = (torch.cuda.get_rng_state_all()
+               if share and torch.cuda.is_available() else None)
+
+        f_mut = self.branch(batch, mutated=True, perturb=p)
         if not self.cfg.two_branch:
             return self.head(f_mut).squeeze(-1)
-        f_itw = self.branch(batch, mutated=False)
+        if state is not None:
+            torch.set_rng_state(state)
+            if dev is not None:
+                torch.cuda.set_rng_state_all(dev)
+        f_itw = self.branch(batch, mutated=False, perturb=p)
         z = torch.cat([f_mut, f_itw], -1) if self.cfg.concat_head else (f_mut - f_itw)
         return self.head(z).squeeze(-1)

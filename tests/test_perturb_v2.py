@@ -198,3 +198,116 @@ def test_model_output_is_invariant_to_padding_length():
         b = m(make_batch(mutate=True, cfg=cfg, seed=1, pad_to=40))
     assert torch.allclose(a, b, atol=1e-5), \
         f"prediction changed with padding width: max |diff| {(a-b).abs().max():.2e}"
+
+
+# ------------------------------------------------------------------- site pooling
+@pytest.mark.parametrize("mode", ["mean", "site", "site_mean"])
+def test_every_pool_keeps_the_required_properties(mode):
+    """Changing how tokens collapse must not break (a) or (e)."""
+    cfg = PerturbV2Config(pool=mode)
+    m = PerturbV2(cfg).eval()
+    with torch.no_grad():
+        assert torch.equal(m(make_batch(mutate=False, cfg=cfg)), torch.zeros(3)), \
+            f"pool={mode}: a null edit is no longer exactly zero"
+    for p in m.head.parameters():
+        torch.nn.init.normal_(p, std=0.05)
+    with torch.no_grad():
+        a = m(make_batch(mutate=True, cfg=cfg, seed=1))
+        b = m(make_batch(mutate=True, cfg=cfg, seed=1, pad_to=40))
+    assert torch.allclose(a, b, atol=1e-5), \
+        f"pool={mode}: prediction changed with padding width, max |diff| {(a-b).abs().max():.2e}"
+
+
+def test_site_pool_does_not_delete_a_side_without_a_mutation():
+    """make_batch mutates the antibody only, so site_ag is all zero.
+
+    Pooling over an empty mask would return zeros for the whole antigen side on every
+    antibody-only row -- most of the dataset -- and it would do so silently. The fallback
+    must be per row, so a batch mixing both kinds is still correct.
+    """
+    cfg = PerturbV2Config(pool="site")
+    m = PerturbV2(cfg).eval()
+    batch = make_batch(mutate=True, cfg=cfg)
+    assert batch["site_ag"].sum() == 0, "this test needs an unmutated antigen side"
+    with torch.no_grad():
+        f = m.branch(batch, mutated=True)
+    ag = f[:, cfg.width:]
+    assert ag.abs().sum() > 0, "the antigen side pooled to exactly zero"
+
+    # and the fallback is per row: make row 0 have an antigen site, rows 1-2 not
+    batch["site_ag"] = torch.zeros_like(batch["site_ag"])
+    batch["site_ag"][0, 1] = 1.0
+    with torch.no_grad():
+        f2 = m.branch(batch, mutated=True)
+    assert not torch.allclose(f2[0, cfg.width:], f[0, cfg.width:]), \
+        "row 0 gained a site but its antigen pool did not change"
+    assert torch.allclose(f2[1:, cfg.width:], f[1:, cfg.width:], atol=1e-6), \
+        "rows without a site were affected by another row's site"
+
+
+def test_site_pool_amplifies_the_edit_relative_to_mean_pool():
+    """The reason for the option: the mean over a long crop dilutes a one-token edit.
+
+    Asserted on the pooled tensors rather than on a score, so it states the mechanism and
+    not a result that depends on training.
+    """
+    cfg_m = PerturbV2Config(pool="mean")
+    cfg_s = PerturbV2Config(pool="site")
+    mm, ms = PerturbV2(cfg_m).eval(), PerturbV2(cfg_s).eval()
+    ms.load_state_dict(mm.state_dict())
+    b_m = make_batch(mutate=True, cfg=cfg_m, l_ab=40, seed=3)
+    b_s = make_batch(mutate=True, cfg=cfg_s, l_ab=40, seed=3)
+    with torch.no_grad():
+        d_mean = (mm.branch(b_m, True) - mm.branch(b_m, False))[:, :cfg_m.width]
+        d_site = (ms.branch(b_s, True) - ms.branch(b_s, False))[:, :cfg_s.width]
+    r = d_site.norm(dim=-1).mean() / d_mean.norm(dim=-1).mean().clamp(min=1e-9)
+    assert r > 2.0, f"site pooling amplified the edit only {r:.2f}x over the mean"
+
+
+# ------------------------------------------------- input noise and feature dropout
+def test_regularisation_is_off_in_eval_and_changes_nothing_by_default():
+    cfg = PerturbV2Config(input_noise=0.5, feature_dropout=0.5)
+    m = PerturbV2(cfg).eval()
+    b = make_batch(mutate=True, cfg=cfg, seed=2)
+    with torch.no_grad():
+        assert m.make_perturb(b) is None, "perturbation must not be sampled in eval"
+        a, c = m(b), m(b)
+    assert torch.equal(a, c), "eval is not deterministic"
+
+    plain = PerturbV2(PerturbV2Config()).train()
+    assert plain.make_perturb(b) is None, "both knobs off must sample nothing"
+
+
+def test_shared_perturbation_cancels_in_the_difference():
+    """The whole point: noise must not reach the WT/MUT difference.
+
+    Additive noise cancels and the channel mask factors out, so a null edit is still
+    exactly zero DURING TRAINING. Sampling per branch instead would inject noise into a
+    signal that is only 2.5% of the pooled vector, and the null-edit property would fail.
+    """
+    cfg = PerturbV2Config(input_noise=1.0, feature_dropout=0.3)
+    m = PerturbV2(cfg).train()
+    torch.manual_seed(0)
+    y = m(make_batch(mutate=False, cfg=cfg))
+    assert torch.allclose(y, torch.zeros_like(y), atol=1e-5), \
+        f"a null edit under training-time noise gave {y.tolist()}"
+
+
+def test_perturbation_actually_perturbs():
+    """So the previous test cannot pass by the knobs silently doing nothing."""
+    cfg = PerturbV2Config(input_noise=1.0, feature_dropout=0.3)
+    m = PerturbV2(cfg).train()
+    b = make_batch(mutate=True, cfg=cfg, seed=5)
+    torch.manual_seed(0)
+    p1 = m.make_perturb(b)
+    torch.manual_seed(1)
+    p2 = m.make_perturb(b)
+    assert p1 is not None and p2 is not None
+    n1, m1 = p1["seq_ab"]
+    n2, m2 = p2["seq_ab"]
+    assert not torch.equal(n1, n2), "noise is identical across samples"
+    assert (m1 == 0).any(), "feature dropout never dropped a channel"
+    with torch.no_grad():
+        f_a = m.branch(b, mutated=True, perturb=p1)
+        f_b = m.branch(b, mutated=True, perturb=None)
+    assert not torch.allclose(f_a, f_b), "the perturbation did not change the branch output"

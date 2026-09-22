@@ -9,7 +9,7 @@ must not see the test complexes.
 
     python _perturb_v2_colab.py --exp v2_full --folds 0 1 2 3 4 --seeds 0
 """
-import argparse, json, pickle, time
+import argparse, json, os, pickle, time
 from pathlib import Path
 
 import joblib
@@ -20,12 +20,21 @@ from torch.utils.data import DataLoader, Dataset
 
 from model_v2 import PerturbV2, PerturbV2Config, distance_bins
 
-ROOT = Path("/content/perturb")
+# The VM layout by default. PERTURB_ROOT points it at the local caches instead, so the
+# model can be probed on real batches without a GPU session -- which is how the gradient
+# check runs. PERTURB_TOKENIZER likewise, since locally the tokenizer comes from the hub
+# rather than from a directory the bootstrap downloaded.
+ROOT = Path(os.environ.get("PERTURB_ROOT", "/content/perturb"))
+TOKENIZER = os.environ.get("PERTURB_TOKENIZER", str(ROOT / "model" / "esm2_650m"))
 OUT = ROOT / "out"
 PCA_DIR = ROOT / "pca_v2"
 AA = "ARNDCQEGHILKMFPSTWYV"
 AA_INDEX = {a: i for i, a in enumerate(AA)}
-BATCH, LR, WD, PATIENCE, VAL_FRACTION = 32, 3e-4, 1e-2, 10, 0.10
+# VAL_FRACTION is a fraction of COMPLEXES, and complexes range from 2 to 87 rows, so
+# 0.10 produced validation sets of 73 to 169 rows across the five folds. Early stopping
+# ran on that, and validation Pearson barely tracked test Pearson (fold 2: val +0.245 ->
+# test +0.461; fold 1: val +0.641 -> test +0.266). 0.20 roughly doubles it.
+BATCH, LR, WD, PATIENCE, VAL_FRACTION = 32, 3e-4, 1e-2, 10, 0.20
 
 
 def blosum62():
@@ -43,7 +52,7 @@ class Cache:
         self.store = np.load(ROOT / "esm2_650m_tokens.npy", mmap_mode="r")
         self.index = pickle.load(open(ROOT / "esm2_650m_index.pkl", "rb"))["index"]
         from transformers import AutoTokenizer
-        self.tok = AutoTokenizer.from_pretrained(str(ROOT / "model" / "esm2_650m"))
+        self.tok = AutoTokenizer.from_pretrained(TOKENIZER)
         self.crops = np.load(ROOT / "perturb_crops.npz", allow_pickle=False)
         self._mpnn = {}
 
@@ -205,6 +214,60 @@ def collate(items):
     return out
 
 
+def per_complex_rho(pred, true, keys, min_rows=5):
+    """Mean Spearman within a complex, which is the quantity the model is judged on.
+
+    Selecting on pooled Pearson over the validation rows rewards telling complexes apart --
+    between-complex variance is about 45% of the label variance -- and that is not what the
+    model is for. Complexes with fewer than min_rows carry no reliable rank, so they are
+    dropped; if nothing survives, fall back to pooled Pearson rather than return nothing.
+    """
+    df = pd.DataFrame({"p": pred, "t": true, "k": keys})
+    rs = []
+    for _, g in df.groupby("k"):
+        if len(g) >= min_rows and g.t.std() > 0 and g.p.std() > 0:
+            r = g.p.corr(g.t, method="spearman")
+            if pd.notna(r):
+                rs.append(float(r))
+    return float(np.mean(rs)) if rs else pear(pred, true)
+
+
+GRAD_GROUPS = {"head": "head.", "attn": "branch.attn", "fuse": "branch.fuse",
+               "film": "branch.gamma", "film_b": "branch.beta",
+               "red_seq": "branch.red_seq", "red_str": "branch.red_str",
+               "blosum": "branch.mut", "chain": "branch.chain"}
+
+
+def grad_report(model, clip):
+    """Gradient health for one step, measured BEFORE clipping.
+
+    A difference-of-branches head can starve without anything in the loss curve showing it:
+    if f_mut - f_itw is mostly noise the head still gets a large gradient while the branch
+    that has to produce the edit gets very little. Per-group norms make that visible.
+    """
+    sq, dead, n = 0.0, 0, 0
+    per = {k: 0.0 for k in GRAD_GROUPS}
+    for name, prm in model.named_parameters():
+        n += prm.numel()
+        if prm.grad is None:
+            dead += prm.numel()
+            continue
+        g = prm.grad.detach()
+        g2 = float(g.pow(2).sum())
+        sq += g2
+        dead += int((g.abs() < 1e-12).sum())
+        for k, pref in GRAD_GROUPS.items():
+            if name.startswith(pref):
+                per[k] += g2
+                break
+    total = sq ** 0.5
+    out = {"grad_norm": total, "grad_clipped": 1.0 if total > clip else 0.0,
+           "grad_dead_frac": dead / max(n, 1)}
+    for k, v in per.items():
+        out["g_" + k] = v ** 0.5
+    return out
+
+
 def pear(a, b):
     a, b = np.asarray(a, float), np.asarray(b, float)
     if len(a) < 3 or a.std() == 0 or b.std() == 0:
@@ -215,8 +278,11 @@ def pear(a, b):
 def history(exp, row):
     p = OUT / f"perturb_{exp}" / "history.csv"
     p.parent.mkdir(parents=True, exist_ok=True)
-    cols = ["epoch", "step", "steps", "loss", "val_rho", "train_rho", "val_rmse",
-            "seconds", "fold", "seed", "n_train", "n_val", "name", "host_gb", "gpu_gb"]
+    cols = ["epoch", "step", "steps", "loss", "val_rho", "val_cx_rho", "train_rho",
+            "val_rmse", "seconds", "fold", "seed", "n_train", "n_val", "name",
+            "host_gb", "gpu_gb", "grad_norm", "grad_clipped", "grad_dead_frac",
+            "g_head", "g_attn", "g_fuse", "g_film", "g_film_b", "g_red_seq",
+            "g_red_str", "g_blosum", "g_chain"]
     if not p.exists():
         p.write_text(",".join(cols) + "\n")
     with open(p, "a") as f:
@@ -236,7 +302,8 @@ def sweep_row(exp, note, params=None):
     pd.DataFrame(list(rows.values())).to_csv(f, index=False)
 
 
-def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True):
+def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True,
+             select_on="per_complex"):
     torch.manual_seed(seed); np.random.seed(seed)
     pcas = fold_pca(rows, fold, cache, cfg.pca_dim, seed=0)
     test = rows[rows.fold == fold]
@@ -261,23 +328,33 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
     best, state, bad, t0 = -np.inf, None, 0, time.time()
     for ep in range(max_epochs):
         model.train(); tot, ns = 0.0, 0
+        gstat = {}
         for b in tr:
             x = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
             loss = lf(model(x), b["y"].to(device))
             opt.zero_grad(); loss.backward()
+            for gk, gv in grad_report(model, 5.0).items():
+                gstat[gk] = gstat.get(gk, 0.0) + gv
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0); opt.step()
             tot += float(loss.detach()); ns += 1
-        model.eval(); p, t = [], []
+        gstat = {gk: gv / max(ns, 1) for gk, gv in gstat.items()}
+        model.eval(); p, t, vids = [], [], []
         with torch.no_grad():
             for b in va:
                 x = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
                 p.append(model(x).cpu().numpy()); t.append(b["y"].numpy())
+                vids += b["row_id"]
         pv, tv = np.concatenate(p), np.concatenate(t)
-        r = pear(pv, tv)
+        r_pool = pear(pv, tv)
+        r_cx = per_complex_rho(pv, tv, [i.rsplit("|", 1)[0] for i in vids])
+        r = r_cx if select_on == "per_complex" else r_pool
         import resource
         history(exp, dict(epoch=ep, step=(ep + 1) * max(ns, 1), steps=ns,
                           loss=round(tot / max(ns, 1), 5),
-                          val_rho="" if np.isnan(r) else round(r, 5), train_rho="",
+                          val_rho="" if np.isnan(r_pool) else round(r_pool, 5),
+                          val_cx_rho="" if np.isnan(r_cx) else round(r_cx, 5),
+                          train_rho="",
+                          **{gk: round(gv, 5) for gk, gv in gstat.items()},
                           val_rmse=round(float(np.sqrt(((pv - tv) ** 2).mean())), 5),
                           seconds=round(time.time() - t0, 1), fold=fold, seed=seed,
                           n_train=len(train), n_val=len(val), name=f"perturb_{exp}",
@@ -285,7 +362,11 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
                           gpu_gb=round(torch.cuda.max_memory_allocated()/1e9, 2)
                                   if torch.cuda.is_available() else 0.0))
         if ep % 5 == 0:
-            print(f"    fold {fold} seed {seed} ep {ep:3d} val r {r:+.4f} "
+            print(f"    fold {fold} seed {seed} ep {ep:3d} "
+                  f"val r {r_pool:+.4f} cx {r_cx:+.4f} | "
+                  f"grad {gstat.get('grad_norm', 0):.3f} "
+                  f"head {gstat.get('g_head', 0):.3f} attn {gstat.get('g_attn', 0):.3f} "
+                  f"clip {gstat.get('grad_clipped', 0):.0%} "
                   f"({time.time()-t0:.0f}s)", flush=True)
         if np.isnan(r):
             r = -np.inf
@@ -314,6 +395,9 @@ def main():
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
     ap.add_argument("--max-epochs", type=int, default=60)
     ap.add_argument("--overrides", default="{}")
+    ap.add_argument("--select-on", default="per_complex",
+                    choices=["per_complex", "pooled"],
+                    help="what early stopping maximises on the validation fold")
     ap.add_argument("--clip", type=float, default=4.0,
                     help="clip |ddG| to this, in training and in scoring; 0 disables")
     a = ap.parse_args()
@@ -349,7 +433,8 @@ def main():
             if (fold, seed) in done:
                 print(f"  fold {fold} seed {seed}: reused", flush=True); continue
             ids, yt, yp, eps, mins, npar = run_fold(rows, fold, seed, cfg, cache, a.exp,
-                                                    device, a.max_epochs, augment)
+                                                    device, a.max_epochs, augment,
+                                                    a.select_on)
             recs.append(dict(exp=a.exp, split="frozen5", fold=fold, seed=seed,
                              n_train=int((rows.fold != fold).sum()), n_test=len(ids),
                              pearson=pear(yp, yt),
