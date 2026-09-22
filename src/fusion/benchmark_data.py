@@ -90,7 +90,14 @@ def load(name: str) -> pd.DataFrame:
         "ab_mt": list(ab_mt), "ag_mt": list(ag_mt),
         "ddG": d["ddG"].astype(float),
     })
-    out["row_id"] = out["dataset"] + "|" + out["pdb"] + "|" + out["mutation"]
+    # A positional suffix, because (dataset, pdb, mutation) is NOT unique: their csvs carry 16
+    # rows over 8 ids that are replicate measurements of the same mutation with *different*
+    # ddG -- 1N8Z B:Y105F appears as -0.05 and 0.82, a 0.87 kcal/mol spread. Without the
+    # suffix a `.loc[row_ids]` feature join silently returns more rows than it was given and
+    # every downstream column shifts out of alignment, which is exactly what it did here
+    # before this was caught.
+    out["row_id"] = (out["dataset"] + "|" + out["pdb"] + "|" + out["mutation"]
+                     + "|" + out.groupby(["dataset", "pdb", "mutation"]).cumcount().astype(str))
     return out
 
 

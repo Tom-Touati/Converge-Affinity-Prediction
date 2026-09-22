@@ -8,15 +8,16 @@ documented run is ``chem + geom + geomrev + mpnn``. Here it is:
 
 * ``chem`` -- substitution chemistry, computed from the mutation string alone, so it needs no
   structure and is exact for every row.
+* ``geom`` and ``geomrev`` -- the project's interface geometry, run over their complexes with
+  the same extractors the documented forest uses. Cached to ``benchmarks_geom.parquet``.
 * ``mpnn_site`` -- the ProteinMPNN encoder field at the mutated position, read out of the
   per-residue cache already built for these complexes. This is the same quantity
   ``mpnnrep.parquet`` stores for our dataset (``hc*``/``ha*``), recovered by indexing rather
   than by re-running the model.
 
-``geom`` and ``geomrev`` are **omitted**, because building them means running the interface
-geometry extractor over 173 more complexes. So this is a *floor* on what the forest would do
-with its full feature set, not a like-for-like transfer of it. That is stated in the output and
-in the results table rather than left for the reader to infer.
+So the feature set now matches the documented forest's ``chem + geom + geomrev + mpnn``,
+except that the ProteinMPNN channel is the encoder field at the site rather than the
+likelihood ratios -- both come from the same model, and the field is what was already cached.
 
 **Two protocols, both reported.**
 
@@ -46,12 +47,16 @@ import pandas as pd
 from sklearn.model_selection import GroupKFold, KFold
 
 from src import paths
-from src.features import chem
+from src.features import chem, geom_rev, geometry
 from src.fusion import benchmark_data as BD
 from src.fusion import metrics, results
 from src.fusion.mpnn_per_residue import BENCH_CACHE, resolve_chains
 from src.model import MODELS
 from src.structures import parse_mutations, parse_pdb, verify
+
+#: Interface geometry over their complexes is the slow step (minutes, not seconds), so it is
+#: computed once and cached. Deleting this file forces a rebuild.
+GEOM_CACHE = paths.FEATURES / "benchmarks_geom.parquet"
 
 #: Their fold counts, from the paper's protocol.
 N_FOLDS = {"S1131": 10, "AB645": 10, "AB1101": 5}
@@ -143,11 +148,51 @@ def prepare() -> pd.DataFrame:
     have = np.array([v is not None for v in site])
     print(f"ProteinMPNN site features available for {have.sum()} of {len(ok)} verified rows")
 
+    # --- interface geometry, the slow part, cached so it is paid once -------------------
+    # geometry.build and geom_rev.build both want SKEMPI's column names, and key complex-level
+    # work on `#Pdb`. The key is built from the *resolved* chains rather than the raw Partners
+    # string, so the H/L fallback cannot produce two keys for one chain assignment, and it
+    # omits the dataset so a complex shared by AB645 and AB1101 is computed once.
+    ok["#Pdb"] = ok.pdb + "_" + ok.ab_chains + "_" + ok.ag_chains
+    geo_input = ok[["row_id", "#Pdb", "pdb", "ab_chains", "ag_chains", "mutations"]]
+
+    if GEOM_CACHE.exists():
+        G = pd.read_parquet(GEOM_CACHE)
+        missing = set(ok.row_id) - set(G.index)
+        if missing:
+            print(f"geometry cache is missing {len(missing)} rows; rebuilding")
+            G = None
+        else:
+            print(f"geometry: reusing cache ({G.shape[1]} columns)")
+    else:
+        G = None
+
+    if G is None:
+        t0 = time.time()
+        print(f"geometry: building over {ok['#Pdb'].nunique()} complexes, {len(ok)} rows ...",
+              flush=True)
+        g1 = geometry.build(geo_input)
+        print(f"  geom done, {g1.shape[1]} cols, {(time.time()-t0)/60:.1f} min", flush=True)
+        g2 = geom_rev.build(geo_input)
+        print(f"  geomrev done, {g2.shape[1]} cols, {(time.time()-t0)/60:.1f} min", flush=True)
+        G = g1.join(g2, how="outer")
+        paths.FEATURES.mkdir(parents=True, exist_ok=True)
+        G.to_parquet(GEOM_CACHE)
+        print(f"  cached to {GEOM_CACHE.name}")
+
+    # A .loc[] with duplicate labels silently returns MORE rows than it was given, and the
+    # positional concat below then shifts every feature out of alignment with its label. That
+    # happened here and was only caught by the row count moving from 2465 to 2489.
+    assert ok.row_id.is_unique, "row_id is not unique; the geometry join would misalign"
+    X_geom = G.loc[ok.row_id].reset_index(drop=True)
+    assert len(X_geom) == len(ok), f"geometry join returned {len(X_geom)} rows for {len(ok)}"
+
     X = pd.concat([X_chem.drop(columns=[c for c in ("wt_aa", "mut_aa") if c in X_chem]),
-                   X_mpnn], axis=1)
+                   X_geom, X_mpnn], axis=1)
+    assert len(X) == len(ok), f"feature matrix has {len(X)} rows for {len(ok)} labels"
     X = X.loc[:, X.nunique(dropna=False) > 1].astype(np.float32).fillna(0.0)
     print(f"feature matrix: {X.shape[1]} columns over {len(X)} rows "
-          f"(chem + ProteinMPNN site; geom/geomrev omitted)")
+          f"(chem + geom + geomrev + ProteinMPNN site)")
     return ok.join(X.add_prefix("f__"))
 
 
@@ -184,11 +229,11 @@ def run(frame: pd.DataFrame, seeds=(0, 1, 2)) -> pd.DataFrame:
                 for i in range(k):
                     te = folds == i
                     s = metrics.score(y[te], oof[te])
-                    s.update(exp=f"rf_chem_mpnnsite__{protocol}", dataset=dataset,
+                    s.update(exp=f"rf_full__{protocol}", dataset=dataset,
                              fold=i, seed=seed, n_train=int((~te).sum()),
                              n_test=int(te.sum()), params="", git_sha=sha,
                              train_minutes=round(mins / k, 3),
-                             note=f"chem+mpnn_site/rf/{protocol}")
+                             note=f"chem+geom+geomrev+mpnn_site/rf/{protocol}")
                     results.append(s, path=results.BENCHMARKS_CSV)
                     per_fold.append(s)
                 pf = pd.DataFrame(per_fold)
@@ -217,7 +262,7 @@ def main() -> None:
     summary = run(frame, seeds=tuple(cli.seeds))
 
     print("\n" + "=" * 78)
-    print("our forest (chem + ProteinMPNN site) vs ProtAttBA (ESM2, sequence only)")
+    print("our forest (chem+geom+geomrev+mpnn site) vs ProtAttBA (ESM2, sequence only)")
     print("=" * 78)
     print(f"{'dataset':8s} {'protocol':9s} {'n':>5s} {'PCC':>14s} {'rho':>7s} {'RMSE':>7s}"
           f"   ProtAttBA PCC/rho/RMSE")
@@ -232,8 +277,8 @@ def main() -> None:
             tail = f"   {pub[0]:.2f} / {pub[1]:.2f} / {pub[2]:.2f}" if protocol == "paper" else ""
             print(f"{dataset:8s} {protocol:9s} {n:5d} {p:8.3f} +/-{pr:.3f} {sp:7.3f} {rm:7.3f}{tail}")
     print(f"\nwrote {results.BENCHMARKS_CSV.relative_to(paths.ROOT)}")
-    print("Feature set is chem + ProteinMPNN site only; geom/geomrev omitted, so this is a")
-    print("floor on the documented forest rather than a like-for-like transfer of it.")
+    print("Feature set: chem + geom + geomrev + ProteinMPNN site at the mutated residue.")
+    print("411 of 2876 rows dropped: their residue numbering does not verify against the PDB.")
 
 
 if __name__ == "__main__":

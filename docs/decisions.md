@@ -176,3 +176,28 @@ defensible option, write it down, keep going.
   the other dataset. ProtAttBA's benchmarks are a different problem -- S1131 has no
   antibody-antigen complexes at all -- so a number from one of them must never be read as ours
   just because it was on screen.
+
+## E6b, the benchmark comparison
+
+- **D33. ProtAttBA's csvs contain replicate rows with conflicting labels, and that broke my
+  own join.** `(dataset, pdb, mutation)` is not unique: 16 rows over 8 ids, each a repeat
+  measurement with a *different* ddG -- 1N8Z `B:Y105F` appears as -0.05 and 0.82, a 0.87
+  kcal/mol spread. A `.loc[row_ids]` with duplicate labels silently returns more rows than it
+  was given, so the geometry features shifted against their labels and the row count moved
+  from 2465 to 2489. Caught by the count, not by any error. `row_id` now carries a positional
+  suffix, and `run_benchmarks` asserts uniqueness and length before and after the join.
+  Consequence worth stating separately: under their row-wise CV a replicate can sit in
+  training while its twin is in test, which is direct leakage of a near-identical measurement.
+- **D34. The misalignment was masking a real effect.** With it, adding interface geometry
+  changed nothing (S1131 0.747 -> 0.740). Corrected, every number rose: S1131 0.770, AB1101
+  0.717, AB645 0.458. The earlier "geometry adds nothing" reading was an artefact of my bug.
+- **D35. A third of AB1101 is not antibody data.** 379 of 1100 rows (34%) and 81 of 645 AB645
+  rows have no antibody heavy chain at all, because the complex is not an antibody-antigen
+  pair: cyclophilin A with HIV-1 capsid (1AK4), beta-lactamase with BLIP (1JTG), TGF-beta with
+  its receptor (1KTZ), CheY with CheA (1FFW), and 1T83 alone for 246 rows. Their `cat_seq`
+  returns just the light chain for those, and ours matches, so nothing is corrupted -- but a
+  benchmark named AB1101 being a third non-antibody changes how its number should be read.
+- **D36. I raised a false alarm on "nan" in sequences and withdrew it.** A substring check
+  flagged 188 rows; "NAN" is Asn-Ala-Asn and occurs in real sequences. Checking every
+  character against the amino-acid alphabet gives zero non-residue characters and zero
+  sequences equal to "nan" across all four columns.

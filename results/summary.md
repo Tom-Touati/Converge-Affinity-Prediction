@@ -35,24 +35,24 @@ predictions their repo ships (`experiments/protattba_repro/verify_published.py`)
 | model | PCC | Spearman | RMSE |
 |---|---|---|---|
 | ProtAttBA (published) | 0.84 ± 0.05 | 0.75 ± 0.06 | 1.31 ± 0.09 |
-| rf_chem_mpnnsite__grouped | 0.396 | 0.277 | 2.443 |
-| rf_chem_mpnnsite__paper | 0.747 | 0.709 | 1.621 |
+| rf_full__grouped | 0.458 ± 0.007 | 0.367 ± 0.008 | 2.387 ± 0.016 |
+| rf_full__paper | 0.770 ± 0.001 | 0.736 ± 0.003 | 1.562 ± 0.002 |
 
 ### AB645
 
 | model | PCC | Spearman | RMSE |
 |---|---|---|---|
 | ProtAttBA (published) | 0.66 ± 0.10 | 0.62 ± 0.10 | 1.40 ± 0.16 |
-| rf_chem_mpnnsite__grouped | 0.452 | 0.393 | 1.684 |
-| rf_chem_mpnnsite__paper | 0.406 | 0.487 | 1.857 |
+| rf_full__grouped | 0.469 ± 0.007 | 0.465 ± 0.009 | 1.649 ± 0.001 |
+| rf_full__paper | 0.458 ± 0.008 | 0.578 ± 0.012 | 1.808 ± 0.007 |
 
 ### AB1101
 
 | model | PCC | Spearman | RMSE |
 |---|---|---|---|
 | ProtAttBA (published) | 0.63 ± 0.05 | 0.59 ± 0.05 | 1.62 ± 0.09 |
-| rf_chem_mpnnsite__grouped | 0.409 | 0.393 | 2.044 |
-| rf_chem_mpnnsite__paper | 0.689 | 0.691 | 1.619 |
+| rf_full__grouped | 0.472 ± 0.005 | 0.503 ± 0.004 | 1.955 ± 0.008 |
+| rf_full__paper | 0.717 ± 0.002 | 0.729 ± 0.001 | 1.561 ± 0.004 |
 
 ## Failures
 
