@@ -390,11 +390,20 @@ function renderRuns(){
   const sel=document.getElementById('runsel');
   const keep=sel.value;
   sel.innerHTML='';
-  runs.forEach(r=>{
-    const o=document.createElement('option');
-    o.value=r.run;
-    o.textContent = r.dataset===OUR_DATASET ? r.run : r.run+'  ['+r.dataset+']';
-    sel.appendChild(o);
+  // Newest first, with the dozen most recent in their own group. Alphabetical order over a
+  // hundred and forty runs meant the one that had just finished was unfindable.
+  [['recent','recent'],['earlier','earlier']].forEach(([key,label])=>{
+    const mine=runs.filter(r=>(r.age||'earlier')===key);
+    if(!mine.length) return;
+    const g=document.createElement('optgroup'); g.label=label+'  ('+mine.length+')';
+    mine.forEach(r=>{
+      const o=document.createElement('option');
+      o.value=r.run;
+      o.textContent=(r.dataset===OUR_DATASET?r.run:r.run+'  ['+r.dataset+']')
+                    +(r.when?'   · '+r.when:'');
+      g.appendChild(o);
+    });
+    sel.appendChild(g);
   });
   if(!runs.length) return;
   const pref=['ov_both_geom','rk_huber_only','aug_none'].find(n=>runs.some(r=>r.run===n));
@@ -422,10 +431,30 @@ async function loadRuns(){
   renderRuns();
 }
 
+function clearError(msg){
+  ['cDir','cTier','cMult','cSide','cSup','cClust','cSize','cSizeRho'].forEach(id=>{
+    if(charts[id]){ charts[id].destroy(); delete charts[id]; }
+  });
+  ['sdir','stier','smult','sside','ssup','sclust'].forEach(id=>{
+    const e=document.getElementById(id); if(e) e.innerHTML='<span style="color:var(--dim)">&mdash;</span>';
+  });
+  ['tDir','tTier','tMult','tSide','tSup','tClust'].forEach(id=>{
+    const e=document.querySelector('#'+id+' tbody'); if(e) e.innerHTML='';
+  });
+  document.getElementById('tierNote').textContent=msg;
+}
+
 async function loadError(){
-  if(!RUN) return;
-  ERR=await (await fetch('/api/error?run='+encodeURIComponent(RUN))).json();
-  if(ERR.error){ document.getElementById('tierNote').textContent=ERR.error; return; }
+  if(!RUN){ clearError('no run selected'); return; }
+  const asked=RUN;
+  ERR=await (await fetch('/api/error?run='+encodeURIComponent(RUN),{cache:'no-store'})).json();
+  if(asked!==RUN) return;          // the user moved on while this was in flight
+  if(ERR.error){
+    // Returning here without clearing left every figure showing the PREVIOUS run, which
+    // looks exactly like a selector that does nothing. Wipe them and say why instead.
+    clearError(ERR.error);
+    return;
+  }
   const ORD_DIR=['stabilising (<-0.5)','neutral (|ddG|<=0.5)','destabilising (>+0.5)'];
   fillTable('tDir', ERR.direction, ORD_DIR);
   sliceChart('cDir', ERR.direction, ORD_DIR); statTile('sdir', ERR.direction, ORD_DIR);

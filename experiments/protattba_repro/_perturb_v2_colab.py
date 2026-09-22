@@ -314,6 +314,8 @@ def main():
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
     ap.add_argument("--max-epochs", type=int, default=60)
     ap.add_argument("--overrides", default="{}")
+    ap.add_argument("--clip", type=float, default=4.0,
+                    help="clip |ddG| to this, in training and in scoring; 0 disables")
     a = ap.parse_args()
 
     ov = json.loads(a.overrides)
@@ -321,6 +323,14 @@ def main():
     cfg = PerturbV2Config(**ov)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     rows = pd.read_parquet(a.rows)
+    if a.clip:
+        # Clip before anything splits the table, so the training target, the validation
+        # signal and the reported metric are the same quantity. Clipping only the training
+        # labels would leave the RMSE dominated by the rows the model was told to ignore.
+        n = int((rows.ddg.abs() > a.clip).sum())
+        rows["ddg"] = rows.ddg.clip(-a.clip, a.clip)
+        print(f"clipped |ddG| to {a.clip}: {n} of {len(rows)} rows "
+              f"({100 * n / len(rows):.1f}%)", flush=True)
     cache = Cache()
     OUT.mkdir(parents=True, exist_ok=True)
     print(f"=== {a.exp} === {len(rows)} rows, device {device}", flush=True)

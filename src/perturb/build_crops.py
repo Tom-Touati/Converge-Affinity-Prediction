@@ -22,6 +22,8 @@ import argparse
 import numpy as np
 import pandas as pd
 
+from pathlib import Path
+
 from src import paths
 from src.perturb import data as D
 from src.perturb.crop import (
@@ -35,7 +37,8 @@ OUT = paths.FEATURES / "perturb_crops.npz"
 
 
 def build(r_iface: float = R_IFACE_DEFAULT, r_site: float = R_SITE_DEFAULT,
-          verbose: bool = True) -> str:
+          verbose: bool = True, out: Path | None = None,
+          prefer_chain_id: bool = True) -> str:
     from src.structures import load_structures
 
     rows = D.load_rows()
@@ -50,7 +53,7 @@ def build(r_iface: float = R_IFACE_DEFAULT, r_site: float = R_SITE_DEFAULT,
         ab = meta.loc[r.row_id, "ab_chains"] or meta.loc[r.row_id, "side1"]
         ag = meta.loc[r.row_id, "ag_chains"] or meta.loc[r.row_id, "side2"]
         lens = {c: len(st.chains[c].seq) for c in st.chains}
-        t_ab, i_ab, _ = chain_layout(ab, lens, "ab")
+        t_ab, i_ab, _ = chain_layout(ab, lens, "ab", prefer_chain_id=prefer_chain_id)
         t_ag, i_ag, _ = chain_layout(ag, lens, "ag")
 
         dist = np.load(D.DIST_DIR / f"{r.complex_key}.npy")
@@ -89,28 +92,34 @@ def build(r_iface: float = R_IFACE_DEFAULT, r_site: float = R_SITE_DEFAULT,
         sizes.append(c.size)
         disconnected += c.disconnected
 
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(OUT, **store)
+    dest = Path(out).resolve() if out else OUT
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(dest, **store)
 
     s = np.array(sizes)
     if verbose:
-        mb = OUT.stat().st_size / 1e6
-        print(f"wrote {OUT.relative_to(paths.ROOT)} ({mb:.1f} MB) for {len(rows)} rows")
+        mb = dest.stat().st_size / 1e6
+        shown = dest.relative_to(paths.ROOT) if dest.is_relative_to(paths.ROOT) else dest
+        print(f"wrote {shown} ({mb:.1f} MB) for {len(rows)} rows")
         print(f"  crop size: median {np.median(s):.0f}, p10 {np.percentile(s,10):.0f}, "
               f"p90 {np.percentile(s,90):.0f}, max {s.max()}")
         print(f"  inside the expected 40-120 band: {100*((s>=40)&(s<=120)).mean():.0f}%")
         print(f"  disconnected (site does not touch the interface): {disconnected} "
               f"({100*disconnected/len(s):.0f}%)")
         print(f"  radii: r_iface {r_iface} A, r_site {r_site} A")
-    return str(OUT)
+        print(f"  heavy/light from the chain id where present: {prefer_chain_id}")
+    return str(dest)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--r-iface", type=float, default=R_IFACE_DEFAULT)
     ap.add_argument("--r-site", type=float, default=R_SITE_DEFAULT)
+    ap.add_argument("--out", default=None, help="write here instead of the default path")
+    ap.add_argument("--length-only", action="store_true",
+                    help="assign heavy/light by length alone, ignoring an H/L chain id")
     a = ap.parse_args()
-    build(a.r_iface, a.r_site)
+    build(a.r_iface, a.r_site, out=a.out, prefer_chain_id=not a.length_only)
 
 
 if __name__ == "__main__":

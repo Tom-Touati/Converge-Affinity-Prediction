@@ -311,12 +311,15 @@ def main():
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     ap.add_argument("--max-epochs", type=int, default=60)
     ap.add_argument("--overrides", default="{}")
+    ap.add_argument("--clip", type=float, default=4.0)
     a = ap.parse_args()
 
     cfg = PerturbConfig(**json.loads(a.overrides))
     augment = json.loads(a.overrides).get("_augment", True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     rows = pd.read_parquet(a.rows)
+    if a.clip:
+        rows["ddg"] = rows.ddg.clip(-a.clip, a.clip)
     cache = Cache()
     OUT.mkdir(parents=True, exist_ok=True)
     print(f"=== {a.exp} === {len(rows)} rows, device {device}, cfg {cfg}", flush=True)

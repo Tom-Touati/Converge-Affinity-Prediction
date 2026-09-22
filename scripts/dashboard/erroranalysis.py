@@ -212,19 +212,35 @@ def run_dataset(d) -> str:
 
 
 def available_runs() -> list:
-    """[{run, dataset}], so the UI can default to our dataset and hide the rest.
+    """[{run, dataset, when, age}], newest first, so the UI can find the run that just landed.
 
     A bare list of names cannot express which dataset a run belongs to, and the whole point
     of the tick box is that a benchmark number must never be mistaken for one of ours.
+
+    Sorted by mtime, not by name. A hundred and forty runs have accumulated; alphabetical
+    order buries whatever finished a minute ago somewhere in the middle and puts a benchmark
+    from another dataset at the top. ``age`` splits the list so the UI can group the handful
+    that are current apart from the archive.
     """
+    import time
+
     r = ROOT / "reports"
     if not r.exists():
         return []
-    return sorted(
-        ({"run": p.name, "dataset": run_dataset(p)}
-         for p in r.iterdir() if p.is_dir() and (p / "predictions.csv").exists()),
-        key=lambda x: (x["dataset"] != OUR_DATASET, x["run"]),
-    )
+    out = []
+    for p in r.iterdir():
+        if not p.is_dir() or p.name.startswith("_"):
+            continue
+        f = p / "predictions.csv"
+        if not f.exists():
+            continue
+        m = f.stat().st_mtime
+        out.append({"run": p.name, "dataset": run_dataset(p), "mtime": m,
+                    "when": time.strftime("%d %b %H:%M", time.localtime(m))})
+    out.sort(key=lambda x: -x["mtime"])
+    for i, x in enumerate(out):
+        x["age"] = "recent" if i < 12 else "earlier"
+    return out
 
 
 _CATALOG: dict = {}

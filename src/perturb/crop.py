@@ -20,9 +20,14 @@ Each token carries its ``chain_type`` (heavy / light / antigen), its ``chain_id`
 **original per-chain residue index**, not its position in the concatenated array. RoPE uses
 the original index, so cropping does not silently renumber the protein.
 
-Heavy and light are told apart by length and order within the antibody group: the longer
-chain is the heavy chain. That is a heuristic and is logged as one -- a Kabat/Chothia
-annotation would be better and is not available here.
+Heavy and light are told apart by the chain id when the structure names them ``H`` and ``L``,
+which it does for 27 of our 50 complexes (63% of rows), and otherwise by length: the longer
+chain is taken to be heavy. Length alone is weak here -- the median gap between the two
+antibody chains is 7 residues, 47% of rows are within 5 and 10% are exactly equal -- and it
+contradicts the H label outright on 3N85, 3BDY, 4NM8 and 3BE1 (29 rows). A Kabat or Chothia
+annotation would settle it properly, but both need ANARCI/abnumber and therefore HMMER, which
+is not installed. ``prefer_chain_id=False`` restores the pure-length behaviour so the two can
+be compared.
 """
 from __future__ import annotations
 
@@ -58,7 +63,8 @@ class Crop:
         return len(self.ab_idx) + len(self.ag_idx)
 
 
-def chain_layout(chain_ids: str, lengths: dict[str, int], side: str) -> tuple:
+def chain_layout(chain_ids: str, lengths: dict[str, int], side: str,
+                 prefer_chain_id: bool = True) -> tuple:
     """(chain_type per position, original residue index per position) for one side.
 
     ``lengths`` maps chain id to length, in the order the sequences were concatenated.
@@ -66,8 +72,11 @@ def chain_layout(chain_ids: str, lengths: dict[str, int], side: str) -> tuple:
     types, res_index, chain_of = [], [], []
     if side == "ab":
         present = [c for c in chain_ids if c in lengths]
-        # the longer chain is taken to be heavy; a heuristic, logged as one
-        heavy = max(present, key=lambda c: lengths[c]) if present else None
+        # An explicit H/L naming is ground truth; length is the fallback, not the rule.
+        if prefer_chain_id and "H" in present and "L" in present:
+            heavy = "H"
+        else:
+            heavy = max(present, key=lambda c: lengths[c]) if present else None
         for c in present:
             n = lengths[c]
             types.extend([HEAVY if c == heavy else LIGHT] * n)

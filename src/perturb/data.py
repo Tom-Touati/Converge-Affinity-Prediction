@@ -101,6 +101,15 @@ def build_distance_cache(verbose: bool = True) -> int:
     return n
 
 
+#: Effects beyond this are clipped, both in training and when scoring. 68 of 940 rows (7.2%)
+#: exceed it. They are not spread evenly: fold 0 holds the 3HFM alanine hot-spot series and
+#: 39 of its 188 rows are past 4, which is why its label sd is 2.42 against 1.30-1.71 for the
+#: other folds and why its RMSE reads ~3 while its Pearson is ordinary. SKEMPI's large values
+#: are also the least trustworthy -- many sit at the assay's detection limit -- so a squared
+#: loss spends most of its budget on the numbers we are least sure of.
+DDG_CLIP = 4.0
+
+
 @dataclass
 class Row:
     """One dataset row, resolved to arrays. Sequences stay as strings until PCA is applied."""
@@ -165,7 +174,7 @@ def load_rows(split_json: Path | None = None) -> list[Row]:
             mt_aa.append(mut.mut)
         rows.append(Row(r.row_id, r.complex_key, r.pdb, r.ab_wt, r.ag_wt, r.ab_mt, r.ag_mt,
                         sites_ab, sites_ag, wt_aa, mt_aa, wt_ab, mt_ab, wt_ag, mt_ag,
-                        float(r.ddG), int(r.fold)))
+                        float(np.clip(r.ddG, -DDG_CLIP, DDG_CLIP)), int(r.fold)))
     return rows
 
 
