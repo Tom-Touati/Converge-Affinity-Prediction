@@ -6,8 +6,9 @@ comparable to one over twenty, and the difference is usually what makes a slice 
 """
 from __future__ import annotations
 
-import json
 import pathlib
+
+import json
 
 import numpy as np
 import pandas as pd
@@ -197,10 +198,33 @@ def analyse(run: str) -> dict:
     return out
 
 
+#: Runs with no dataset recorded are this project's own antibody-antigen SKEMPI subset --
+#: every run that existed before the ProtAttBA benchmarks were added is ours.
+OUR_DATASET = "skempi_abag"
+
+
+def run_dataset(d) -> str:
+    """Which dataset a run was scored on, from its run.json."""
+    try:
+        return json.loads((d / "run.json").read_text()).get("dataset") or OUR_DATASET
+    except Exception:
+        return OUR_DATASET
+
+
 def available_runs() -> list:
+    """[{run, dataset}], so the UI can default to our dataset and hide the rest.
+
+    A bare list of names cannot express which dataset a run belongs to, and the whole point
+    of the tick box is that a benchmark number must never be mistaken for one of ours.
+    """
     r = ROOT / "reports"
-    return sorted(p.name for p in r.iterdir()
-                  if p.is_dir() and (p / "predictions.csv").exists()) if r.exists() else []
+    if not r.exists():
+        return []
+    return sorted(
+        ({"run": p.name, "dataset": run_dataset(p)}
+         for p in r.iterdir() if p.is_dir() and (p / "predictions.csv").exists()),
+        key=lambda x: (x["dataset"] != OUR_DATASET, x["run"]),
+    )
 
 
 _CATALOG: dict = {}

@@ -46,6 +46,7 @@ from src.util import resolve_device
 from src.structures import load_structures
 
 CACHE = paths.FEATURES / "mpnn_per_residue"
+BENCH_CACHE = paths.FEATURES / "mpnn_per_residue_benchmarks"
 
 
 def sides_for(key: str, ab_chains: str, ag_chains: str) -> tuple[str, str]:
@@ -58,6 +59,32 @@ def sides_for(key: str, ab_chains: str, ag_chains: str) -> tuple[str, str]:
     """
     return (ab_chains or key.split("_")[1]), (ag_chains or key.split("_")[2])
 
+
+def resolve_chains(structure, partners: str) -> tuple[str, str]:
+    """(antibody chains, antigen chains) from a ``side1_side2`` string, with a fallback.
+
+    Their csv's ``Partners`` column follows SKEMPI's chain naming, but five AB645/AB1101
+    complexes ship a structure from AB-bind whose chains were renamed -- 1MLC is annotated
+    ``AB_E`` while the file holds chains E, H and L. Taking the annotation literally drops
+    those complexes silently.
+
+    The fallback uses the immunoglobulin naming convention the files themselves follow: H
+    and L are the antibody's heavy and light chains, so everything else is the antigen. It
+    only fires when the annotation cannot be honoured, and only when the structure actually
+    has an H or L chain, so it cannot quietly override a valid annotation.
+    """
+    side1, _, side2 = partners.partition("_")
+    ab = "".join(c for c in side1 if c in structure.chains)
+    ag = "".join(c for c in side2 if c in structure.chains)
+    if ab and ag:
+        return ab, ag
+
+    heavy_light = "".join(c for c in "HL" if c in structure.chains)
+    if heavy_light:
+        rest = "".join(sorted(c for c in structure.chains if c not in heavy_light))
+        if rest:
+            return heavy_light, rest
+    return "", ""
 
 def build(device: str = "auto", weights: str = DEFAULT_WEIGHTS, force: bool = False,
           verbose: bool = True) -> int:
@@ -153,12 +180,95 @@ def residue_row(entry: dict, chain: str, position: int, field: str = "h_complex"
     return entry[field][offsets[chain] + position]
 
 
+def build_benchmarks(device: str = "auto", weights: str = DEFAULT_WEIGHTS,
+                     force: bool = False, verbose: bool = True) -> int:
+    """The same field for ProtAttBA's AB645, AB1101 and S1131 complexes.
+
+    Their ``Partners`` column is ``<side1>_<side2>`` in exactly the convention this repo's
+    ``#Pdb`` uses, so side1 is treated as the antibody side and side2 as the antigen side.
+    For the AB sets that matches how their csv is laid out (antibody columns first); for
+    S1131 the labels are conventions anyway, since it holds no antibodies at all.
+
+    Structures come from their shipped PDB directories, with our own parser rather than
+    theirs -- a second parser could disagree with the one the EDA validated, and every
+    residue index has to line up with ``chain.index``.
+    """
+    from src.fusion import benchmark_data as BD
+    from src.structures import parse_pdb
+
+    rows = BD.load_all()
+    keys = rows.drop_duplicates(["dataset", "pdb", "partners"])
+    BENCH_CACHE.mkdir(parents=True, exist_ok=True)
+
+    def cache_name(ds, pdb, partners):
+        return f"{ds}__{pdb}__{partners}".replace("/", "-")
+
+    todo = [r for r in keys.itertuples()
+            if force or not (BENCH_CACHE / f"{cache_name(r.dataset, r.pdb, r.partners)}.npz").exists()]
+    if verbose:
+        print(f"{len(keys)} (dataset, complex) entries, {len(todo)} to compute, device {device}")
+    if not todo:
+        return 0
+
+    device = resolve_device(device)
+    model, _ = _load_model(device, weights)
+    t0 = time.perf_counter()
+    written, skipped = 0, []
+
+    for r in todo:
+        path = BD.find_structure(r.pdb)
+        if path is None:
+            skipped.append((r.dataset, r.pdb, "no structure"))
+            continue
+        try:
+            st = parse_pdb(path)
+            ab, ag = resolve_chains(st, str(r.partners))
+            if not ab or not ag:
+                skipped.append((r.dataset, r.pdb,
+                                f"partners {r.partners} not in {sorted(st.chains)}"))
+                continue
+            h_cx, off_cx = encoder_h_V(model, st, ab + ag, device)
+            h_ab, off_ab = encoder_h_V(model, st, ab, device)
+            h_ag, off_ag = encoder_h_V(model, st, ag, device)
+            np.savez_compressed(
+                BENCH_CACHE / f"{cache_name(r.dataset, r.pdb, r.partners)}.npz",
+                h_complex=h_cx.astype(np.float16), h_ab=h_ab.astype(np.float16),
+                h_ag=h_ag.astype(np.float16),
+                meta=np.array(json.dumps({
+                    "complex_key": cache_name(r.dataset, r.pdb, r.partners),
+                    "dataset": r.dataset, "pdb": r.pdb, "partners": r.partners,
+                    "chains_ab": ab, "chains_ag": ag,
+                    "off_complex": off_cx, "off_ab": off_ab, "off_ag": off_ag,
+                    "dim": int(h_cx.shape[1]), "weights": weights,
+                })))
+            written += 1
+        except Exception as e:                       # one bad structure must not stop the set
+            skipped.append((r.dataset, r.pdb, f"{type(e).__name__}: {e}"))
+        if verbose and written and written % 20 == 0:
+            print(f"  {written}/{len(todo)}  {time.perf_counter() - t0:.0f}s", flush=True)
+
+    if verbose:
+        total = sum(p.stat().st_size for p in BENCH_CACHE.glob("*.npz"))
+        print(f"wrote {written} entries to {BENCH_CACHE.relative_to(paths.ROOT)} "
+              f"({total / 1e6:.1f} MB) in {time.perf_counter() - t0:.0f}s")
+        if skipped:
+            print(f"  skipped {len(skipped)}:")
+            for row in skipped[:10]:
+                print(f"    {row}")
+    return written
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--force", action="store_true", help="recompute complexes already cached")
+    ap.add_argument("--benchmarks", action="store_true",
+                    help="extract ProtAttBA's AB645/AB1101/S1131 complexes instead of ours")
     cli = ap.parse_args()
-    build(device=cli.device, force=cli.force)
+    if cli.benchmarks:
+        build_benchmarks(device=cli.device, force=cli.force)
+    else:
+        build(device=cli.device, force=cli.force)
 
 
 if __name__ == "__main__":

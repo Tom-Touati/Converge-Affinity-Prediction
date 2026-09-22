@@ -137,3 +137,42 @@ defensible option, write it down, keep going.
   Stored fp16 (18.2 MB for all 53 complexes, 159 s on CPU) and verified against
   `mpnnrep.parquet`: max difference 0.00097 over 80 single-point rows, i.e. fp16 precision, so
   the residue indexing agrees with the existing cache.
+
+## Extraction, PCA, sampling, dashboard scoping (asked for 2026-09-22)
+
+- **D26. Repaired two defects in ProtAttBA's released CSVs rather than dropping the rows.**
+  S1131 stores the PDB id `1E96` as `1.00E+96` in 2 rows (Excel read it as scientific
+  notation), and 87 AB645/AB1101 rows use `HM_1KTZ`-style ids for homology models, which a
+  naive `split("_")[0]` turns into `HM`. Both are repaired in
+  `src/fusion/benchmark_data.normalise_pdb_id`, taking structure coverage from 111/112,
+  24/25 and 27/28 to complete.
+- **D27. Fall back to H/L chain naming when `Partners` cannot be honoured.** Five
+  AB645/AB1101 complexes are annotated with SKEMPI chain letters (`AB_E` for 1MLC) while the
+  shipped AB-bind structure uses `E, H, L`. The fallback treats H and L as the antibody and
+  the rest as the antigen, fires only when the annotation fails, and only when the structure
+  actually has an H or L chain, so it cannot override a valid annotation. It recovered the
+  last 10 of 173 benchmark complexes.
+- **D28. PCA is refit inside every fold, on training rows only.** Fitting once on all rows
+  would choose components from the test complexes' variance structure, which under a grouped
+  split is exactly the homology the split withholds. Standardisation is fit the same way,
+  because ESM dimensions differ in scale by more than an order of magnitude.
+- **D29. PCA-128 does not rescue the pooled sequence features — it hurts.** 128 components
+  capture 93.8% of variance, and on the cluster split pooled Pearson falls from 0.188 to
+  0.094 (per-complex rho 0.186 to 0.091); on the by-complex split 0.303 to 0.255. So the E0
+  gap is not the tree's feature sampling being diluted. The likely mechanism is that PCA
+  maximises variance, and in a whole-sequence pooled vector the dominant variance is *which
+  complex this is*, not what the single mutated residue did. That is an argument for
+  per-residue features, not for a better projection.
+- **D30. Sampling weight is a per-row odds ratio, and the resulting share is reported next to
+  it.** Our dataset at 2x per row gives it 39.5% of draws over the full union and 41.5% after
+  fold 0's leakage exclusion, because the share also depends on pool sizes. `describe`
+  prints both so the configured ratio is never mistaken for the batch composition.
+- **D31. Leakage exclusion drops rows rather than zero-weighting them.** A zero-weight row is
+  still in the training table and can be counted, logged or used by anything that does not
+  consult the sampler.
+- **D32. The dashboard defaults to our dataset and says so on screen.** `/api/runs` now
+  returns `{run, dataset}`, the selector lists only `skempi_abag` runs unless "other datasets"
+  is ticked, and a badge reads either "our antibody-antigen SKEMPI" or a red warning naming
+  the other dataset. ProtAttBA's benchmarks are a different problem -- S1131 has no
+  antibody-antigen complexes at all -- so a number from one of them must never be read as ours
+  just because it was on screen.

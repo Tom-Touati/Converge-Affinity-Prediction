@@ -48,6 +48,11 @@
   <button class="tab" data-view="error">Error analysis</button>
   <button class="tab" data-view="runs">Runs</button>
   <select id="runsel" title="which run to analyse"></select>
+  <label id="dslabel" title="Off by default: the headline on screen is always our antibody-antigen SKEMPI subset. Tick to also list runs scored on ProtAttBA's AB645 / AB1101 / S1131."
+         style="margin-left:8px;color:var(--dim);font-size:12px;cursor:pointer">
+    <input type="checkbox" id="otherds" style="vertical-align:-1px"> other datasets
+  </label>
+  <span id="dsbadge" style="margin-left:8px;font-size:12px"></span>
 </div>
 
 <div class="grid" id="view-train">
@@ -270,14 +275,45 @@ function fillTable(id, obj, order){
   });
 }
 
-async function loadRuns(){
-  const runs=await (await fetch('/api/runs')).json();
+let ALLRUNS=[];
+const OUR_DATASET='skempi_abag';
+
+function renderRuns(){
+  const showOther=document.getElementById('otherds').checked;
+  const runs=ALLRUNS.filter(r=>showOther||r.dataset===OUR_DATASET);
   const sel=document.getElementById('runsel');
+  const keep=sel.value;
   sel.innerHTML='';
-  runs.forEach(r=>{ const o=document.createElement('option'); o.value=o.textContent=r; sel.appendChild(o); });
-  const pref=['ov_both_geom','rk_huber_only','aug_none'].find(r=>runs.includes(r));
-  sel.value=RUN=pref||runs[0];
-  sel.onchange=()=>{ RUN=sel.value; loadError(); };
+  runs.forEach(r=>{
+    const o=document.createElement('option');
+    o.value=r.run;
+    o.textContent = r.dataset===OUR_DATASET ? r.run : r.run+'  ['+r.dataset+']';
+    sel.appendChild(o);
+  });
+  if(!runs.length) return;
+  const pref=['ov_both_geom','rk_huber_only','aug_none'].find(n=>runs.some(r=>r.run===n));
+  sel.value = runs.some(r=>r.run===keep) ? keep : (pref||runs[0].run);
+  RUN=sel.value;
+  const cur=ALLRUNS.find(r=>r.run===RUN);
+  const b=document.getElementById('dsbadge');
+  if(cur && cur.dataset!==OUR_DATASET){
+    b.textContent='showing '+cur.dataset+' — NOT our dataset';
+    b.style.color='var(--bad,#e06c75)';
+  } else { b.textContent='our antibody–antigen SKEMPI'; b.style.color='var(--dim)'; }
+  loadError();
+}
+
+async function loadRuns(){
+  // /api/runs returns [{run, dataset}]. The default view is deliberately restricted to our
+  // own antibody-antigen SKEMPI subset: ProtAttBA's benchmarks are a different problem --
+  // S1131 contains no antibody-antigen complexes at all -- and a number from one of them
+  // must never be read as ours just because it was on screen.
+  ALLRUNS=await (await fetch('/api/runs')).json();
+  if(ALLRUNS.length && typeof ALLRUNS[0]==='string')
+    ALLRUNS=ALLRUNS.map(r=>({run:r,dataset:OUR_DATASET}));   // tolerate the old endpoint
+  document.getElementById('otherds').onchange=renderRuns;
+  document.getElementById('runsel').onchange=()=>{ RUN=document.getElementById('runsel').value; renderRuns(); };
+  renderRuns();
 }
 
 async function loadError(){

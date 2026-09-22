@@ -38,7 +38,7 @@ import pandas as pd
 
 from src import paths
 from src import splits
-from src.fusion import features, metrics, results, splits_frozen
+from src.fusion import features, metrics, pca, results, splits_frozen
 from src.model import MODELS
 
 SEEDS = (0, 1, 2)
@@ -87,13 +87,20 @@ def dataset_with_folds(grouping: str = "frozen5") -> pd.DataFrame:
 
 
 def run_one(exp: str, feature_set: str, model_key: str, drop_vectors: bool,
-            seeds=SEEDS, grouping: str = "frozen5") -> pd.DataFrame | None:
+            seeds=SEEDS, grouping: str = "frozen5",
+            pca_components: int | None = None) -> pd.DataFrame | None:
     """One experiment across every fold and seed. Returns out-of-fold predictions."""
     ds = dataset_with_folds(grouping)
     X = features.build(ds["row_id"], feature_set, drop_vectors=drop_vectors)
     y = ds["ddG"].to_numpy(dtype=float)
     folds = ds["fold"].to_numpy()
     sha = results.git_sha()
+
+    # PCA is refit inside every fold on that fold's training rows only. Fitting once on all
+    # rows would choose components using the test complexes' variance structure, which on a
+    # grouped split is exactly the homology the split exists to withhold.
+    folded = (pca.fit_transform_folds(X, folds, pca_components, verbose=True)
+              if pca_components else None)
 
     print(f"\n=== {exp} ===")
     print(f"  features {feature_set}: {X.shape[1]} columns over {len(X)} rows, "
@@ -108,8 +115,9 @@ def run_one(exp: str, feature_set: str, model_key: str, drop_vectors: bool,
             te = folds == k
             tr = ~te
             est = MODELS[model_key](seed)
-            est.fit(X[tr.tolist()] if isinstance(X, list) else X.loc[tr], y[tr])
-            oof[te] = est.predict(X.loc[te])
+            X_tr, X_te = (folded[k] if folded else (X.loc[tr], X.loc[te]))
+            est.fit(X_tr, y[tr])
+            oof[te] = est.predict(X_te)
             # "params" for a forest is the total node count, the closest honest analogue.
             if hasattr(est, "estimators_"):
                 n_params = int(sum(t.tree_.node_count for t in est.estimators_))
@@ -131,7 +139,8 @@ def run_one(exp: str, feature_set: str, model_key: str, drop_vectors: bool,
                        n_test=int(m.sum()), params=n_params,
                        train_minutes=round(minutes / len(set(folds)), 3),
                        git_sha=sha, dataset="skempi_abag",
-                       note=f"{feature_set}/{model_key}/{grouping}")
+                       note=f"{feature_set}/{model_key}/{grouping}"
+                            + (f"/pca{pca_components}" if pca_components else ""))
             results.append(row)
 
         pooled = metrics.score(y, oof, complexes=ds["#Pdb"])
@@ -149,14 +158,18 @@ def main() -> None:
     ap.add_argument("--seeds", type=int, nargs="+", default=list(SEEDS))
     ap.add_argument("--grouping", default="frozen5", choices=GROUPINGS,
                     help="which split strategy to score on")
+    ap.add_argument("--pca", type=int, default=None, metavar="K",
+                    help="reduce ESM embedding columns to K dims, refit per training fold")
     cli = ap.parse_args()
 
     todo = {cli.exp: EXPERIMENTS[cli.exp]} if cli.exp else EXPERIMENTS
     for exp, (fs, model_key, drop) in todo.items():
         try:
             name = exp if cli.grouping == "frozen5" else f"{exp}__{cli.grouping}"
+            if cli.pca:
+                name = f"{name}__pca{cli.pca}"
             run_one(name, fs, model_key, drop, seeds=tuple(cli.seeds),
-                    grouping=cli.grouping)
+                    grouping=cli.grouping, pca_components=cli.pca)
         except Exception:                      # rule 8: a failure never stops the ladder
             tb = traceback.format_exc()
             results.record_failure(exp, "all", "all", tb)

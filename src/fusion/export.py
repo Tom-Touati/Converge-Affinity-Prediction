@@ -38,7 +38,7 @@ from src.fusion import results as R
 
 
 def export(exp: str, seed: int, name: str | None = None, n_boot: int = 0,
-           grouping: str = "cluster") -> str:
+           grouping: str = "cluster", dataset: str = "skempi_abag") -> str:
     """Write one fusion (experiment, seed) into ``reports/<name>/``. Returns the run name."""
     src_path = R.PREDICTIONS_DIR / f"{exp}_seed{seed}.csv"
     if not src_path.exists():
@@ -68,6 +68,7 @@ def export(exp: str, seed: int, name: str | None = None, n_boot: int = 0,
 
     (out / "run.json").write_text(json.dumps({
         "name": run, "source": "src.fusion", "exp": exp, "seed": seed,
+        "dataset": dataset,
         "model": exp, "features": [], "grouping_for_cluster_labels": grouping,
         "residual": None, "min_group": evaluate.MIN_GROUP,
         "note": "exported from results/predictions/ by src.fusion.export; "
