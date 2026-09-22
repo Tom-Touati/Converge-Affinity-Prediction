@@ -9,6 +9,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 SESSION=${SESSION:-pb}
 EXP=${1:-full}
+PYBIN=${PYBIN:-$HERE/experiments/protattba_repro/.venv_protattba/Scripts/python.exe}
 EVERY=${2:-180}
 mkdir -p "$HERE/reports/perturb_$EXP" "$HERE/results/oof"
 while true; do
@@ -18,8 +19,10 @@ while true; do
     "$HERE/reports/perturb_$EXP/${EXP}_results.csv" >/dev/null 2>&1
   timeout 300 colab download -s "$SESSION" "/content/perturb/out/${EXP}_oof.csv" \
     "$HERE/results/oof/${EXP}.csv" >/dev/null 2>&1
-  timeout 120 colab download -s "$SESSION" "/content/perturb/out/rank_fusion_sweep.csv" \
-    "$HERE/reports/rank_fusion_sweep.csv" >/dev/null 2>&1
+  # The sweep file is owned LOCALLY by scripts/perturb_sweep_row.py, not pulled.
+  # The VM writes a minimal row; the dashboard Configurations table needs the fuller
+  # schema, so downloading it would overwrite the enriched version every cycle and
+  # every cell would render as "undefined".
   n=$(tail -n +2 "$HERE/reports/perturb_$EXP/${EXP}_results.csv" 2>/dev/null | wc -l)
   e=$(tail -n +2 "$HERE/reports/perturb_$EXP/history.csv" 2>/dev/null | wc -l)
   echo "[$(date -u +%H:%M:%S)] $EXP: $n (fold,seed) done, $e epochs logged"

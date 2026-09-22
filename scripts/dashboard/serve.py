@@ -48,7 +48,7 @@ def pull(session: str, remote: str, local: pathlib.Path) -> bool:
         return False
 
 
-LOCAL_REPORTS = ROOT / "reports"
+LOCAL_REPORTS = HERE.resolve().parents[1] / "reports"
 
 
 def pull_local(remote: str, local: pathlib.Path) -> bool:

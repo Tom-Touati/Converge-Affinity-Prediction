@@ -4,7 +4,13 @@
     {
       "name": "sweep-dashboard",
       "runtimeExecutable": "C:/Users/tomto/workspaces/converge_bind/.venv/Scripts/python.exe",
-      "runtimeArgs": ["scripts/dashboard/serve.py", "--port", "8777", "--session", "pab"],
+      "runtimeArgs": [
+        "scripts/dashboard/serve.py",
+        "--port",
+        "8777",
+        "--session",
+        "pb"
+      ],
       "port": 8777
     }
   ]
