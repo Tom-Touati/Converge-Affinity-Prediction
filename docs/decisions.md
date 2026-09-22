@@ -233,3 +233,25 @@ defensible option, write it down, keep going.
   before a 5-fold run finishes, but the remote process survives it and `colab download` works
   against a BUSY kernel. Polling is therefore both the progress view and the thing that makes
   results survive a reclaimed session.
+
+## Parameter-economy redesign (model_v2)
+
+- **D44. The head stays bias-free, which is why the budget lands at 51,089 rather than the
+  spec's 51,314.** The gaps are all bias terms I dropped: the head (required for a null edit
+  to give exactly zero), the attention Q/K/V/O, and the low-rank ``down`` factor. The one
+  addition is a second LayerNorm, because pre-LN cross-attention needs separate norms for the
+  query and key/value streams. 15.9x fewer parameters than the first model.
+- **D45. Heavy and light chains are told apart by length, and that is a heuristic.** The
+  longer chain of the antibody pair is taken as heavy. A Kabat or Chothia annotation would be
+  correct; none is available in this repo. Logged here rather than buried, because the
+  chain-type embedding is only as good as this call.
+- **D46. The crop keeps 13% of the tokens.** Median 85 tokens against 608 uncropped, with 91%
+  of rows inside the spec's expected 40-120 band and a maximum of 138. Per-fold medians run
+  80-92, so no fold is systematically cropping differently.
+- **D47. 6% of rows have a disconnected crop** -- the mutation's neighbourhood does not touch
+  the interface set. That is intended, not a bug: whether the site can still reach the
+  interface through the distance-biased attention is exactly what the error analysis asks.
+  It is also a confound to watch, since those rows have two separate regions rather than one.
+- **D48. Both branches read the crop from one batch, and the test asserts it on the tensors.**
+  Test (c) spies on what ``encode`` actually receives rather than checking the code path, so
+  a future change that had MUT re-derive its own crop would fail rather than pass quietly.
