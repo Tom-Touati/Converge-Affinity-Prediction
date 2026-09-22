@@ -335,9 +335,6 @@ def main() -> None:
     figures(a.run)
 
 
-if __name__ == "__main__":
-    main()
-
 
 # ----------------------------------------------------------------------------- figures
 def figures(run: str = "rungN0_chem_geom_mpnn_rf") -> str:
@@ -428,3 +425,10 @@ def figures(run: str = "rungN0_chem_geom_mpnn_rf") -> str:
     plt.close(fig)
     print(f"wrote {path.relative_to(paths.ROOT)}")
     return str(path)
+
+# The entry point lives at the very bottom on purpose. It used to sit directly under `main`,
+# which is above `figures`, so `main()` executed before `def figures` had been evaluated and
+# every invocation ended in `NameError: name 'figures' is not defined` -- after printing all
+# the tables, so the crash looked cosmetic while in fact no figure was ever written.
+if __name__ == "__main__":
+    main()

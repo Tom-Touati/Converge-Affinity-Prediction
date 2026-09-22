@@ -101,3 +101,39 @@ defensible option, write it down, keep going.
   GPU job queued behind the S1131 reproduction.
 - **D20. AB-bind is not in this repo** and no pipeline consumes it, so it is out of the
   leakage accounting. It exists only inside the gitignored upstream ProtAttBA checkout.
+
+## Integrating main's modules (asked for explicitly)
+
+- **D21. Bridged the two report formats instead of changing either.** `src/error_analysis.py`
+  and the dashboard read `reports/<run>/predictions.csv`; the fusion ladder writes
+  `results/predictions/<exp>_seed<n>.csv` because the plan specifies its own schema.
+  `src/fusion/export.py` publishes one into the other, so both of main's tools work on a
+  fusion run unmodified. The bridge validates itself: `E0a_rf_handcrafted__cluster`, scored
+  through the project's own `src/evaluate.metrics`, gives per-complex Spearman **+0.239** —
+  the project's documented figure to three decimals.
+- **D22. `cluster` labels come from the project's split, `fold` from the run.** A homology
+  cluster is a property of the complex, computed once with Smith-Waterman over antigen chains,
+  and is independent of how folds were later drawn. So a run scored on the 5-fold by-complex
+  split still gets true cluster labels and the dashboard's per-cluster panel stays meaningful,
+  while the fold column keeps describing the split the model was actually scored on.
+- **D23. Fixed a real bug in `src/error_analysis.py` rather than working around it.** Its
+  `if __name__ == "__main__": main()` sat *above* `def figures`, so `main()` ran before
+  `figures` was bound and every invocation ended in `NameError` — after printing all the
+  tables, so the crash looked cosmetic while in fact no figure had ever been written. Moving
+  the guard to the end of the file is the whole change; no logic was touched. This is the one
+  exception to rule 9, and it was necessary to make the module usable at all.
+- **D24. Made the split strategy a flag on the fusion ladder, not a fork of it.**
+  `--grouping frozen5|cluster|complex|random` selects between the plan's 5-fold by-complex
+  split and the project's own `src/splits.py` groupings, and the grouping is recorded on every
+  results row. A fold number means nothing without the grouping that produced it. Runs on a
+  non-default grouping are suffixed `__<grouping>` so the two can never be averaged together
+  by accident.
+- **D25. Per-residue ProteinMPNN reuses `mpnn_repr.encoder_h_V` verbatim.** That function
+  already computes the `(L, 128)` field the fusion head needs and then reduces it to 384
+  pooled numbers; `src/fusion/mpnn_per_residue.py` writes it out unreduced instead. No second
+  implementation of the encoder exists to drift. Cached per **complex** rather than per
+  mutation, because `h_V` is computed from backbone geometry with no sequence input, so it is
+  identical for the wild type and the mutant — which is exactly what the plan's E1 assumes.
+  Stored fp16 (18.2 MB for all 53 complexes, 159 s on CPU) and verified against
+  `mpnnrep.parquet`: max difference 0.00097 over 80 single-point rows, i.e. fp16 precision, so
+  the residue indexing agrees with the existing cache.
