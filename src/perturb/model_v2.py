@@ -102,6 +102,18 @@ class PerturbV2Config:
     input_noise: float = 0.0         # Gaussian noise, as a fraction of each channel's sd
     feature_dropout: float = 0.0     # probability of zeroing a whole PCA channel
 
+    #: Weight init for the FiLM that carries the mutation. Zero makes the FiLM an exact
+    #: identity at step 0, so the ESM delta contributes NOTHING to the representation until
+    #: gradient descent lifts it off zero -- while ``branch.mut`` ships with ordinary init
+    #: and injects BLOSUM from the very first step. Measured at initialisation: delta
+    #: contributes 0.000000 and BLOSUM 0.048477. The delta path has to climb out of zero
+    #: against a path already explaining variance, which is the likeliest reason gamma
+    #: carries 41x less gradient per parameter than attention while mut carries 2x more.
+    #:
+    #: The BIAS stays zero whatever this is set to, so gamma(0) == 0 and a null edit still
+    #: leaves both branches identical -- required test (a) is unaffected.
+    film_init: float = 0.0
+
     #: Draw the SAME dropout mask in both branches. The head reads f_mut - f_itw, and with
     #: independent masks the attention dropout disagrees between the two calls: on a null
     #: edit, where the true difference is exactly zero, the branches still differ by 0.42
@@ -234,7 +246,11 @@ class BranchV2(nn.Module):
         else:
             self.gamma, self.beta = nn.Linear(w, w), nn.Linear(w, w)
             for lin in (self.gamma, self.beta):
-                nn.init.zeros_(lin.weight); nn.init.zeros_(lin.bias)
+                if cfg.film_init > 0:
+                    nn.init.normal_(lin.weight, std=cfg.film_init)
+                else:
+                    nn.init.zeros_(lin.weight)
+                nn.init.zeros_(lin.bias)   # always: keeps gamma(0) == 0, so test (a) holds
         if cfg.struct_film_on:
             self.gamma2, self.beta2 = nn.Linear(w, w), nn.Linear(w, w)
             for lin in (self.gamma2, self.beta2):

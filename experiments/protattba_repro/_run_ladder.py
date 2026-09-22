@@ -41,6 +41,19 @@ LADDER = [
     ("v3_noaug", {"_augment": False}),
     # the two that looked best, together
     ("v3_site_reg", {"pool": "site", "input_noise": 0.1, "feature_dropout": 0.2}),
+
+    # --- v4: BLOSUM out, and the delta path live from step 0.
+    # gamma and beta are zero-initialised, so (1 + gamma(d)) * t + beta(d) == t exactly and
+    # the ESM delta contributes NOTHING at step 0 (measured: 0.000000) while branch.mut
+    # ships with ordinary init and injects BLOSUM immediately (0.048477). The model is
+    # therefore a BLOSUM predictor with learned complex context, and BLOSUM is the one
+    # module carrying more gradient per parameter than attention while being 5% of the
+    # weights. Dropping it without also lifting the FiLM off zero would leave the model
+    # with no mutation signal at all for its first epochs, so the two go together.
+    ("v4_noblosum", {"use_blosum": False, "film_init": 0.02}),
+    # with the regularisation that v3_reg showed is doing real work
+    ("v4_noblosum_reg", {"use_blosum": False, "film_init": 0.02,
+                         "input_noise": 0.1, "feature_dropout": 0.2}),
 ]
 
 

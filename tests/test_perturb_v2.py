@@ -311,3 +311,60 @@ def test_perturbation_actually_perturbs():
         f_a = m.branch(b, mutated=True, perturb=p1)
         f_b = m.branch(b, mutated=True, perturb=None)
     assert not torch.allclose(f_a, f_b), "the perturbation did not change the branch output"
+
+
+# ----------------------------------------------------- no BLOSUM, live delta path
+def test_film_init_leaves_a_null_edit_at_exactly_zero():
+    """A non-zero FiLM init must not cost the null-edit property.
+
+    gamma(0) == 0 as long as the BIAS stays zero, so an unmutated row still produces
+    identical branches however the weight is initialised.
+    """
+    for init in (0.0, 0.02, 0.1):
+        cfg = PerturbV2Config(film_init=init, use_blosum=False)
+        m = PerturbV2(cfg).eval()
+        with torch.no_grad():
+            y = m(make_batch(mutate=False, cfg=cfg))
+        assert torch.allclose(y, torch.zeros_like(y), atol=1e-6), \
+            f"film_init={init}: null edit gave {y.tolist()}"
+        assert float(m.branch.gamma.bias.abs().max()) == 0.0, "gamma bias must stay zero"
+
+
+def test_film_init_makes_the_delta_reach_the_representation_at_step_zero():
+    """The point of the flag: with zeros the ESM delta contributes exactly nothing.
+
+    Asserted on the token representation, so it states the mechanism rather than a score.
+    """
+    def delta_contribution(init):
+        cfg = PerturbV2Config(film_init=init, use_blosum=False)
+        m = PerturbV2(cfg).eval()
+        b = make_batch(mutate=True, cfg=cfg, seed=3)
+        with torch.no_grad():
+            t = m.branch.red_str(b["struct_ab"])
+            d = (m.branch.red_seq(b["seq_ab_mt"]) - m.branch.red_seq(b["seq_ab_wt"]))
+            d = d * b["site_ab"].unsqueeze(-1)
+            film = (1 + m.branch.gamma(d)) * t + m.branch.beta(d)
+        return float((film - t).abs().mean())
+
+    assert delta_contribution(0.0) == 0.0, \
+        "with a zero init the delta must contribute exactly nothing; that is the problem"
+    assert delta_contribution(0.02) > 0.0, \
+        "with a non-zero init the delta must reach the representation at step 0"
+
+
+def test_without_blosum_the_mutation_still_reaches_the_model():
+    """Dropping BLOSUM must not leave the model blind to which substitution was made.
+
+    The mutant identity then travels only through the ESM delta, which is the intended
+    carrier -- but only if the delta path is live, so this pairs film_init with it.
+    """
+    cfg = PerturbV2Config(use_blosum=False, film_init=0.02)
+    m = PerturbV2(cfg).eval()
+    assert not hasattr(m.branch, "mut"), "branch.mut should not exist without BLOSUM"
+    for p in m.head.parameters():
+        torch.nn.init.normal_(p, std=0.05)
+    with torch.no_grad():
+        y_null = m(make_batch(mutate=False, cfg=cfg, seed=4))
+        y_real = m(make_batch(mutate=True, cfg=cfg, seed=4))
+    assert torch.equal(y_null, torch.zeros_like(y_null))
+    assert y_real.abs().max() > 0, "a real mutation produced no response without BLOSUM"
