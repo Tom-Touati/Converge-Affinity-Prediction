@@ -99,7 +99,7 @@ class PerturbV2Config:
     #: reads, which is only 2.5% of the pooled vector to begin with -- it would regularise
     #: by destroying the signal, and it would break the null-edit-is-zero property during
     #: training. Shared, the difference is untouched and the property still holds exactly.
-    input_noise: float = 0.0         # sd of Gaussian noise on the PCA features
+    input_noise: float = 0.0         # Gaussian noise, as a fraction of each channel's sd
     feature_dropout: float = 0.0     # probability of zeroing a whole PCA channel
 
     #: Draw the SAME dropout mask in both branches. The head reads f_mut - f_itw, and with
@@ -397,7 +397,14 @@ class PerturbV2(nn.Module):
         out = {}
         for key in ("seq_ab", "seq_ag", "struct_ab", "struct_ag"):
             ref = batch[f"{key}_wt"] if key.startswith("seq") else batch[key]
-            n = torch.randn_like(ref) * cfg.input_noise if cfg.input_noise > 0 else None
+            n = None
+            if cfg.input_noise > 0:
+                # Relative to each channel's own spread. These are PCA components, so their
+                # variances fall off by orders of magnitude across the 256 dimensions; a
+                # single absolute sd would drown the leading components' neighbours and do
+                # nothing at all to the tail.
+                sd = ref.std(dim=(0, 1), keepdim=True)
+                n = torch.randn_like(ref) * (cfg.input_noise * sd)
             m = None
             if cfg.feature_dropout > 0:
                 # whole PCA channels, shared across tokens, inverted so the scale is kept

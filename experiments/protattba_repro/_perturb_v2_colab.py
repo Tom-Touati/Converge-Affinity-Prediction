@@ -308,9 +308,18 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
     pcas = fold_pca(rows, fold, cache, cfg.pca_dim, seed=0)
     test = rows[rows.fold == fold]
     tr_all = rows[rows.fold != fold]
+    # Hold out complexes until the ROW target is met, not a fixed count of complexes.
+    # Complexes run from 2 to 87 rows, so taking 20% of them took 311 of 752 rows on the
+    # smoke run -- 41%, starving training to 441 rows -- while 10% had given as few as 73.
+    # Either way the split size was whatever the shuffle happened to pick.
     cx = sorted(tr_all.complex_key.unique())
     rng = np.random.default_rng(seed); rng.shuffle(cx)
-    val_cx = set(cx[:max(1, int(round(len(cx) * VAL_FRACTION)))])
+    sizes = tr_all.complex_key.value_counts()
+    target, taken, val_cx = VAL_FRACTION * len(tr_all), 0, set()
+    for c in cx:
+        if taken >= target or len(val_cx) >= len(cx) - 1:
+            break
+        val_cx.add(c); taken += int(sizes[c])
     train = tr_all[~tr_all.complex_key.isin(val_cx)]
     val = tr_all[tr_all.complex_key.isin(val_cx)]
 

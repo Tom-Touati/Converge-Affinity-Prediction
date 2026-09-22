@@ -43,7 +43,7 @@ TB = paths.ROOT / "runs" / "tb"
 #: legible. The default is the live comparison instead -- the perturbation models against the
 #: forest baselines on our own antibody-antigen subset -- and older families are added by
 #: name. Nothing is deleted from reports/ either way; this only decides what gets mirrored.
-DEFAULT = ("perturb_", "E0")
+DEFAULT = ("perturb_", "v3_", "E0")
 
 #: history.csv exists in two schemas -- the perturbation trainers' and the older fusion
 #: sweeps'. Both carry these under one name or another; anything missing is skipped rather
@@ -51,9 +51,27 @@ DEFAULT = ("perturb_", "E0")
 CURVES = {
     "train/loss": ("loss", "train_loss_eval"),
     "val/pearson": ("val_rho",),
+    # what early stopping now maximises, and the quantity the model is judged on
+    "val/per_complex_rho": ("val_cx_rho",),
     "val/rmse": ("val_rmse",),
     "train/pearson": ("train_rho",),
     "train/loss_gap": ("loss_gap",),
+    # Gradient health, measured before clipping. The per-group norms are the point: a
+    # difference-of-branches head can starve the path the edit travels without anything
+    # in the loss curve moving. On the first smoke run branch.gamma -- the FiLM the delta
+    # is injected through -- carried gradients ~80x smaller than the attention.
+    "grad/norm": ("grad_norm",),
+    "grad/clipped_frac": ("grad_clipped",),
+    "grad/dead_frac": ("grad_dead_frac",),
+    "grad/head": ("g_head",),
+    "grad/attn": ("g_attn",),
+    "grad/fuse": ("g_fuse",),
+    "grad/film_gamma": ("g_film",),
+    "grad/film_beta": ("g_film_b",),
+    "grad/reduce_seq": ("g_red_seq",),
+    "grad/reduce_struct": ("g_red_str",),
+    "grad/blosum": ("g_blosum",),
+    "grad/chain": ("g_chain",),
 }
 
 
