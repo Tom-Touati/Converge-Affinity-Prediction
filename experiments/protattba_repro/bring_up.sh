@@ -35,7 +35,6 @@ fi
 cat > /tmp/_mkdirs.py <<'PY'
 import os; os.makedirs('/content/perturb/out', exist_ok=True); print('dirs made')
 PY
-wsl -e cp /tmp/_mkdirs.py /tmp/_mkdirs.py 2>/dev/null || true
 probe=$(wsl_ "timeout 240 colab exec -s $S" < /tmp/_mkdirs.py 2>&1 | tail -3)
 if ! echo "$probe" | grep -q "dirs made"; then
   echo "FATAL: session $S is not usable: $probe"; exit 1

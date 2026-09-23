@@ -2,9 +2,11 @@ PYTHON ?= python
 K      ?= 4
 BOOT   ?= 1000
 DEVICE ?= auto
+RUNS   ?=
+N      ?= 940
 ESM    ?= esm2_t12_35M_UR50D
 
-.PHONY: help data splits features geom esm mpnn errors \
+.PHONY: help data splits features geom esm mpnn errors report align \
         rung0 rung1 rung2a rung2b rung3 rung3b rung4 rung5 rung6 rungN0 \
         ladder figures test clean clean-features third-party
 
@@ -33,6 +35,8 @@ help:
 	@echo ""
 	@echo "  make figures       - regenerate reports/figures/"
 	@echo "  make errors        - slice tables, probes and diagnostics for the best model"
+	@echo "  make report        - THE results table: every run on one common truth"
+	@echo "  make align         - verify each mutation is at the index we index"
 	@echo "  make test          - split-integrity and harness tests"
 	@echo "  make clean         - remove generated reports (keeps the frozen split)"
 
@@ -93,6 +97,20 @@ figures:
 
 errors:
 	$(PYTHON) -m src.error_analysis --run rungN0_chem_geom_mpnn_rf
+
+# The results table. Every run is scored against ONE truth so that models trained on
+# differently clipped labels stay comparable, and the complex-mean floor is printed beneath
+# them -- it scores +0.672 pooled and +0.000 per complex, which is why no table here leads
+# with pooled Pearson.
+report:
+	$(PYTHON) scripts/report_runs.py $(RUNS)
+
+# Is the mutation where we think it is, and does the encoder see it there? Checks the
+# residue at the index against the mutation string, checks the WT and MT sequences differ
+# only at the recorded sites, and -- where a token cache is reachable -- that ||delta|| is
+# peaked at the mutated residues.
+align:
+	$(PYTHON) -m src.perturb.check_alignment -n $(N)
 
 test:
 	$(PYTHON) -m pytest tests -q
