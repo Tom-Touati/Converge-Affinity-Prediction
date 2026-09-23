@@ -331,13 +331,20 @@ architecture**: adding 26 substitution-chemistry columns to the same network mov
 Two splits over the same 940 rows. `frozen5` withholds whole complexes; `cluster` withholds
 whole homology clusters, which is the harder and more honest generalisation test.
 
-| model | by complex | by homology cluster | retained |
-| --- | --- | --- | --- |
-| random forest, 49 handcrafted columns | +0.361 ρ | **+0.275** | **76%** |
-| our network | +0.246 ρ | +0.084 | **34%** |
+| model | by complex | by homology cluster | retained | seeds |
+| --- | --- | --- | --- | --- |
+| random forest, 49 handcrafted columns | +0.418 ρ | **+0.225** | **54%** | 3 |
+| random forest, pooled ESM + ProteinMPNN | +0.362 ρ | +0.186 | 51% | 3 |
+| our network | +0.246 ρ | +0.084 | **34%** | 1 |
 
-The cluster split is harder for both — the forest gives up a quarter — but the network gives
-up two thirds, and 11 of its complexes finish with a *negative* within-complex correlation.
+The cluster split is harder for everything — the forest gives up nearly half — but the
+network gives up two thirds, and 11 of its complexes finish with a *negative* within-complex
+correlation.
+
+Two cautions on this table. The forest rows are three-seed means; the network row is a single
+seed, so its 34% is the least well estimated number here. And an earlier version of this
+section reported the forest retaining 76%, from one seed — three seeds put it at 54%, which
+narrows the gap considerably without closing it.
 The collapse is therefore a property of the model rather than of the split: the
 embedding-based network was relying on homology that the cluster split withholds, and the
 handcrafted columns were not.
