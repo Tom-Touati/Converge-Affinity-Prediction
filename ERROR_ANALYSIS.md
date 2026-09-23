@@ -1,11 +1,17 @@
 # Error analysis
 
+Part I is the error analysis of the random forest, which is the model.
+Part II is the error analysis of the *evaluation*, and is where this project's
+most consequential findings sit.
+
 > **Superseded in places — see [HANDOFF.md](docs/HANDOFF.md).** Numbers here predate two
 > corrections: the per-complex threshold moved from 10 mutations to 5 (the model to beat
 > reads 0.388, not 0.498, on the same predictions), and residual learning was removed.
 > Any figure produced by a net trained on `ddG - forest_prediction` had the forest added
 > back at inference and is not that network's own score.
 
+
+# Part I — errors of the model
 
 Model: `rungN0_chem_geom_mpnn_rf` — chemistry + interface geometry + ProteinMPNN into a random
 forest, per-complex Spearman **0.475 [0.393, 0.552]**. Regenerate everything here with:
@@ -225,3 +231,156 @@ Ranked by what the evidence supports, not by what is most interesting to build.
    because it cannot see *which* residues a mutation contacts. It fails because it will not
    predict extreme values, cannot read antibody CDR loops, and cannot compose multiple mutations.
    Attention addresses none of those three.
+
+---
+
+# Part II — what the neural ladder revealed about the evaluation
+
+Part I analyses the errors of the random forest. This part analyses the errors of the
+*measurement*, and it is the more consequential of the two: several conclusions this project
+had already drawn turned out to be smaller than the noise they were measured against.
+
+Every number regenerates with `make report`. The dataset is 940 rows over 53 complexes, of
+which **32 carry the five rows needed for a within-complex correlation**. Median 9 rows per
+complex, maximum 87, and the three largest complexes hold 24% of the data.
+
+## 8. Pooled Pearson mostly measures complex identity
+
+Predicting nothing but each complex's own mean ΔΔG — a model with no access to the mutation
+at all — scores:
+
+| | per-complex r | pooled r | RMSE | concordance |
+| --- | --- | --- | --- | --- |
+| **complex mean only** | **+0.000** | **+0.672** | **1.144** | **0.00** |
+| best network here | +0.282 | +0.383 | 1.523 | 0.66 |
+| random forest | +0.397 | +0.509 | 1.335 | 0.74 |
+
+It beats every model in this repository on pooled Pearson *and* on RMSE, while being useless
+for the question a designer actually asks. Between-complex variance dominates both: complexes
+differ in mean ΔΔG far more than mutations within a complex differ from one another, so a
+model that merely identifies the complex scores well.
+
+The consequences are not cosmetic.
+
+- **Pooled Pearson and RMSE cannot be headline metrics here.** Every table in this repository
+  leads with per-complex correlation, and `report_runs.py` prints this floor underneath every
+  comparison so a reader can see what the pooled column is worth.
+- **Any feature that identifies the complex is a leak in disguise.** The wild-type
+  binding-site pool is identical for every mutation of a complex and is exactly such a
+  feature. Turning it off (`use_site_pool=False`) is a one-line ablation, and it *helped*.
+- Published ΔΔG results that lead with pooled correlation on SKEMPI are, to an unknown
+  degree, reporting this quantity.
+
+## 9. The noise floor is larger than most of the effects
+
+Re-running an identical configuration under a different seed moves per-complex Pearson by
+more than the architectural differences the ladder was built to measure.
+
+| configuration | seeds | per-complex r | spread |
+| --- | --- | --- | --- |
+| no-PCA grouped, reg2 | 3 | +0.254 / +0.137 / +0.189 | **0.117** |
+| no-PCA grouped, baseline | 2 | +0.274 / +0.199 | 0.075 |
+| gated fusion, reg2 | 3 | +0.271 / +0.216 / +0.217 | 0.055 |
+| cross-attention reversed, no PCA | 3 | +0.194 / +0.154 / +0.200 | 0.046 |
+| gated fusion, baseline | 2 | +0.282 / +0.261 | 0.020 |
+
+Within a *single fold* it is starker: on fold 1, three seeds of one configuration scored
+pooled r of 0.050, 0.425 and 0.195 — a range of 0.376.
+
+Set against that, the entire architectural ladder:
+
+| change | Δ per-complex r |
+| --- | --- |
+| drop the fold-local PCA for a learned block-diagonal reduction | +0.025 (2 seeds) |
+| cross-attention, structure attending to sequence, vs no attention | −0.030 (3 seeds) |
+| gated fusion vs a plain MLP on the same features | +0.006 (2 seeds) |
+| one MLP head layer instead of two | +0.011 (partial) |
+| heavier regularisation (dropout 0.35, noise 0.25, wd 0.10) | −0.037 to −0.043 (3 seeds) |
+
+**Every one of these sits inside the seed spread of at least one configuration being
+compared.** The rule this imposes: no architectural claim here rests on fewer than three
+seeds. Two claims that were made from partial folds — that dropping the PCA gained +0.062,
+and that heavier regularisation halved the seed spread — reversed when the final fold
+arrived. Both are recorded in `AI_PROMPTS.md` rather than quietly dropped.
+
+## 10. Fusion mechanism is not the binding constraint
+
+Six ways of combining sequence and structure were built and measured on the frozen split.
+The control that matters — the same model with the fusion deleted — was missing until late,
+and it changes the reading of the whole family.
+
+| fusion | per-complex r | vs the no-structure control (+0.212) |
+| --- | --- | --- |
+| gated fusion, vector gates over both modalities | +0.282 | +0.070 |
+| FiLM on the structure delta | +0.227 | +0.015 |
+| cross-attention, structure → sequence | +0.204 | −0.008 |
+| cross-attention, sequence → structure, weighted residual | +0.199 | −0.013 |
+| cross-attention, separate MPNN projection | +0.192 | −0.020 |
+
+Four of five attention variants score at or below a model with the attention removed. A
+learned interaction between the modalities does not pay for itself. The one mechanism that
+looks ahead, gated fusion, is +0.070 on two seeds whose own spread is 0.020, and it loses
+0.037 the moment its regularisation is changed.
+
+Against all of this, **the largest single gain in the ladder came from features, not
+architecture**: adding 26 substitution-chemistry columns to the same network moved it from
++0.191 to +0.266.
+
+## 11. The networks ride homology; the forest does not
+
+Two splits over the same 940 rows. `frozen5` withholds whole complexes; `cluster` withholds
+whole homology clusters, which is the harder and more honest generalisation test.
+
+| model | by complex | by homology cluster | retained |
+| --- | --- | --- | --- |
+| random forest, 49 handcrafted columns | +0.361 ρ | **+0.275** | **76%** |
+| our network | +0.246 ρ | +0.084 | **34%** |
+
+The cluster split is harder for both — the forest gives up a quarter — but the network gives
+up two thirds, and 11 of its complexes finish with a *negative* within-complex correlation.
+The collapse is therefore a property of the model rather than of the split: the
+embedding-based network was relying on homology that the cluster split withholds, and the
+handcrafted columns were not.
+
+This is the strongest single argument in the repository for preferring the forest, and it is
+why "use a larger encoder" does not appear in the next steps.
+
+## 12. It is not a bookkeeping bug — the alignment is verified
+
+Before accepting a ceiling near +0.27 for the networks, four ways the mutation could be in
+the wrong place were checked. Each would look identical from a loss curve. Run with
+`make align`.
+
+| check | result |
+| --- | --- |
+| residue at the index equals the mutation string's WT residue | **0 mismatches across 1,726 sites in all 940 rows** |
+| WT and MT sequences differ only at the recorded sites, same length | **0 violations** — rules out SEQRES-vs-ATOM and chain mix-up |
+| ‖δ‖ = ‖t_mt − t_wt‖ peaked at the mutated residues | mutated sites occupy the **top k on 97% of sides** |
+| magnitude of that peak | median **22×** the median residue, minimum 2.4× |
+
+The peak test is judged on top-k rather than on rank 0 deliberately: with k mutations on one
+side only one *can* be rank 0, so a rank-0 threshold marks every multi-point row a failure by
+arithmetic and reports "suspect" on data that is clean — which is what the first version of
+this check did.
+
+The ceiling is the model and the task, not the pipeline.
+
+## 13. What limits performance, ranked
+
+1. **Data volume.** 752 training rows per fold, 32 complexes with enough rows to score. The
+   seed spread in §9 is what that looks like from the inside. No regularisation setting
+   removed it: raising dropout 75%, noise 150% and weight decay tenfold cost 0.037–0.043 on
+   two different architectures and reduced variance on neither.
+2. **Label noise.** Within-complex label standard deviation has a median of 1.104 kcal/mol,
+   and repeated (complex, mutation) measurements in SKEMPI disagree at a scale that caps any
+   achievable correlation.
+3. **Between-complex variance swamping within-complex signal**, which is §8 — it makes the
+   obvious metric the wrong one and rewards the wrong features.
+4. **Representation, last.** Six probes, three protein language models, two structure
+   encoders, and the sequence arm still does not clear zero. Twenty-six columns of
+   substitution chemistry outperform 1280-dimensional embeddings of the same mutation.
+
+**Capacity is not on this list.** Shrinking the model 64→32 cost 0.035; growing the head from
+32k to 82k parameters gained 0.032; removing an entire head layer — 16,512 parameters, 31% of
+the model — cost nothing measurable. A model that is insensitive to a third of its parameters
+is not capacity-limited.
