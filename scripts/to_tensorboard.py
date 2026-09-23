@@ -106,6 +106,22 @@ def results_csv(d: pathlib.Path) -> pd.DataFrame | None:
     return None
 
 
+def fresh(d: pathlib.Path) -> pathlib.Path:
+    """Empty a run directory before writing it.
+
+    EventFileWriter APPENDS, and TensorBoard reads every event file in a directory. Without
+    this, re-running the mirror draws each scalar once per run: run/epochs came back as 52
+    points for 5 folds, the same five values repeating, and a curve that looks nothing like
+    the number it reports.
+    """
+    if d.exists():
+        for f in d.iterdir():
+            if f.is_file():
+                f.unlink()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def write_curves(run: str, hist: pd.DataFrame) -> int:
     from tb_writer import Writer as SummaryWriter
 
@@ -119,7 +135,7 @@ def write_curves(run: str, hist: pd.DataFrame) -> int:
             continue
         step = (pd.to_numeric(g.epoch, errors="coerce").fillna(0).astype(int).tolist()
                 if "epoch" in g.columns else list(range(len(g))))
-        w = SummaryWriter(str(TB / f"{run}__fold{int(f)}"))
+        w = SummaryWriter(str(fresh(TB / f"{run}__fold{int(f)}")))
         for tag, names in CURVES.items():
             s = pick(g, names)
             if s is None:
@@ -200,7 +216,7 @@ def mirror(run: str, d: pathlib.Path) -> dict:
         except Exception as e:                  # a malformed history must not stop the rest
             print(f"  {run}: history skipped ({type(e).__name__}: {e})")
 
-    w = SummaryWriter(str(TB / run))
+    w = SummaryWriter(str(fresh(TB / run)))
     summary = {"run": run, "curves": n_curves}
 
     res = results_csv(d)
