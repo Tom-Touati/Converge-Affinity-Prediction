@@ -67,6 +67,10 @@ class Cache:
         self.tok = AutoTokenizer.from_pretrained(TOKENIZER)
         self.crops = np.load(ROOT / "perturb_crops.npz", allow_pickle=False)
         self._mpnn = {}
+        # The project's handcrafted columns, if they were shipped. Standardisation is
+        # fold-local and happens in run_fold, not here.
+        f = ROOT / "chem_perturb.parquet"
+        self.chem = pd.read_parquet(f).set_index("row_id") if f.exists() else None
 
     def tokens(self, s):
         k = self.tok(s, return_tensors="np")["input_ids"][0].astype(np.int32).tobytes()
@@ -123,13 +127,14 @@ def fold_pca(rows, fold, cache, dim, seed=0):
 
 
 class DS(Dataset):
-    def __init__(self, frame, pcas, cache, cfg, augment, seed, memo=None):
+    def __init__(self, frame, pcas, cache, cfg, augment, seed, memo=None, chem=None):
         self.f = frame.reset_index(drop=True)
         self.p_seq, self.p_str = pcas
         self.c, self.cfg = cache, cfg
         self.augment, self.rng = augment, np.random.default_rng(seed)
         self.bl = blosum62()
         self.memo = memo if memo is not None else {}
+        self.chem = chem          # already standardised, indexed by row_id
 
     def seq_at(self, s, idx):
         key = (s, "seq")
@@ -180,7 +185,10 @@ class DS(Dataset):
 
         b_ab_wt, b_ab_mt = blos(c["ab_site"], len(c["ab_idx"]), c["ab_wt_aa"], c["ab_mt_aa"])
         b_ag_wt, b_ag_mt = blos(c["ag_site"], len(c["ag_idx"]), c["ag_wt_aa"], c["ag_mt_aa"])
-        return dict(seq_ab_wt=s_ab_wt, seq_ab_mt=s_ab_mt, seq_ag_wt=s_ag_wt, seq_ag_mt=s_ag_mt,
+        chem = (self.chem.loc[r.row_id].values.astype(np.float32)
+                if self.chem is not None else np.zeros(0, np.float32))
+        return dict(chem=chem,
+                    seq_ab_wt=s_ab_wt, seq_ab_mt=s_ab_mt, seq_ag_wt=s_ag_wt, seq_ag_mt=s_ag_mt,
                     struct_ab=t_ab, struct_ag=t_ag,
                     blosum_ab_wt=b_ab_wt, blosum_ab_mt=b_ab_mt,
                     blosum_ag_wt=b_ag_wt, blosum_ag_mt=b_ag_mt,
@@ -221,6 +229,8 @@ def collate(items):
         dd = x["dist"]; d[i, :dd.shape[0], :dd.shape[1]] = dd
     out["dist"] = torch.from_numpy(d)
     out["dist_bins"] = distance_bins(torch.from_numpy(d))
+    if len(items[0].get("chem", ())):
+        out["chem"] = torch.from_numpy(np.stack([x["chem"] for x in items]))
     out["y"] = torch.tensor([x["y"] for x in items])
     out["row_id"] = [x["row_id"] for x in items]
     return out
@@ -348,8 +358,18 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
     val = tr_all[tr_all.complex_key.isin(val_cx)]
 
     memo = {}                                  # one PCA cache shared by all three splits
-    mk = lambda f, a: DataLoader(DS(f, pcas, cache, cfg, a, seed, memo), batch_size=BATCH,
-                                 shuffle=a, collate_fn=collate, num_workers=0)
+    chem = None
+    if getattr(cfg, "chem_dim", 0) and cache.chem is not None:
+        # Mean and sd from the TRAINING folds only. Standardising over everything would let
+        # the held-out complexes set the scale the model is trained on -- small, silent, and
+        # exactly the kind of leakage that makes a number look better than it is.
+        c_all = cache.chem
+        mu = c_all.loc[tr_all.row_id].mean()
+        sd = c_all.loc[tr_all.row_id].std().replace(0.0, 1.0)
+        chem = ((c_all - mu) / sd).astype(np.float32)
+    mk = lambda f, a: DataLoader(DS(f, pcas, cache, cfg, a, seed, memo, chem),
+                                 batch_size=BATCH, shuffle=a, collate_fn=collate,
+                                 num_workers=0)
     tr, va, te = mk(train, augment), mk(val, False), mk(test, False)
 
     model = make_model(cfg).to(device)

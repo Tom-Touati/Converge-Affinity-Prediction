@@ -179,6 +179,14 @@ class MLPConfig:
     dropout: float = 0.2
     input_noise: float = 0.0
     feature_dropout: float = 0.0
+    #: Concatenate the project's handcrafted columns (chem + ProteinMPNN log-likelihood
+    #: ratios) to the pooled delta. The forest that beats every net here uses these, so
+    #: giving them to the net separates "the features are better" from "the model class is
+    #: better". They are standardised with fold-local statistics before they are seen,
+    #: because d_volume runs to hundreds while d_charge is a small integer, and a single
+    #: LayerNorm over a vector that is 512 embedding dimensions and 26 chemistry columns
+    #: would normalise the chemistry into irrelevance.
+    chem_dim: int = 0
 
 
 class PerturbMLP(nn.Module):
@@ -188,17 +196,17 @@ class PerturbMLP(nn.Module):
         # Both sides concatenated. A side with no mutation contributes zeros, so the head
         # can tell "no antigen-side mutation" from "an antigen-side mutation of zero size".
         d = c.pca_dim * 2
-        blocks: list[nn.Module] = [nn.LayerNorm(d)]
+        # The embedding half is normalised on its own; the chemistry arrives already
+        # standardised and is concatenated after, so neither rescales the other.
+        self.norm = nn.LayerNorm(d, elementwise_affine=False)
+        d += c.chem_dim
+        blocks: list[nn.Module] = []
         for _ in range(c.layers):
             # bias-free, so an all-zero input (a null edit) maps to exactly zero
             blocks += [nn.Linear(d, c.hidden, bias=False), nn.GELU(), nn.Dropout(c.dropout)]
             d = c.hidden
         blocks += [nn.Linear(d, 1, bias=False)]
         self.net = nn.Sequential(*blocks)
-        # LayerNorm has an affine bias that would break the null-edit property; drop it.
-        self.net[0].elementwise_affine = False
-        self.net[0].weight = None
-        self.net[0].bias = None
 
     def forward(self, batch) -> torch.Tensor:
         c = self.cfg
@@ -217,4 +225,7 @@ class PerturbMLP(nn.Module):
                     m = keep.to(wt.dtype) / (1.0 - c.feature_dropout)
                     wt, mt = wt * m, mt * m
             parts.append(site_mean(mt - wt, batch[f"site_{side}"]))
-        return self.net(torch.cat(parts, dim=-1)).squeeze(-1)
+        z = self.norm(torch.cat(parts, dim=-1))
+        if c.chem_dim:
+            z = torch.cat([z, batch["chem"]], dim=-1)
+        return self.net(z).squeeze(-1)

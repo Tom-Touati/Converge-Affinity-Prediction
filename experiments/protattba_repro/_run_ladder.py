@@ -52,6 +52,15 @@ LADDER = [
     ("mlp_delta_pca128_reg", {"arch": "mlp", "pca_dim": 128,
                               "input_noise": 0.1, "feature_dropout": 0.2}),
 
+    # --- the ESM delta plus the forest's own columns (chem + ProteinMPNN log-likelihood
+    # ratios, 26 of them). The forest beats every net here; this separates "the features
+    # are better" from "the model class is better". chem_only is the control: the same
+    # head on the chemistry ALONE, with no embedding at all.
+    ("mlp_delta_chem_reg", {"arch": "mlp", "hidden": 128, "layers": 2, "chem_dim": 26,
+                            "input_noise": 0.1, "feature_dropout": 0.2}),
+    ("mlp_chem_only", {"arch": "mlp", "hidden": 128, "layers": 2, "chem_dim": 26,
+                       "pca_dim": 1, "input_noise": 0.0, "feature_dropout": 0.0}),
+
     # width 64 (41,792 params) and width 32 (15,008: 25 per training row, against 85 for
     # the attention model, which is what the overfitting measurement asks for)
     ("v5_simple", dict(SIMPLE)),
