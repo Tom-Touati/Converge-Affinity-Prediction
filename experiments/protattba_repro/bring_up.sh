@@ -15,6 +15,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 S=${1:?usage: bring_up.sh <session-name>}
+PYBIN=${PYBIN:-$HERE/experiments/protattba_repro/.venv_protattba/Scripts/python.exe}
 WSLROOT=$(wsl -e wslpath -a "$(cygpath -w "$HERE")" | tr -d '\r')
 cd "$HERE"
 
@@ -53,18 +54,27 @@ push experiments/protattba_repro/cache/project_sequences.parquet project_sequenc
 [ -f data/features/chem_perturb.parquet ] && \
   push data/features/chem_perturb.parquet chem_perturb.parquet
 
-echo "== finished results, so the runner skips them =="
-n=0
+echo "== results pushed back, so the runner resumes rather than restarts =="
+# PARTIAL runs go back too, not just complete ones. The trainer already skips any
+# (fold, seed) it finds in the results file, so pushing a one-fold table back turns a
+# rebuild into a resume. Sessions last about 40 minutes of GPU and the ESM bootstrap
+# eats 30 of them, so a five-fold run does NOT fit in one session -- without this the
+# no-PCA run was lost twice at exactly the same fold.
+n=0; part=0
 for d in reports/perturb_*/; do
   e=$(basename "$d" | sed 's/^perturb_//')
   f="$d/${e}_results.csv"
   [ -f "$f" ] || continue
-  [ "$(tail -n +2 "$f" | wc -l | tr -d ' ')" -ge 5 ] || continue
+  k=$(tail -n +2 "$f" | wc -l | tr -d ' ')
+  [ "${k:-0}" -ge 1 ] || continue
+  # The two files are grabbed as separate transfers, so the OOF table can be a fold
+  # AHEAD of the results table; resuming from that pair scores a fold twice.
+  [ -f "results/oof/$e.csv" ] &&     "$PYBIN" experiments/protattba_repro/reconcile_partial.py       "$f" "results/oof/$e.csv" >/dev/null 2>&1
   push "$f" "out/${e}_results.csv"
   [ -f "results/oof/$e.csv" ] && push "results/oof/$e.csv" "out/${e}_oof.csv"
-  n=$((n + 1))
+  if [ "$k" -ge 5 ]; then n=$((n + 1)); else part=$((part + 1)); echo "    partial $e: $k folds"; fi
 done
-echo "  $n finished configurations pushed back"
+echo "  $n complete, $part partial configurations pushed back"
 
 echo "== bootstrap, then the ladder =="
 wsl_ "timeout 300 colab exec -s $S" <<'PY' 2>&1 | tail -1
@@ -82,7 +92,11 @@ PY
 # launched four configurations with no poller running -- the collector had been killed
 # separately -- and the session was reclaimed before anything was pulled, losing all four.
 # Nothing should be able to train on that VM without something collecting it.
-pkill -f "pull_ladder.sh" 2>/dev/null
+# `pkill -f` cannot see Windows processes from Git Bash: it matched nothing every time,
+# silently, and each rebuild leaked another collector. Sixteen were found running at once,
+# all polling `colab download` in a loop against sessions that no longer existed. Kill by
+# PID through PowerShell, which can, and print the count so a failure is visible.
+powershell -NoProfile -ExecutionPolicy Bypass -File \n  "$(cygpath -w "$HERE/experiments/protattba_repro/kill_collectors.ps1")"
 sleep 1
 SESSION=$S nohup bash "$HERE/experiments/protattba_repro/pull_ladder.sh" 180 \
   > /tmp/pull_$S.log 2>&1 &

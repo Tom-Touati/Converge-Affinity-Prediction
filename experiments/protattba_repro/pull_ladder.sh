@@ -19,14 +19,18 @@ HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 SESSION=${SESSION:-pt}
 EVERY=${1:-180}
 PYBIN=${PYBIN:-$HERE/experiments/protattba_repro/.venv_protattba/Scripts/python.exe}
-EXPS="st64_xattn_r01 st64_nochem"
+# Overridable so two sessions can be collected side by side without one
+# clobbering the other's mirror or its stop condition.
+EXPS=${EXPS:-"st64_xattn_rev"}
 # the same worktree, as WSL sees it
 WSLROOT=$(wsl -e wslpath -a "$(cygpath -w "$HERE")" | tr -d '\r')
 
 cd "$HERE"
 
 grab() {   # grab <remote-path> <local-path>
-  wsl -e bash -lc "cd '$WSLROOT' && timeout 240 colab download -s $SESSION '$1' '$2'" \
+# 240s per file meant a pass over two runs could take 24 minutes -- longer than
+# the session itself, so a reclaimed run was never collected at all.
+  wsl -e bash -lc "cd '$WSLROOT' && timeout 60 colab download -s $SESSION '$1' '$2'" \
     >/dev/null 2>&1
 }
 
@@ -60,6 +64,6 @@ while true; do
     n=${n// /}
     [ "${n:-0}" -ge 5 ] && done_n=$((done_n + 1))
   done
-  [ "$done_n" -ge 2 ] && { echo "ladder complete"; break; }
+  [ "$done_n" -ge "$(echo $EXPS | wc -w)" ] && { echo "ladder complete"; break; }
   sleep "$EVERY"
 done
