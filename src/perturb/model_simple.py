@@ -455,6 +455,17 @@ class SiteTokenConfig:
     #: combining the two modalities had never actually been run -- which makes it the
     #: missing control for all three of them.
     concat_struct: bool = False
+    #: Pool the structure over the whole binding AREA (the crop mask) instead of over the
+    #: mutated residues. The two modalities then answer different questions: the sequence
+    #: says what the substitution is, the structure says what kind of pocket it sits in.
+    #: ProteinMPNN encodes local geometry per residue, so a mean over the interface is a
+    #: reasonable description of the environment, where a mean over one residue is not.
+    #:
+    #: Watch this one. The area pool is nearly constant across mutations of a complex --
+    #: the crop moves a little with the site, but most of it does not -- and a channel that
+    #: identifies the complex scores +0.672 pooled and +0.000 per complex (ERROR_ANALYSIS
+    #: section 8). Expect pooled r to rise; per-complex r is the number that matters.
+    struct_area_pool: bool = False
     input_noise: float = 0.0
     feature_dropout: float = 0.0
 
@@ -587,6 +598,25 @@ class PerturbSiteToken(nn.Module):
         blocks += [nn.Linear(d, 1)]
         self.mlp = nn.Sequential(*blocks)
 
+    def _struct_vec(self, batch, px, tok_proj) -> torch.Tensor:
+        """One vector per row describing the wild-type structure at the mutation.
+
+        Pooled over the mutated residues by default, or over the whole crop -- the binding
+        area -- when ``struct_area_pool`` is set. Only the wild-type structure exists; there
+        is no mutant structure, so this term is the same for both branches and cancels from
+        nothing.
+        """
+        c = self.cfg
+        key = "mask" if c.struct_area_pool else "site"
+        z = 0
+        for side in ("ab", "ag"):
+            st = px(batch[f"struct_{side}"])
+            if self.gr_str is not None:
+                st = self.gr_str(st)
+            stp = self.mpnn_proj(st) if self.mpnn_proj is not None else tok_proj(st)
+            z = z + site_mean(stp, batch[f"{key}_{side}"])
+        return z
+
     def forward(self, batch) -> torch.Tensor:
         c = self.cfg
         # The scale and the dropout mask are per WIDTH. They used to be taken once from
@@ -660,14 +690,7 @@ class PerturbSiteToken(nn.Module):
         tok_mt = sum(tokens("mt", s) for s in ("ab", "ag"))
         if c.gated_fusion:
             z_seq = self.norm_tok[0](tok_mt - tok_wt)
-            z_str = 0
-            for side in ("ab", "ag"):
-                st = px(batch[f"struct_{side}"])
-                if self.gr_str is not None:
-                    st = self.gr_str(st)
-                stp = self.mpnn_proj(st) if self.mpnn_proj is not None else tok_proj(st)
-                z_str = z_str + site_mean(stp, batch[f"site_{side}"])
-            z_str = self.norm_str(z_str)
+            z_str = self.norm_str(self._struct_vec(batch, px, tok_proj))
             ch = batch["chem"] if c.chem_dim else z_seq[:, :0]
             g = torch.sigmoid(self.gate(torch.cat([z_seq, z_str, ch], dim=-1)))
             zs = z_seq.shape[-1]
@@ -684,14 +707,7 @@ class PerturbSiteToken(nn.Module):
                 pooled = (x * m).sum(1) / m.sum(1).clamp(min=1.0)
                 parts.append(self.norm_pool[i](pooled))
         if c.concat_struct:
-            z_str = 0
-            for side in ("ab", "ag"):
-                st = px(batch[f"struct_{side}"])
-                if self.gr_str is not None:
-                    st = self.gr_str(st)
-                stp = self.mpnn_proj(st) if self.mpnn_proj is not None else tok_proj(st)
-                z_str = z_str + site_mean(stp, batch[f"site_{side}"])
-            parts.append(self.norm_str(z_str))
+            parts.append(self.norm_str(self._struct_vec(batch, px, tok_proj)))
         if c.chem_dim:
             parts.append(batch["chem"])
         return self.mlp(torch.cat(parts, dim=-1)).squeeze(-1)

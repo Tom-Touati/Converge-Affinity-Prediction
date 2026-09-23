@@ -59,46 +59,35 @@ REG3 = {"dropout": 0.50, "input_noise": 0.40, "feature_dropout": 0.50, "wd": 0.3
 GF = dict(ST, use_site_pool=False, chem_dim=26, gated_fusion=True, mpnn_proj=64)
 NP = dict(ST, use_site_pool=False, chem_dim=26, **NOPCA)
 
+#: Clip at 10 rather than 5. The measured global gradient norm is 5.0-5.3, so a threshold of
+#: 5 rescaled about half of all steps and left the other half alone -- the most intermittent
+#: setting available, and one that differed systematically between arms because the heavier
+#: regularisation levels clip more often. At 10 essentially nothing reaches it.
+CLIP10 = {"grad_clip": 10.0}
+
+#: The night queue. Sequence read AT the mutation, structure read as the mean of the binding
+#: AREA -- the two modalities answering different questions rather than both being asked
+#: what is at the mutated residue.
+AREA = dict(ST, use_site_pool=False, chem_dim=26, mpnn_proj=64, layers=1,
+            struct_area_pool=True, seeds=[0, 1, 2], **REG2, **CLIP10)
+
 LADDER = [
-    # The two attention directions, still in flight when the regularisation sweep was
-    # added. They stay at the head of the list so a rebuilt session resumes them instead
-    # of abandoning them part-finished.
-    ("st64_xattn_rev_nopca", dict(ST, use_site_pool=False, chem_dim=26, cross_attn=True,
-                                  n_heads=4, mpnn_proj=64, seeds=[0, 1, 2],
-                                  attn_direction="struct_to_seq", **NOPCA)),
-    ("st64_xattn_fwd_nopca", dict(ST, use_site_pool=False, chem_dim=26, cross_attn=True,
-                                  n_heads=4, mpnn_proj=64, seeds=[0, 1, 2],
-                                  attn_direction="seq_to_struct", **NOPCA)),
-    # Three seeds each, because a single seed cannot resolve anything this size: the
-    # no-PCA pair came back +0.274 and +0.199 on seeds 0 and 1.
-    # PCA-128 on both modalities, pooled at the mutated residues, CONCATENATED, one MLP
-    # head, under the heavy regularisation. This is the plainest possible fusion of the
-    # two modalities and it had never been run: structure could previously only enter via
-    # a gate, a FiLM or an attention, so all three were being compared against a model
-    # with no structure at all rather than against simple concatenation.
-    ("cat128_reg2", dict(ST, use_site_pool=False, chem_dim=26, concat_struct=True,
-                         mpnn_proj=64, seeds=[0, 1, 2], **REG2)),
-    ("cat128_reg3", dict(ST, use_site_pool=False, chem_dim=26, concat_struct=True,
-                         mpnn_proj=64, seeds=[0, 1, 2], **REG3)),
-    ("gf_reg2", dict(GF, seeds=[0, 1, 2], **REG2)),
-    ("nopca_reg2", dict(NP, seeds=[0, 1, 2], **REG2)),
-    ("gf_reg3", dict(GF, seeds=[0, 1, 2], **REG3)),
-    # One hidden layer in the head instead of two. Measured on the running jobs, 45-59%
-    # of all gradient energy sits in that MLP -- more than in the projections that build
-    # the representation -- and the second 128x128 block is 16,512 parameters, 31% of the
-    # concat model. On 752 training rows the question is whether it buys anything or just
-    # adds capacity to fit noise.
+    # finish what is already part-run, at the old clip, so they stay comparable
     ("cat128_reg2_l1", dict(ST, use_site_pool=False, chem_dim=26, concat_struct=True,
                             mpnn_proj=64, layers=1, seeds=[0, 1, 2], **REG2)),
-    # The same model with clipping effectively off. The threshold sat at 5.0 while the
-    # measured gradient norm was 5.0-5.3, so half the steps were rescaled and half were
-    # not, and the heavier regularisation arms clipped far more often than the baselines
-    # they were being compared against. This says whether any of that mattered.
     ("cat128_reg2_l1_noclip", dict(ST, use_site_pool=False, chem_dim=26, concat_struct=True,
                                    mpnn_proj=64, layers=1, seeds=[0, 1, 2],
                                    grad_clip=20.0, **REG2)),
-    ("gf_reg2_l1", dict(GF, layers=1, seeds=[0, 1, 2], **REG2)),
-    ("nopca_reg3", dict(NP, seeds=[0, 1, 2], **REG3)),
+
+    # 1. the new representation, plainly concatenated -- the control for everything below
+    ("area_concat", dict(AREA, concat_struct=True)),
+
+    # 2-4. the three fusion mechanisms on top of it, in the order they earned: gated fusion
+    # is the only one that ever cleared its control, FiLM was second, attention never did.
+    ("area_gated", dict(AREA, gated_fusion=True)),
+    ("area_film", dict(AREA, film_struct=True)),
+    ("area_xattn", dict(AREA, cross_attn=True, n_heads=4,
+                        attn_direction="struct_to_seq")),
 ]
 
 
