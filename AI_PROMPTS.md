@@ -253,3 +253,109 @@ external repository's logic runs on this infrastructure and lands on its publish
 - Assumed the 2 GB GTX 1050 would hold the run with gradient checkpointing. It does not; after
   the CUDA context and the Windows display, PyTorch gets about 900 MB and it OOMs at batch 12
   regardless.
+
+---
+
+## Session, 2026-09-23/24 — the perturbation fusion ladder, and what it is measuring
+
+The longest session so far, and the one that changed what we believe. It set out to find a
+fusion architecture that beats the forest and instead established that almost none of the
+differences the ladder had been reading were larger than the noise.
+
+> clip large effects at +-4, and the error analysis tab doesnt seem to respond to a change in
+> run selection
+
+> i cant seem to understand anything from this dashboard. transfer it to something like
+> tensorboard or other opensource visualization
+
+> i want to try a simpler model. pca to 128. layer norm, linear layer. delta seq -> film
+> structure, mean site, concat modalities -> MLP
+
+> we have to normalize the subtracted data and the non subtracted data separately
+
+> can we cross attend with 32 per head, 2 heads, after the 128>64? what is the param count
+
+> lets create one version where the modalities are reversed, with structure attending to
+> sequence
+
+> try one without the pca, just group each 128 to 16 in the net
+
+> the no-pca is more important. what is the architecture you used to train antiberty data?
+
+> check if The mutant embeddings are wrong. Off-by-one from insertion codes, a chain mix-up,
+> or the substitution applied to the SEQRES sequence instead of the ATOM-derived one. [...]
+> If ‖δ‖ isn't sharply peaked at the site, the alignment is broken and everything downstream
+> is noise.
+
+> we have to try the most promising models and add more intense regularization
+
+> lets try also pca to 128 / then concat modalities with mlp head / with strong regularization
+
+> run regularisation experiments only. you can use 2 concurrent on same session
+
+> can we remove an mlp head layer?
+
+### What it produced
+
+- `src/perturb/model_simple.py` grown into four model families with a shared config:
+  `PerturbSimple`, `PerturbMLP`, `PerturbTwoTower` and `PerturbSiteToken`, the last carrying
+  cross-attention in both directions, FiLM, gated fusion, plain concatenation, and a
+  block-diagonal `GroupedReduce` that replaces the PCA.
+- `scripts/report_runs.py` — the results table, every run on one common truth, with the
+  complex-mean floor printed underneath it.
+- `src/perturb/check_alignment.py` — the four-part mutation alignment check.
+- `experiments/protattba_repro/reconcile_partial.py` and fold-level resume in `bring_up.sh`,
+  without which nothing survived a reclaimed session.
+- `scripts/to_tensorboard.py` and `scripts/tb_writer.py` — a one-way mirror of `reports/` into
+  TensorBoard, writing event protos directly because torch stopped importing on this machine.
+
+### Findings worth keeping
+
+- **Pooled Pearson mostly measures complex identity.** Predicting each complex's own mean
+  scores **+0.672 pooled and +0.000 per complex**, beating every model here on the first and
+  being useless for design on the second. Every table since reports per-complex first.
+- **The seed spread is larger than almost every effect the ladder was reading.** Per-complex
+  Pearson moved 0.075 between two seeds of the same configuration; within a single fold,
+  pooled Pearson ranged 0.049 to 0.425 across three seeds. The attention family, FiLM, gated
+  fusion versus the plain MLP, and PCA versus no PCA are all separated by less than that.
+- **Cross-attention over ProteinMPNN is worth nothing.** Against `st64_noattn` -- the control
+  with the attention deleted, which the ladder had been missing -- four of five variants score
+  at or below it. Removing the PCA did not rescue it: three seeds of the reversed direction
+  average +0.182 against +0.237 for the same model with no attention at all.
+- **Heavier regularisation does not help.** Gated fusion on identical folds: +0.272 at the
+  baseline settings against +0.235 with dropout 0.35, noise 0.25, feature-dropout 0.35 and
+  weight decay 0.10. It costs accuracy and does not reduce the seed spread.
+- **The networks ride homology; the forest does not.** Under the homology-cluster split the
+  forest keeps 76% of its per-complex rho (0.361 -> 0.275) while our networks keep 34%
+  (0.246 -> 0.084). The forest on that split had never been run before this session.
+- **The embeddings are not misaligned.** Over all 940 rows and 1,726 mutated sites, zero
+  residue-letter mismatches and no difference between the WT and MT strings outside the
+  recorded sites; ‖δ‖ puts the mutated sites in the top k of the whole sequence on 97% of
+  sides, at a median of 22x the median residue. The ~0.27 ceiling is the model and the task.
+- **AntiBERTy loses to ESM-2 on the antibody side** by 0.046 on a same-session control, in a
+  model where the antigen stays ESM-2 and one shared projection serves both.
+
+### Assistant errors and corrections during the session
+
+- **Claimed dropping the PCA was the session's biggest win, at +0.062 over its control and
+  "three times the seed noise".** The seed replicate came back at +0.199 against the first
+  seed's +0.274, so the gain is +0.025 against a 0.075 spread and is not established. The
+  "most fold-stable model we have" claim went with it -- that was one seed.
+- **Claimed heavy regularisation halved the seed spread**, from four folds. The fifth fold
+  reversed it: 0.055 against 0.020. Two conclusions drawn from partial folds, both wrong, and
+  after the second the rule became to report only complete runs.
+- **Called cross-attention "ahead on every fold"** after reading pooled Pearson over four
+  folds. Per-complex over five it was -0.012.
+- **Said high gradient clipping "effectively caps the learning rate"**, which is the SGD
+  intuition. Under AdamW a uniform rescale largely cancels in m/√v; the real effect is that
+  the clipping is intermittent.
+- **Asserted a FiLM "starved gradient" mechanism from input scale.** Measured on real data the
+  ratio was 1.3x, which cannot explain a 40x difference. Retracted; the real asymmetry was
+  zero-initialised gamma/beta against a default-initialised branch.
+- **Reported "16 collectors running"** when that was 16 bash processes, several of them
+  subshells of the same collector.
+- Wrote the alignment check to judge peakedness on rank 0, which marks every multi-point row a
+  failure by arithmetic -- one site of k can be rank 0 -- and printed "the alignment is
+  suspect" on data that is clean. Fixed to judge on top-k.
+- Killed the collector during a cleanup and launched four configurations with nothing
+  collecting them; all four were lost to a reclaim.
