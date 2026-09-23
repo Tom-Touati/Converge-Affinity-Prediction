@@ -61,6 +61,13 @@ AA_INDEX = {a: i for i, a in enumerate(AA)}
 # ran on that, and validation Pearson barely tracked test Pearson (fold 2: val +0.245 ->
 # test +0.461; fold 1: val +0.641 -> test +0.266). 0.20 roughly doubles it.
 BATCH, LR, WD, PATIENCE, VAL_FRACTION = 32, 3e-4, 1e-2, 10, 0.20
+#: Gradient-norm clip. It sat at 5.0 while the measured norm was 5.0-5.3, so about
+#: half of all steps were rescaled and half were not -- the most intermittent
+#: setting available, and the one where clipping distorts AdamW's m/sqrt(v) most.
+#: It also differed systematically between arms: the heavier regularisation levels
+#: inject more noise, clip more often, and were being compared against configs that
+#: clipped far less. Set it well above the norm to turn clipping off.
+GRAD_CLIP = 5.0
 
 
 def blosum62():
@@ -491,9 +498,10 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
             x = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
             loss = lf(model(x), b["y"].to(device))
             opt.zero_grad(); loss.backward()
-            for gk, gv in grad_report(model, 5.0).items():
+            for gk, gv in grad_report(model, GRAD_CLIP).items():
                 gstat[gk] = gstat.get(gk, 0.0) + gv
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0); opt.step()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            opt.step()
             tot += float(loss.detach()); ns += 1
         gstat = {gk: gv / max(ns, 1) for gk, gv in gstat.items()}
         model.eval(); p, t, vids = [], [], []
@@ -565,6 +573,8 @@ def main():
     ap.add_argument("--no-pca", action="store_true",
                     help="skip the fold-local PCA and hand the model raw embeddings; the "
                          "model must then reduce them itself")
+    ap.add_argument("--grad-clip", type=float, default=None,
+                    help="gradient-norm clip; 20 is effectively off here")
     ap.add_argument("--wd", type=float, default=None,
                     help="AdamW weight decay; the ladder has always used 1e-2")
     ap.add_argument("--lr", type=float, default=None)
@@ -606,14 +616,17 @@ def main():
         rows["ddg"] = rows.ddg.clip(-a.clip, a.clip)
         print(f"clipped |ddG| to {a.clip}: {n} of {len(rows)} rows "
               f"({100 * n / len(rows):.1f}%)", flush=True)
-    global LR, WD, PATIENCE
+    global LR, WD, PATIENCE, GRAD_CLIP
     if a.wd is not None:
         WD = a.wd
     if a.lr is not None:
         LR = a.lr
     if a.patience is not None:
         PATIENCE = a.patience
-    print(f"  optim: lr {LR}, weight_decay {WD}, patience {PATIENCE}", flush=True)
+    if a.grad_clip is not None:
+        GRAD_CLIP = a.grad_clip
+    print(f"  optim: lr {LR}, weight_decay {WD}, patience {PATIENCE}, "
+          f"grad_clip {GRAD_CLIP}", flush=True)
 
     cache = Cache()
     OUT.mkdir(parents=True, exist_ok=True)

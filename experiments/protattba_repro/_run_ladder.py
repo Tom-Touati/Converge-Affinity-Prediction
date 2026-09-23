@@ -90,6 +90,13 @@ LADDER = [
     # adds capacity to fit noise.
     ("cat128_reg2_l1", dict(ST, use_site_pool=False, chem_dim=26, concat_struct=True,
                             mpnn_proj=64, layers=1, seeds=[0, 1, 2], **REG2)),
+    # The same model with clipping effectively off. The threshold sat at 5.0 while the
+    # measured gradient norm was 5.0-5.3, so half the steps were rescaled and half were
+    # not, and the heavier regularisation arms clipped far more often than the baselines
+    # they were being compared against. This says whether any of that mattered.
+    ("cat128_reg2_l1_noclip", dict(ST, use_site_pool=False, chem_dim=26, concat_struct=True,
+                                   mpnn_proj=64, layers=1, seeds=[0, 1, 2],
+                                   grad_clip=20.0, **REG2)),
     ("gf_reg2_l1", dict(GF, layers=1, seeds=[0, 1, 2], **REG2)),
     ("nopca_reg3", dict(NP, seeds=[0, 1, 2], **REG3)),
 ]
@@ -102,9 +109,9 @@ def run(name: str, ov: dict) -> int:
     arch = ov.pop("arch", "v2")
     flags = list(ov.pop("flags", []))
     # optimiser settings are CLI flags, not config fields
-    for k in ("wd", "lr", "patience"):
+    for k in ("wd", "lr", "patience", "grad_clip"):
         if k in ov:
-            flags += [f"--{k}", str(ov.pop(k))]
+            flags += ["--" + k.replace("_", "-"), str(ov.pop(k))]
     seeds = ov.pop("seeds", [ov.pop("seed", 0)])
     seeds = [str(x) for x in (seeds if isinstance(seeds, list) else [seeds])]
     cmd = [sys.executable, "_perturb_v2_colab.py", "--exp", name, "--arch", arch,
