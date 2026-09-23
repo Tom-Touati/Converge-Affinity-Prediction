@@ -16,10 +16,10 @@
 #   SESSION=pe bash experiments/protattba_repro/pull_ladder.sh [every_seconds]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
-SESSION=${SESSION:-pe}
+SESSION=${SESSION:-ph}
 EVERY=${1:-180}
 PYBIN=${PYBIN:-$HERE/experiments/protattba_repro/.venv_protattba/Scripts/python.exe}
-EXPS="v3_base v3_site v3_indep v3_reg v3_sitemean v3_noaug v3_site_reg v4_noblosum v4_noblosum_reg"
+EXPS="v5_simple v5_simple_w32 v5_simple_w32_reg v5_simple_noseqstruct v4_sm_nb v4_sm_nb_reg v3_noaug v3_site_reg"
 # the same worktree, as WSL sees it
 WSLROOT=$(wsl -e wslpath -a "$(cygpath -w "$HERE")" | tr -d '\r')
 
@@ -58,6 +58,6 @@ while true; do
     n=${n// /}
     [ "${n:-0}" -ge 5 ] && done_n=$((done_n + 1))
   done
-  [ "$done_n" -ge 9 ] && { echo "ladder complete"; break; }
+  [ "$done_n" -ge 8 ] && { echo "ladder complete"; break; }
   sleep "$EVERY"
 done

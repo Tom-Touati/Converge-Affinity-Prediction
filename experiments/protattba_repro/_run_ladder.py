@@ -1,6 +1,6 @@
-"""Run the v3 ablation ladder on the VM, one configuration after another.
+"""Run the ablation ladder on the VM, one configuration after another.
 
-Sequential inside a single process, so nothing polls for anything. The previous attempt
+Sequential inside a single process, so nothing polls for anything. An earlier attempt
 chained jobs with ``while pgrep -f ...``; each waiter's pattern matched the OTHER waiter's
 own command line, so neither ever saw the queue empty and the GPU sat idle. Here the order
 is just the order of the list.
@@ -8,11 +8,13 @@ is just the order of the list.
 Each job is launched with subprocess and an argument LIST, never a shell string, so the
 JSON in --overrides needs no quoting and cannot be mangled by a shell.
 
-Ordered by what is learned per minute, because a session can be reclaimed at any point:
-the baseline and the two questions that motivated the work come first, the controls after.
+Ordered by what is learned per minute, because sessions ARE reclaimed -- three times so
+far, each costing a rebuild. Anything with five folds already on disk is skipped, so a
+rebuilt session resumes rather than restarts; push the finished results back before
+relaunching and nothing is retrained.
 
-    python _run_ladder.py            # everything still missing a results file
-    python _run_ladder.py v3_site    # just these
+    python _run_ladder.py                 # everything still missing a results file
+    python _run_ladder.py abl_no_delta    # just these
 """
 import json
 import subprocess
@@ -23,42 +25,63 @@ from pathlib import Path
 ROOT = Path("/content/perturb")
 OUT = ROOT / "out"
 
-#: (name, config overrides). Every job also gets --clip 4 and --select-on per_complex.
+#: The two changes that actually moved per-complex Pearson, combined. site_mean was the
+#: best single config (+0.172) and dropping BLOSUM the second (+0.165); they had never been
+#: run together. Every abl_* below is this minus one component, so each line answers "what
+#: does this part contribute" against one fixed reference rather than against whatever
+#: happened to be best that hour.
+BASE = {"pool": "site_mean", "use_blosum": False, "film_init": 0.02}
+
+#: The simple model: LayerNorm + Linear, delta-FiLMed structure, mean over the mutated
+#: residues, concat, MLP. No attention, RoPE, distance bias, chain embedding or BLOSUM.
+#: It runs first because it is the one remaining hypothesis with a mechanism behind it,
+#: and because sessions get reclaimed.
+SIMPLE = {"arch": "simple"}
+
 LADDER = [
-    # the new baseline: unchanged pooling, but with the shared-dropout fix, the wider
-    # validation split and per-complex selection. Everything else is measured against it.
-    ("v3_base", {}),
-    # the question that started this: does pooling at the site beat averaging the crop
-    ("v3_site", {"pool": "site"}),
-    # the control for the dropout fix. Same as v3_base with the branches drawing their own
-    # masks again, which is what every earlier run did.
-    ("v3_indep", {"shared_branch_dropout": False}),
-    # regularisation, against 85 parameters per training row
-    ("v3_reg", {"input_noise": 0.1, "feature_dropout": 0.2}),
-    # keep the global view as well as the site, at 59,281 parameters instead of 51,089
-    ("v3_sitemean", {"pool": "site_mean"}),
-    # the reverse-mutation augmentation sets the training target's mean to exactly zero
+    # width 64 (41,792 params) and width 32 (15,008: 25 per training row, against 85 for
+    # the attention model, which is what the overfitting measurement asks for)
+    ("v5_simple", dict(SIMPLE)),
+    ("v5_simple_w32", dict(SIMPLE, width=32, hidden=32)),
+    ("v5_simple_w32_reg", dict(SIMPLE, width=32, hidden=32,
+                               input_noise=0.1, feature_dropout=0.2)),
+    # does ProteinMPNN earn its place once everything else is gone? 16,768 params.
+    ("v5_simple_noseqstruct", dict(SIMPLE, width=32, hidden=32, use_structure=False)),
+
+    # --- the combination, and the combination plus regularisation
+    ("v4_sm_nb", dict(BASE)),
+    ("v4_sm_nb_reg", dict(BASE, input_noise=0.1, feature_dropout=0.2)),
+
+    # --- the two configurations a reclaimed session never got to
     ("v3_noaug", {"_augment": False}),
-    # the two that looked best, together
     ("v3_site_reg", {"pool": "site", "input_noise": 0.1, "feature_dropout": 0.2}),
 
-    # --- v4: BLOSUM out, and the delta path live from step 0.
-    # gamma and beta are zero-initialised, so (1 + gamma(d)) * t + beta(d) == t exactly and
-    # the ESM delta contributes NOTHING at step 0 (measured: 0.000000) while branch.mut
-    # ships with ordinary init and injects BLOSUM immediately (0.048477). The model is
-    # therefore a BLOSUM predictor with learned complex context, and BLOSUM is the one
-    # module carrying more gradient per parameter than attention while being 5% of the
-    # weights. Dropping it without also lifting the FiLM off zero would leave the model
-    # with no mutation signal at all for its first epochs, so the two go together.
-    ("v4_noblosum", {"use_blosum": False, "film_init": 0.02}),
-    # with the regularisation that v3_reg showed is doing real work
-    ("v4_noblosum_reg", {"use_blosum": False, "film_init": 0.02,
-                         "input_noise": 0.1, "feature_dropout": 0.2}),
+    # --- component ablations, each removing one thing from BASE.
+    # Does ProteinMPNN contribute anything, and is it the structure or just the token
+    # count? shuffle is the control: same tensors, positions permuted.
+    ("abl_no_structure", dict(BASE, use_structure=False)),
+    ("abl_shuffle_structure", dict(BASE, shuffle_structure=True)),
+    # With BLOSUM gone the ESM delta is the ONLY carrier of which substitution was made.
+    # Removing it should collapse the model to chance; if it does not, the model is
+    # scoring on something other than the mutation.
+    ("abl_no_delta", dict(BASE, use_delta=False)),
+    ("abl_no_film", dict(BASE, delta_film=False)),
+    # geometry
+    ("abl_no_dist_bias", dict(BASE, dist_bias=False)),
+    ("abl_no_cross_chain", dict(BASE, cross_chain=False)),
+    ("abl_no_chain_emb", dict(BASE, chain_embedding=False)),
+    # the two-branch difference itself, which is the whole premise
+    ("abl_one_branch", dict(BASE, two_branch=False)),
+    ("abl_concat_head", dict(BASE, concat_head=True)),
 ]
 
 
 def run(name: str, ov: dict) -> int:
-    cmd = [sys.executable, "_perturb_v2_colab.py", "--exp", name,
+    # "arch" selects the model and is a CLI flag, not a config field, so it is lifted out
+    # of the overrides before they are handed to the config constructor.
+    ov = dict(ov)
+    arch = ov.pop("arch", "v2")
+    cmd = [sys.executable, "_perturb_v2_colab.py", "--exp", name, "--arch", arch,
            "--folds", "0", "1", "2", "3", "4", "--seeds", "0",
            "--clip", "4", "--select-on", "per_complex",
            "--overrides", json.dumps(ov)]
@@ -79,8 +102,6 @@ def main() -> None:
     for name, ov in LADDER:
         if want and name not in want:
             continue
-        # A finished job leaves its results file; the trainer resumes per fold anyway, so
-        # re-running one is cheap, but skipping keeps a restarted ladder moving.
         done = OUT / f"{name}_results.csv"
         if done.exists() and len(done.read_text().strip().splitlines()) >= 6:
             print(f"=== {name}: already has 5 folds, skipping ===", flush=True)

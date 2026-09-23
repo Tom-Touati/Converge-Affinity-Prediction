@@ -20,6 +20,17 @@ from torch.utils.data import DataLoader, Dataset
 
 from model_v2 import PerturbV2, PerturbV2Config, distance_bins
 
+# The simple model reads only seq_*_wt/mt, struct_* and site_*; collate produces the
+# attention model's extra tensors too and it simply ignores them, so one trainer serves
+# both and the two are trained on byte-identical batches.
+try:
+    from model_simple import PerturbSimple, SimpleConfig
+except ImportError:          # the VM may not have it yet
+    PerturbSimple = SimpleConfig = None
+
+ARCH = {"v2": (lambda: PerturbV2, lambda: PerturbV2Config),
+        "simple": (lambda: PerturbSimple, lambda: SimpleConfig)}
+
 # The VM layout by default. PERTURB_ROOT points it at the local caches instead, so the
 # model can be probed on real batches without a GPU session -- which is how the gradient
 # check runs. PERTURB_TOKENIZER likewise, since locally the tokenizer comes from the hub
@@ -232,10 +243,18 @@ def per_complex_rho(pred, true, keys, min_rows=5):
     return float(np.mean(rs)) if rs else pear(pred, true)
 
 
-GRAD_GROUPS = {"head": "head.", "attn": "branch.attn", "fuse": "branch.fuse",
-               "film": "branch.gamma", "film_b": "branch.beta",
-               "red_seq": "branch.red_seq", "red_str": "branch.red_str",
-               "blosum": "branch.mut", "chain": "branch.chain"}
+# Prefix per group, per architecture. The simple model's modules are named differently,
+# and grouping it with the attention model's names silently logged zeros for every group
+# while the total was fine -- a breakdown that looks like a starved network but is only a
+# name mismatch. Each arch gets its own map and anything unmatched lands in "other", so a
+# module that is added later cannot vanish from the accounting.
+GRAD_GROUPS_V2 = {"head": "head.", "attn": "branch.attn", "fuse": "branch.fuse",
+                  "film": "branch.gamma", "film_b": "branch.beta",
+                  "red_seq": "branch.red_seq", "red_str": "branch.red_str",
+                  "blosum": "branch.mut", "chain": "branch.chain"}
+GRAD_GROUPS_SIMPLE = {"head": "mlp.", "film": "gamma", "film_b": "beta",
+                      "red_seq": "proj_seq", "red_str": "proj_str"}
+GRAD_GROUPS = GRAD_GROUPS_V2
 
 
 def grad_report(model, clip):
@@ -247,6 +266,7 @@ def grad_report(model, clip):
     """
     sq, dead, n = 0.0, 0, 0
     per = {k: 0.0 for k in GRAD_GROUPS}
+    per["other"] = 0.0
     for name, prm in model.named_parameters():
         n += prm.numel()
         if prm.grad is None:
@@ -260,6 +280,8 @@ def grad_report(model, clip):
             if name.startswith(pref):
                 per[k] += g2
                 break
+        else:
+            per["other"] += g2
     total = sq ** 0.5
     out = {"grad_norm": total, "grad_clipped": 1.0 if total > clip else 0.0,
            "grad_dead_frac": dead / max(n, 1)}
@@ -282,7 +304,7 @@ def history(exp, row):
             "val_rmse", "seconds", "fold", "seed", "n_train", "n_val", "name",
             "host_gb", "gpu_gb", "grad_norm", "grad_clipped", "grad_dead_frac",
             "g_head", "g_attn", "g_fuse", "g_film", "g_film_b", "g_red_seq",
-            "g_red_str", "g_blosum", "g_chain"]
+            "g_red_str", "g_blosum", "g_chain", "g_other"]
     if not p.exists():
         p.write_text(",".join(cols) + "\n")
     with open(p, "a") as f:
@@ -303,7 +325,7 @@ def sweep_row(exp, note, params=None):
 
 
 def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True,
-             select_on="per_complex"):
+             select_on="per_complex", make_model=PerturbV2):
     torch.manual_seed(seed); np.random.seed(seed)
     pcas = fold_pca(rows, fold, cache, cfg.pca_dim, seed=0)
     test = rows[rows.fold == fold]
@@ -328,7 +350,7 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
                                  shuffle=a, collate_fn=collate, num_workers=0)
     tr, va, te = mk(train, augment), mk(val, False), mk(test, False)
 
-    model = PerturbV2(cfg).to(device)
+    model = make_model(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
     lf = torch.nn.MSELoss()
@@ -404,6 +426,8 @@ def main():
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
     ap.add_argument("--max-epochs", type=int, default=60)
     ap.add_argument("--overrides", default="{}")
+    ap.add_argument("--arch", default="v2", choices=["v2", "simple"],
+                    help="which model; both read the same batches")
     ap.add_argument("--select-on", default="per_complex",
                     choices=["per_complex", "pooled"],
                     help="what early stopping maximises on the validation fold")
@@ -413,7 +437,12 @@ def main():
 
     ov = json.loads(a.overrides)
     augment = ov.pop("_augment", True)
-    cfg = PerturbV2Config(**ov)
+    global GRAD_GROUPS
+    GRAD_GROUPS = GRAD_GROUPS_SIMPLE if a.arch == "simple" else GRAD_GROUPS_V2
+    model_cls, cfg_cls = (f() for f in ARCH[a.arch])
+    if model_cls is None:
+        raise SystemExit(f"--arch {a.arch} not available: model_simple.py is missing")
+    cfg = cfg_cls(**ov)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     rows = pd.read_parquet(a.rows)
     if a.clip:
@@ -443,7 +472,7 @@ def main():
                 print(f"  fold {fold} seed {seed}: reused", flush=True); continue
             ids, yt, yp, eps, mins, npar = run_fold(rows, fold, seed, cfg, cache, a.exp,
                                                     device, a.max_epochs, augment,
-                                                    a.select_on)
+                                                    a.select_on, model_cls)
             recs.append(dict(exp=a.exp, split="frozen5", fold=fold, seed=seed,
                              n_train=int((rows.fold != fold).sum()), n_test=len(ids),
                              pearson=pear(yp, yt),

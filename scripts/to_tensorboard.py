@@ -72,6 +72,7 @@ CURVES = {
     "grad/reduce_struct": ("g_red_str",),
     "grad/blosum": ("g_blosum",),
     "grad/chain": ("g_chain",),
+    "grad/other": ("g_other",),
 }
 
 
