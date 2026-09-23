@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from src import paths  # noqa: E402
 
 TB = paths.ROOT / "runs" / "tb"
@@ -85,15 +86,28 @@ def pick(frame: pd.DataFrame, names: tuple) -> pd.Series | None:
     return None
 
 
+def read_csv(p: pathlib.Path) -> pd.DataFrame | None:
+    """None for a file that is missing, empty or truncated.
+
+    A poller writes these while a run is in flight and a killed transfer can leave a
+    zero-byte file behind, so an unreadable CSV is an ordinary state here, not a bug. It
+    should skip that one run rather than abort the whole mirror.
+    """
+    try:
+        return pd.read_csv(p)
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, FileNotFoundError):
+        return None
+
+
 def results_csv(d: pathlib.Path) -> pd.DataFrame | None:
     """The per-fold table, whatever the trainer happened to call it."""
     for p in sorted(d.glob("*_results.csv")):
-        return pd.read_csv(p)
+        return read_csv(p)
     return None
 
 
 def write_curves(run: str, hist: pd.DataFrame) -> int:
-    from torch.utils.tensorboard import SummaryWriter
+    from tb_writer import Writer as SummaryWriter
 
     n = 0
     folds = sorted(hist.fold.dropna().unique()) if "fold" in hist.columns else [0]
@@ -166,7 +180,7 @@ def figures(run: str, preds: pd.DataFrame, w) -> None:
 
 
 def mirror(run: str, d: pathlib.Path) -> dict:
-    from torch.utils.tensorboard import SummaryWriter
+    from tb_writer import Writer as SummaryWriter
 
     meta = {}
     rj = d / "run.json"
@@ -180,7 +194,9 @@ def mirror(run: str, d: pathlib.Path) -> dict:
     hist = d / "history.csv"
     if hist.exists():
         try:
-            n_curves = write_curves(run, pd.read_csv(hist))
+            h = read_csv(hist)
+            if h is not None:
+                n_curves = write_curves(run, h)
         except Exception as e:                  # a malformed history must not stop the rest
             print(f"  {run}: history skipped ({type(e).__name__}: {e})")
 
@@ -208,8 +224,9 @@ def mirror(run: str, d: pathlib.Path) -> dict:
 
     preds = d / "predictions.csv"
     if preds.exists():
-        p = pd.read_csv(preds).dropna(subset=["y_pred"])
-        if len(p) > 2:
+        p = read_csv(preds)
+        p = p.dropna(subset=["y_pred"]) if p is not None else None
+        if p is not None and len(p) > 2:
             e = p.y_pred - p.y_true
             pooled = {
                 "oof/pearson": float(np.corrcoef(p.y_pred, p.y_true)[0, 1]),

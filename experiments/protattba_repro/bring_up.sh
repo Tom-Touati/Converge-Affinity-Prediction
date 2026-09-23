@@ -25,10 +25,21 @@ push() {
 }
 
 echo "== creating session $S =="
-wsl -e bash -lc "timeout 500 colab new -s $S --gpu T4" 2>&1 | tail -2
-wsl_ "timeout 240 colab exec -s $S" <<'PY' 2>&1 | tail -1
+# A session that never came up must stop the script. Without this it pushed 21 files into
+# nothing, reported "launched" and started a collector against a session that did not
+# exist -- every step after the failure "succeeded" while doing nothing at all.
+if ! wsl -e bash -lc "timeout 500 colab new -s $S --gpu T4" 2>&1 | tail -2; then
+  echo "FATAL: could not create session $S"; exit 1
+fi
+cat > /tmp/_mkdirs.py <<'PY'
 import os; os.makedirs('/content/perturb/out', exist_ok=True); print('dirs made')
 PY
+wsl -e cp /tmp/_mkdirs.py /tmp/_mkdirs.py 2>/dev/null || true
+probe=$(wsl_ "timeout 240 colab exec -s $S" < /tmp/_mkdirs.py 2>&1 | tail -3)
+if ! echo "$probe" | grep -q "dirs made"; then
+  echo "FATAL: session $S is not usable: $probe"; exit 1
+fi
+echo "  dirs made"
 
 echo "== harness =="
 for f in _perturb_bootstrap.py _esm_colab.py _perturb_v2_colab.py _run_ladder.py \
@@ -67,5 +78,13 @@ subprocess.Popen(['bash', '-lc',
                  start_new_session=True)
 print('launched')
 PY
+# Start the collector HERE, not as a note for the operator to follow. A rebuild once
+# launched four configurations with no poller running -- the collector had been killed
+# separately -- and the session was reclaimed before anything was pulled, losing all four.
+# Nothing should be able to train on that VM without something collecting it.
+pkill -f "pull_ladder.sh" 2>/dev/null
+sleep 1
+SESSION=$S nohup bash "$HERE/experiments/protattba_repro/pull_ladder.sh" 180 \
+  > /tmp/pull_$S.log 2>&1 &
 echo
-echo "now: SESSION=$S bash experiments/protattba_repro/pull_ladder.sh 180 &"
+echo "collector started against $S (log: /tmp/pull_$S.log)"

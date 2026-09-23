@@ -24,13 +24,19 @@ from model_v2 import PerturbV2, PerturbV2Config, distance_bins
 # attention model's extra tensors too and it simply ignores them, so one trainer serves
 # both and the two are trained on byte-identical batches.
 try:
-    from model_simple import MLPConfig, PerturbMLP, PerturbSimple, SimpleConfig
+    from model_simple import (MLPConfig, PerturbMLP, PerturbSimple,
+                              PerturbSiteToken, PerturbTwoTower, SimpleConfig,
+                              SiteTokenConfig, TwoTowerConfig)
 except ImportError:          # the VM may not have it yet
     PerturbSimple = SimpleConfig = PerturbMLP = MLPConfig = None
+    PerturbTwoTower = TwoTowerConfig = None
+    PerturbSiteToken = SiteTokenConfig = None
 
 ARCH = {"v2": (lambda: PerturbV2, lambda: PerturbV2Config),
         "simple": (lambda: PerturbSimple, lambda: SimpleConfig),
-        "mlp": (lambda: PerturbMLP, lambda: MLPConfig)}
+        "mlp": (lambda: PerturbMLP, lambda: MLPConfig),
+        "twotower": (lambda: PerturbTwoTower, lambda: TwoTowerConfig),
+        "sitetok": (lambda: PerturbSiteToken, lambda: SiteTokenConfig)}
 
 # The VM layout by default. PERTURB_ROOT points it at the local caches instead, so the
 # model can be probed on real batches without a GPU session -- which is how the gradient
@@ -266,6 +272,8 @@ GRAD_GROUPS_V2 = {"head": "head.", "attn": "branch.attn", "fuse": "branch.fuse",
 GRAD_GROUPS_SIMPLE = {"head": "mlp.", "film": "gamma", "film_b": "beta",
                       "red_seq": "proj_seq", "red_str": "proj_str"}
 GRAD_GROUPS_MLP = {"head": "net."}
+GRAD_GROUPS_TT = {"head": "mlp.", "proc": "proc"}
+GRAD_GROUPS_ST = {"head": "mlp."}
 GRAD_GROUPS = GRAD_GROUPS_V2
 
 
@@ -316,7 +324,7 @@ def history(exp, row):
             "val_rmse", "seconds", "fold", "seed", "n_train", "n_val", "name",
             "host_gb", "gpu_gb", "grad_norm", "grad_clipped", "grad_dead_frac",
             "g_head", "g_attn", "g_fuse", "g_film", "g_film_b", "g_red_seq",
-            "g_red_str", "g_blosum", "g_chain", "g_other"]
+            "g_red_str", "g_blosum", "g_chain", "g_proc", "g_other"]
     if not p.exists():
         p.write_text(",".join(cols) + "\n")
     with open(p, "a") as f:
@@ -448,11 +456,13 @@ def main():
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
     ap.add_argument("--max-epochs", type=int, default=60)
     ap.add_argument("--overrides", default="{}")
-    ap.add_argument("--arch", default="v2", choices=["v2", "simple", "mlp"],
+    ap.add_argument("--arch", default="v2", choices=["v2", "simple", "mlp", "twotower", "sitetok"],
                     help="which model; both read the same batches")
     ap.add_argument("--select-on", default="per_complex",
                     choices=["per_complex", "pooled"],
                     help="what early stopping maximises on the validation fold")
+    ap.add_argument("--single-only", action="store_true",
+                    help="keep only rows with exactly one mutated residue")
     ap.add_argument("--clip", type=float, default=4.0,
                     help="clip |ddG| to this, in training and in scoring; 0 disables")
     a = ap.parse_args()
@@ -460,14 +470,25 @@ def main():
     ov = json.loads(a.overrides)
     augment = ov.pop("_augment", True)
     global GRAD_GROUPS
-    GRAD_GROUPS = {"simple": GRAD_GROUPS_SIMPLE, "mlp": GRAD_GROUPS_MLP}.get(
-        a.arch, GRAD_GROUPS_V2)
+    GRAD_GROUPS = {"simple": GRAD_GROUPS_SIMPLE, "mlp": GRAD_GROUPS_MLP,
+                   "twotower": GRAD_GROUPS_TT,
+                   "sitetok": GRAD_GROUPS_ST}.get(a.arch, GRAD_GROUPS_V2)
     model_cls, cfg_cls = (f() for f in ARCH[a.arch])
     if model_cls is None:
         raise SystemExit(f"--arch {a.arch} not available: model_simple.py is missing")
     cfg = cfg_cls(**ov)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     rows = pd.read_parquet(a.rows)
+    if a.single_only:
+        # k is read from the crop file, which is the same source the model pools from, so
+        # "one mutated residue" means the same thing here and in the forward pass.
+        cr = np.load(ROOT / "perturb_crops.npz", allow_pickle=False)
+        k = np.array([int(cr[f"{r}|ab_site"].sum() + cr[f"{r}|ag_site"].sum())
+                      for r in rows.row_id])
+        n0 = len(rows)
+        rows = rows[k == 1].reset_index(drop=True)
+        print(f"single-point only: {len(rows)} of {n0} rows, "
+              f"{rows.complex_key.nunique()} complexes", flush=True)
     if a.clip:
         # Clip before anything splits the table, so the training target, the validation
         # signal and the reported metric are the same quantity. Clipping only the training

@@ -16,10 +16,10 @@
 #   SESSION=pe bash experiments/protattba_repro/pull_ladder.sh [every_seconds]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
-SESSION=${SESSION:-pn}
+SESSION=${SESSION:-pt}
 EVERY=${1:-180}
 PYBIN=${PYBIN:-$HERE/experiments/protattba_repro/.venv_protattba/Scripts/python.exe}
-EXPS="mlp_delta_chem_reg mlp_chem_only mlp_delta_pca128_reg v4_sm_nb v4_sm_nb_reg v3_noaug v3_site_reg"
+EXPS="st64_xattn_r01 st64_nochem"
 # the same worktree, as WSL sees it
 WSLROOT=$(wsl -e wslpath -a "$(cygpath -w "$HERE")" | tr -d '\r')
 
@@ -48,8 +48,10 @@ while true; do
     fi
   done
 
-  "$PYBIN" scripts/to_tensorboard.py v3_ perturb_v2_full E0a_rf_handcrafted_seed0 \
-    >/dev/null 2>&1
+  # Mirror exactly what this collector tracks. It used to carry a hard-coded list
+  # from an earlier ladder, so new runs were pulled to disk and then filtered out
+  # of TensorBoard -- present locally, invisible in the UI.
+  "$PYBIN" scripts/to_tensorboard.py $EXPS E0a_rf_handcrafted_seed0 \n    >/dev/null 2>&1
   echo "[$(date -u +%H:%M:%S)] folds:$got"
 
   done_n=0
@@ -58,6 +60,6 @@ while true; do
     n=${n// /}
     [ "${n:-0}" -ge 5 ] && done_n=$((done_n + 1))
   done
-  [ "$done_n" -ge 7 ] && { echo "ladder complete"; break; }
+  [ "$done_n" -ge 2 ] && { echo "ladder complete"; break; }
   sleep "$EVERY"
 done

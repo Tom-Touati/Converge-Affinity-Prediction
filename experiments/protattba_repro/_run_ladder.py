@@ -38,63 +38,27 @@ BASE = {"pool": "site_mean", "use_blosum": False, "film_init": 0.02}
 #: and because sessions get reclaimed.
 SIMPLE = {"arch": "simple"}
 
+ST = {"arch": "sitetok", "pca_dim": 128, "proj": 64, "subtract": True,
+      "use_site_pool": True, "hidden": 128, "layers": 2,
+      "input_noise": 0.1, "feature_dropout": 0.2}
+
+REG = {"input_noise": 0.1, "feature_dropout": 0.2}
+TT = {"arch": "twotower", "pca_dim": 128, "proc": 128, "hidden": 128, "layers": 2, **REG}
+
 LADDER = [
-    # --- the floor: pool the ESM delta at the mutated residues, regress. No structure,
-    # no attention, no FiLM, no crop geometry -- one 512-vector per row. If the rest of
-    # the architecture does not clearly beat this, it is not earning its place.
-    # Regularised first. Every config in this session that had input noise and feature
-    # dropout beat its unregularised twin, and this model sees 512 inputs for 752 training
-    # rows, so it is the one most exposed. The plain version follows as the control.
-    ("mlp_delta_pca256_reg", {"arch": "mlp", "input_noise": 0.1, "feature_dropout": 0.2}),
-    ("mlp_delta_pca256", {"arch": "mlp"}),
-    ("mlp_delta_pca256_h128_reg", {"arch": "mlp", "hidden": 128, "layers": 2,
-                                   "input_noise": 0.1, "feature_dropout": 0.2}),
-    ("mlp_delta_pca128_reg", {"arch": "mlp", "pca_dim": 128,
-                              "input_noise": 0.1, "feature_dropout": 0.2}),
-
-    # --- the ESM delta plus the forest's own columns (chem + ProteinMPNN log-likelihood
-    # ratios, 26 of them). The forest beats every net here; this separates "the features
-    # are better" from "the model class is better". chem_only is the control: the same
-    # head on the chemistry ALONE, with no embedding at all.
-    ("mlp_delta_chem_reg", {"arch": "mlp", "hidden": 128, "layers": 2, "chem_dim": 26,
-                            "input_noise": 0.1, "feature_dropout": 0.2}),
-    ("mlp_chem_only", {"arch": "mlp", "hidden": 128, "layers": 2, "chem_dim": 26,
-                       "pca_dim": 1, "input_noise": 0.0, "feature_dropout": 0.0}),
-
-    # width 64 (41,792 params) and width 32 (15,008: 25 per training row, against 85 for
-    # the attention model, which is what the overfitting measurement asks for)
-    ("v5_simple", dict(SIMPLE)),
-    ("v5_simple_w32", dict(SIMPLE, width=32, hidden=32)),
-    ("v5_simple_w32_reg", dict(SIMPLE, width=32, hidden=32,
-                               input_noise=0.1, feature_dropout=0.2)),
-    # does ProteinMPNN earn its place once everything else is gone? 16,768 params.
-    ("v5_simple_noseqstruct", dict(SIMPLE, width=32, hidden=32, use_structure=False)),
-
-    # --- the combination, and the combination plus regularisation
-    ("v4_sm_nb", dict(BASE)),
-    ("v4_sm_nb_reg", dict(BASE, input_noise=0.1, feature_dropout=0.2)),
-
-    # --- the two configurations a reclaimed session never got to
-    ("v3_noaug", {"_augment": False}),
-    ("v3_site_reg", {"pool": "site", "input_noise": 0.1, "feature_dropout": 0.2}),
-
-    # --- component ablations, each removing one thing from BASE.
-    # Does ProteinMPNN contribute anything, and is it the structure or just the token
-    # count? shuffle is the control: same tensors, positions permuted.
-    ("abl_no_structure", dict(BASE, use_structure=False)),
-    ("abl_shuffle_structure", dict(BASE, shuffle_structure=True)),
-    # With BLOSUM gone the ESM delta is the ONLY carrier of which substitution was made.
-    # Removing it should collapse the model to chance; if it does not, the model is
-    # scoring on something other than the mutation.
-    ("abl_no_delta", dict(BASE, use_delta=False)),
-    ("abl_no_film", dict(BASE, delta_film=False)),
-    # geometry
-    ("abl_no_dist_bias", dict(BASE, dist_bias=False)),
-    ("abl_no_cross_chain", dict(BASE, cross_chain=False)),
-    ("abl_no_chain_emb", dict(BASE, chain_embedding=False)),
-    # the two-branch difference itself, which is the whole premise
-    ("abl_one_branch", dict(BASE, two_branch=False)),
-    ("abl_concat_head", dict(BASE, concat_head=True)),
+    # No residual at all: the token does not pass through, so the head's delta becomes
+    #     o((attn_mt - attn_wt) @ V)
+    # K and V come from the WILD-TYPE structure in both branches, so V is identical and the
+    # entire edit has to be expressed as a change in WHERE the sequence looks. The raw
+    # sequence difference no longer reaches the head by any path. That is a much stronger
+    # claim than weighting the residual down, and it either works or collapses.
+    ("st64_xattn_r01", dict(ST, chem_dim=26, cross_attn=True, n_heads=4, mpnn_proj=64,
+                            res_pre=0.0, res_post=1.0)),
+    # 0.2/0.8 scored +0.208 and 1.0/1.0 scored +0.192; these two are already done and are
+    # listed so a resumed ladder does not re-run them.
+    ("st64_xattn_r28", dict(ST, chem_dim=26, cross_attn=True, n_heads=4, mpnn_proj=64,
+                            res_pre=0.2, res_post=0.8)),
+    ("st64_nochem", dict(ST)),
 ]
 
 

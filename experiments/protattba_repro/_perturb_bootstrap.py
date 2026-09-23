@@ -37,7 +37,7 @@ else:
     print("  already present", flush=True)
 
 print("== unpack caches ==", flush=True)
-for tgz in ("_mpnn_cache.tgz", "_dist_cache.tgz"):
+for tgz in ("_mpnn_cache.tgz", "_dist_cache.tgz", "_crops.tgz"):
     if os.path.exists(f"{ROOT}/{tgz}"):
         with tarfile.open(f"{ROOT}/{tgz}") as t:
             t.extractall(ROOT)

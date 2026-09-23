@@ -229,3 +229,298 @@ class PerturbMLP(nn.Module):
         if c.chem_dim:
             z = torch.cat([z, batch["chem"]], dim=-1)
         return self.net(z).squeeze(-1)
+
+
+@dataclass
+class TwoTowerConfig:
+    """Process the wild-type and mutant representations, then combine them.
+
+    Everything so far subtracted first and processed the difference. This does the reverse:
+    each sequence is pooled and passed through a shared processing layer on its own, and
+    only then are the two brought together -- by concatenation, or by subtraction as the
+    ablation.
+
+    The two arms are not equivalent, and the difference is the thing this session kept
+    running into. ``subtract`` can only see what the edit CHANGED: identical inputs give
+    exactly zero, so the complex cannot be identified through it. ``concat`` hands the head
+    the wild-type vector as well, which is constant across every mutation of a complex --
+    and predicting a complex's mean scores pooled +0.672 here, better than any model in the
+    repo, while scoring 0.000 per complex. So concat is expected to look better on pooled
+    Pearson and that will not mean it is better.
+    """
+
+    pca_dim: int = 128       # per side, after the fold-local PCA
+    proc: int = 128          # the shared processing layer
+    hidden: int = 128
+    layers: int = 2
+    dropout: float = 0.2
+    combine: str = "concat"  # {concat, subtract}
+    chem_dim: int = 0
+    input_noise: float = 0.0
+    feature_dropout: float = 0.0
+
+
+class PerturbTwoTower(nn.Module):
+    def __init__(self, cfg: TwoTowerConfig | None = None):
+        super().__init__()
+        c = self.cfg = cfg or TwoTowerConfig()
+        if c.combine not in ("concat", "subtract"):
+            raise ValueError(f"unknown combine {c.combine!r}")
+        # Shared between the two towers: the same function must be applied to both, or the
+        # subtraction compares two different things and the concat arm can tell them apart
+        # by which tower they came from.
+        self.norm = nn.LayerNorm(c.pca_dim * 2, elementwise_affine=False)
+        self.proc = nn.Linear(c.pca_dim * 2, c.proc, bias=False)
+
+        d = c.proc * (2 if c.combine == "concat" else 1) + c.chem_dim
+        blocks: list[nn.Module] = []
+        for _ in range(c.layers):
+            blocks += [nn.Linear(d, c.hidden, bias=False), nn.GELU(), nn.Dropout(c.dropout)]
+            d = c.hidden
+        blocks += [nn.Linear(d, 1, bias=False)]
+        self.mlp = nn.Sequential(*blocks)
+
+    def perturb(self, batch):
+        """Shared between the towers, so it cancels under `subtract`."""
+        c = self.cfg
+        if not self.training or (c.input_noise <= 0 and c.feature_dropout <= 0):
+            return None
+        out = {}
+        for side in ("ab", "ag"):
+            ref = batch[f"seq_{side}_wt"]
+            n = (torch.randn_like(ref) * (c.input_noise * ref.std(dim=(0, 1), keepdim=True))
+                 if c.input_noise > 0 else None)
+            m = None
+            if c.feature_dropout > 0:
+                keep = (torch.rand(ref.shape[0], 1, ref.shape[2], device=ref.device,
+                                   dtype=ref.dtype) >= c.feature_dropout)
+                m = keep.to(ref.dtype) / (1.0 - c.feature_dropout)
+            out[side] = (n, m)
+        return out
+
+    def tower(self, batch, which: str, p) -> torch.Tensor:
+        """Pool each side at the mutated residues, concat the sides, process. Shared."""
+        parts = []
+        for side in ("ab", "ag"):
+            x = batch[f"seq_{side}_{which}"]
+            if p is not None:
+                n, m = p[side]
+                if n is not None:
+                    x = x + n
+                if m is not None:
+                    x = x * m
+            parts.append(site_mean(x, batch[f"site_{side}"]))
+        return self.proc(self.norm(torch.cat(parts, dim=-1)))
+
+    def forward(self, batch) -> torch.Tensor:
+        p = self.perturb(batch)
+        p_mt = self.tower(batch, "mt", p)
+        p_wt = self.tower(batch, "wt", p)
+        z = (torch.cat([p_mt, p_wt], dim=-1) if self.cfg.combine == "concat"
+             else p_mt - p_wt)
+        if self.cfg.chem_dim:
+            z = torch.cat([z, batch["chem"]], dim=-1)
+        return self.mlp(z).squeeze(-1)
+
+
+@dataclass
+class SiteTokenConfig:
+    """The mutated token, its original, and the wild-type binding site.
+
+    The residue axis collapses to three vectors:
+
+        tok_wt     the wild-type residue's embedding, at the mutated position
+        tok_mt     the mutant residue's embedding, at the same position
+        site_pool  the wild-type binding site, pooled over the crop, per side
+
+    A multi-point row averages its mutated tokens into tok_wt and tok_mt rather than being
+    dropped: 272 rows, 29% of the data, and 7 complexes have no single-point row at all.
+    Averaging is not obviously right -- ddG is not additive in the number of mutations
+    (corr(k, ddG) = -0.151 overall, -0.292 among multi-point rows), so a sum would be
+    wrong and a mean is a choice -- but it keeps every row and every complex.
+
+    The head is given tok_wt and tok_mt separately rather than their difference, so it can
+    learn what to do with them instead of having subtraction imposed.
+
+    ``use_site_pool`` is the one thing to watch. The binding-site pool is IDENTICAL for
+    every mutation of a complex, so it is a complex-identity channel -- and predicting a
+    complex's mean scores pooled +0.672 on these labels, better than any model here, while
+    scoring 0.000 per complex. It gives the head context for where the mutation sits; it
+    also gives it a shortcut. Turning it off is a one-line ablation and worth running.
+    """
+
+    pca_dim: int = 128
+    #: A shared Linear applied to every token after the PCA, before anything is pooled.
+    #: 0 leaves the PCA components as they are. Projecting first means the subtraction
+    #: below happens in a learned space rather than in PCA coordinates, and the same map
+    #: is used for the mutated tokens and for the binding-site pools so they stay
+    #: comparable.
+    proj: int = 0
+    #: A narrower projection for the binding-site pools only. 0 reuses ``proj``. The pools
+    #: are identical for every mutation of a complex, so their width is the width of the
+    #: complex-identity channel: narrowing them shrinks the shortcut while leaving the
+    #: edit pathway at full width. That is a different intervention from trimming the
+    #: model uniformly, and the evidence favours it -- shrinking this architecture
+    #: uniformly has twice made it worse (+0.205 -> +0.170 at width 32, and the MLP gained
+    #: going 32k -> 82k), so capacity per se is not what is limiting it.
+    pool_proj: int = 0
+    #: Hand the head tok_mt - tok_wt instead of both vectors. The difference is what the
+    #: edit did; the pair lets the head also read which residue was there to begin with.
+    subtract: bool = False
+    hidden: int = 128
+    layers: int = 2
+    dropout: float = 0.2
+    use_site_pool: bool = True
+    #: The project's handcrafted columns (chem + ProteinMPNN log-likelihood ratios),
+    #: concatenated after the blocks above are normalised. They arrive already
+    #: standardised with training-fold statistics, so they are NOT passed through another
+    #: LayerNorm: doing so would renormalise 26 columns per row and destroy the relative
+    #: scale between, say, d_volume and n_to_ala that the fold-local standardisation set.
+    chem_dim: int = 0
+    #: Let each sequence token attend over the ProteinMPNN tokens of its own side, after
+    #: the projection. The two modalities share the crop, so token i of one is residue i
+    #: of the other -- but attention is over ALL of them, so residue i's sequence vector
+    #: can read residue j's structure. That is spatial context a per-token map cannot
+    #: express. K and V come from the WILD-TYPE structure for both branches, so the
+    #: subtraction still isolates the edit: identical sequences give identical attention
+    #: output and a null edit is still exactly zero.
+    cross_attn: bool = False
+    n_heads: int = 4
+    #: A separate Linear for the ProteinMPNN tokens. 0 reuses ``proj``, which is free
+    #: because both modalities are 128-d PCA -- but it forces one map to serve two
+    #: representations that a dot-product attention is meant to compare, so the query and
+    #: key spaces cannot differ. Its own map costs 8,192 and lets them.
+    mpnn_proj: int = 0
+    #: How the attention's residual is mixed: ``res_pre`` * q_in + ``res_post`` * attn(q_in).
+    #: The default 1.0 / 1.0 is the ordinary residual. Weighting them shifts how much of
+    #: the token survives attention untouched -- and because the head reads a DIFFERENCE,
+    #: it also rescales the two terms of that difference relative to each other:
+    #:     res_pre * (seq_mt - seq_wt)  +  res_post * (attn(seq_mt) - attn(seq_wt))
+    #: the raw sequence edit, and what the edit changed about what it reads.
+    res_pre: float = 1.0
+    res_post: float = 1.0
+    input_noise: float = 0.0
+    feature_dropout: float = 0.0
+
+
+class CrossAttn(nn.Module):
+    """One cross-attention layer, pre-LN, residual. Queries from seq, keys/values from MPNN."""
+
+    def __init__(self, w: int, n_heads: int, dropout: float,
+                 res_pre: float = 1.0, res_post: float = 1.0):
+        super().__init__()
+        assert w % n_heads == 0, f"width {w} must divide by {n_heads} heads"
+        self.h, self.hd = n_heads, w // n_heads
+        self.ln_q = nn.LayerNorm(w, elementwise_affine=False)
+        self.ln_kv = nn.LayerNorm(w, elementwise_affine=False)
+        self.q, self.k, self.v, self.o = (nn.Linear(w, w, bias=False) for _ in range(4))
+        self.drop = nn.Dropout(dropout)
+        self.res_pre, self.res_post = res_pre, res_post
+
+    def forward(self, q_in, kv_in, kv_mask):
+        b, lq, w = q_in.shape
+        qh = self.q(self.ln_q(q_in)).view(b, lq, self.h, self.hd).transpose(1, 2)
+        kv = self.ln_kv(kv_in)
+        kh = self.k(kv).view(b, kv.shape[1], self.h, self.hd).transpose(1, 2)
+        vh = self.v(kv).view(b, kv.shape[1], self.h, self.hd).transpose(1, 2)
+        logits = (qh @ kh.transpose(-2, -1)) / (self.hd ** 0.5)
+        # -inf, never a small finite number: a padded key must carry no softmax mass, or
+        # the answer depends on how wide the batch happened to be padded.
+        logits = logits.masked_fill(~kv_mask.bool()[:, None, None, :], float("-inf"))
+        attn = self.drop(torch.softmax(logits, dim=-1))
+        out = self.o((attn @ vh).transpose(1, 2).reshape(b, lq, w))
+        return self.res_pre * q_in + self.res_post * out
+
+
+class PerturbSiteToken(nn.Module):
+    def __init__(self, cfg: SiteTokenConfig | None = None):
+        super().__init__()
+        c = self.cfg = cfg or SiteTokenConfig()
+        w = c.proj or c.pca_dim
+        self.proj = nn.Linear(c.pca_dim, c.proj, bias=False) if c.proj else None
+        pw = c.pool_proj or w
+        self.pool_proj = (nn.Linear(c.pca_dim, c.pool_proj, bias=False)
+                          if c.pool_proj and c.use_site_pool else None)
+        # ProteinMPNN's PCA output is 128-d like the sequence's, so `proj` maps both into
+        # one space and no separate input layer is needed before the dot product.
+        self.attn = (CrossAttn(w, c.n_heads, c.dropout, c.res_pre, c.res_post)
+                     if c.cross_attn else None)
+        # K and V must arrive at the attention's width, so this maps to w, not to a free
+        # choice -- mpnn_proj is a flag for WHETHER it is separate, not for how wide.
+        self.mpnn_proj = (nn.Linear(c.pca_dim, w, bias=False)
+                          if c.cross_attn and c.mpnn_proj else None)
+
+        # Each block is normalised on its OWN, then concatenated. A single LayerNorm over
+        # the concatenation would normalise across blocks that are not the same kind of
+        # quantity: the edit is a DIFFERENCE of two token vectors and is small, while a
+        # binding-site pool is an absolute vector and is not. Jointly normalised, the pools
+        # set the scale and the edit -- the only part that varies between mutations of the
+        # same complex -- is compressed toward nothing.
+        n_tok = 1 if c.subtract else 2
+        self.norm_tok = nn.ModuleList(
+            [nn.LayerNorm(w, elementwise_affine=False) for _ in range(n_tok)])
+        self.norm_pool = nn.ModuleList(
+            [nn.LayerNorm(pw, elementwise_affine=False) for _ in range(2)]
+        ) if c.use_site_pool else None
+        d = w * n_tok + (pw * 2 if c.use_site_pool else 0) + c.chem_dim
+        blocks: list[nn.Module] = []
+        for _ in range(c.layers):
+            blocks += [nn.Linear(d, c.hidden), nn.GELU(), nn.Dropout(c.dropout)]
+            d = c.hidden
+        blocks += [nn.Linear(d, 1)]
+        self.mlp = nn.Sequential(*blocks)
+
+    def forward(self, batch) -> torch.Tensor:
+        c = self.cfg
+        noise = mask = None
+        if self.training and (c.input_noise > 0 or c.feature_dropout > 0):
+            ref = batch["seq_ab_wt"]
+            if c.input_noise > 0:
+                noise = c.input_noise * ref.std(dim=(0, 1), keepdim=True)
+            if c.feature_dropout > 0:
+                keep = (torch.rand(ref.shape[0], 1, ref.shape[2], device=ref.device,
+                                   dtype=ref.dtype) >= c.feature_dropout)
+                mask = keep.to(ref.dtype) / (1.0 - c.feature_dropout)
+
+        def px(x):
+            # One draw per row, applied to WT and MUT alike, so the pair stays comparable
+            if noise is not None:
+                x = x + torch.randn_like(x) * noise
+            if mask is not None:
+                x = x * mask
+            return x
+
+        def tok_proj(x):
+            return self.proj(x) if self.proj is not None else x
+
+        def pool_map(x):
+            # its own map when pool_proj is set, otherwise the same one the tokens use
+            if self.pool_proj is not None:
+                return self.pool_proj(x)
+            return tok_proj(x)
+
+        # Exactly one side carries the mutation, so the other contributes zeros and the
+        # sum picks out the mutated token without needing to know which side it was on.
+        def tokens(which: str, side: str):
+            x = tok_proj(px(batch[f"seq_{side}_{which}"]))
+            if self.attn is not None:
+                st = px(batch[f"struct_{side}"])
+                kv = (self.mpnn_proj(st) if self.mpnn_proj is not None
+                      else tok_proj(st))               # wild-type structure, both branches
+                x = self.attn(x, kv, batch[f"mask_{side}"])
+            return site_mean(x, batch[f"site_{side}"])
+
+        tok_wt = sum(tokens("wt", s) for s in ("ab", "ag"))
+        tok_mt = sum(tokens("mt", s) for s in ("ab", "ag"))
+        raw = [tok_mt - tok_wt] if c.subtract else [tok_wt, tok_mt]
+        parts = [n(x) for n, x in zip(self.norm_tok, raw)]
+
+        if c.use_site_pool:
+            for i, s in enumerate(("ab", "ag")):
+                m = batch[f"mask_{s}"].unsqueeze(-1)
+                x = pool_map(px(batch[f"seq_{s}_wt"]))
+                pooled = (x * m).sum(1) / m.sum(1).clamp(min=1.0)
+                parts.append(self.norm_pool[i](pooled))
+        if c.chem_dim:
+            parts.append(batch["chem"])
+        return self.mlp(torch.cat(parts, dim=-1)).squeeze(-1)
