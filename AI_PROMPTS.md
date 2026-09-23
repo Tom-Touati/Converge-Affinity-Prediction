@@ -75,7 +75,7 @@ harness:
 
 ## Session, 2026-09-21 — GPU runs, and removing residual learning
 
-The longest session of the project. Full technical state is in [HANDOFF.md](HANDOFF.md); this
+The longest session of the project. Full technical state is in [HANDOFF.md](docs/HANDOFF.md); this
 records how the work was directed and where the assistant was wrong.
 
 ### What was asked for, in order
