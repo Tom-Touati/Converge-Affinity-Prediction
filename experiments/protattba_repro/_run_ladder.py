@@ -39,6 +39,19 @@ BASE = {"pool": "site_mean", "use_blosum": False, "film_init": 0.02}
 SIMPLE = {"arch": "simple"}
 
 LADDER = [
+    # --- the floor: pool the ESM delta at the mutated residues, regress. No structure,
+    # no attention, no FiLM, no crop geometry -- one 512-vector per row. If the rest of
+    # the architecture does not clearly beat this, it is not earning its place.
+    # Regularised first. Every config in this session that had input noise and feature
+    # dropout beat its unregularised twin, and this model sees 512 inputs for 752 training
+    # rows, so it is the one most exposed. The plain version follows as the control.
+    ("mlp_delta_pca256_reg", {"arch": "mlp", "input_noise": 0.1, "feature_dropout": 0.2}),
+    ("mlp_delta_pca256", {"arch": "mlp"}),
+    ("mlp_delta_pca256_h128_reg", {"arch": "mlp", "hidden": 128, "layers": 2,
+                                   "input_noise": 0.1, "feature_dropout": 0.2}),
+    ("mlp_delta_pca128_reg", {"arch": "mlp", "pca_dim": 128,
+                              "input_noise": 0.1, "feature_dropout": 0.2}),
+
     # width 64 (41,792 params) and width 32 (15,008: 25 per training row, against 85 for
     # the attention model, which is what the overfitting measurement asks for)
     ("v5_simple", dict(SIMPLE)),

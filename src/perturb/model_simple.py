@@ -160,3 +160,61 @@ class PerturbSimple(nn.Module):
         p = self.perturb(batch)
         z = torch.cat([self.side(batch, "ab", p), self.side(batch, "ag", p)], dim=-1)
         return self.mlp(z).squeeze(-1)
+
+
+@dataclass
+class MLPConfig:
+    """The shortest path from ESM to ddG, for the floor it sets.
+
+    Pool the delta at the mutated residues and regress. No per-token projection, no
+    structure, no FiLM, no attention, no crop geometry -- one vector per row.
+
+    It exists to price everything else. If the full perturbation model does not clearly
+    beat this, the machinery between the embedding and the answer is not earning its place.
+    """
+
+    pca_dim: int = 256       # per modality, after the fold-local PCA
+    hidden: int = 64
+    layers: int = 1
+    dropout: float = 0.2
+    input_noise: float = 0.0
+    feature_dropout: float = 0.0
+
+
+class PerturbMLP(nn.Module):
+    def __init__(self, cfg: MLPConfig | None = None):
+        super().__init__()
+        c = self.cfg = cfg or MLPConfig()
+        # Both sides concatenated. A side with no mutation contributes zeros, so the head
+        # can tell "no antigen-side mutation" from "an antigen-side mutation of zero size".
+        d = c.pca_dim * 2
+        blocks: list[nn.Module] = [nn.LayerNorm(d)]
+        for _ in range(c.layers):
+            # bias-free, so an all-zero input (a null edit) maps to exactly zero
+            blocks += [nn.Linear(d, c.hidden, bias=False), nn.GELU(), nn.Dropout(c.dropout)]
+            d = c.hidden
+        blocks += [nn.Linear(d, 1, bias=False)]
+        self.net = nn.Sequential(*blocks)
+        # LayerNorm has an affine bias that would break the null-edit property; drop it.
+        self.net[0].elementwise_affine = False
+        self.net[0].weight = None
+        self.net[0].bias = None
+
+    def forward(self, batch) -> torch.Tensor:
+        c = self.cfg
+        parts = []
+        for side in ("ab", "ag"):
+            wt, mt = batch[f"seq_{side}_wt"], batch[f"seq_{side}_mt"]
+            if self.training and (c.input_noise > 0 or c.feature_dropout > 0):
+                # shared across WT and MUT so it cancels in the delta, as elsewhere
+                if c.input_noise > 0:
+                    n = torch.randn_like(wt) * (c.input_noise * wt.std(dim=(0, 1),
+                                                                      keepdim=True))
+                    wt, mt = wt + n, mt + n
+                if c.feature_dropout > 0:
+                    keep = (torch.rand(wt.shape[0], 1, wt.shape[2], device=wt.device,
+                                       dtype=wt.dtype) >= c.feature_dropout)
+                    m = keep.to(wt.dtype) / (1.0 - c.feature_dropout)
+                    wt, mt = wt * m, mt * m
+            parts.append(site_mean(mt - wt, batch[f"site_{side}"]))
+        return self.net(torch.cat(parts, dim=-1)).squeeze(-1)

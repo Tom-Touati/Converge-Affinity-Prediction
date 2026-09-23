@@ -24,12 +24,13 @@ from model_v2 import PerturbV2, PerturbV2Config, distance_bins
 # attention model's extra tensors too and it simply ignores them, so one trainer serves
 # both and the two are trained on byte-identical batches.
 try:
-    from model_simple import PerturbSimple, SimpleConfig
+    from model_simple import MLPConfig, PerturbMLP, PerturbSimple, SimpleConfig
 except ImportError:          # the VM may not have it yet
-    PerturbSimple = SimpleConfig = None
+    PerturbSimple = SimpleConfig = PerturbMLP = MLPConfig = None
 
 ARCH = {"v2": (lambda: PerturbV2, lambda: PerturbV2Config),
-        "simple": (lambda: PerturbSimple, lambda: SimpleConfig)}
+        "simple": (lambda: PerturbSimple, lambda: SimpleConfig),
+        "mlp": (lambda: PerturbMLP, lambda: MLPConfig)}
 
 # The VM layout by default. PERTURB_ROOT points it at the local caches instead, so the
 # model can be probed on real batches without a GPU session -- which is how the gradient
@@ -254,6 +255,7 @@ GRAD_GROUPS_V2 = {"head": "head.", "attn": "branch.attn", "fuse": "branch.fuse",
                   "blosum": "branch.mut", "chain": "branch.chain"}
 GRAD_GROUPS_SIMPLE = {"head": "mlp.", "film": "gamma", "film_b": "beta",
                       "red_seq": "proj_seq", "red_str": "proj_str"}
+GRAD_GROUPS_MLP = {"head": "net."}
 GRAD_GROUPS = GRAD_GROUPS_V2
 
 
@@ -426,7 +428,7 @@ def main():
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
     ap.add_argument("--max-epochs", type=int, default=60)
     ap.add_argument("--overrides", default="{}")
-    ap.add_argument("--arch", default="v2", choices=["v2", "simple"],
+    ap.add_argument("--arch", default="v2", choices=["v2", "simple", "mlp"],
                     help="which model; both read the same batches")
     ap.add_argument("--select-on", default="per_complex",
                     choices=["per_complex", "pooled"],
@@ -438,7 +440,8 @@ def main():
     ov = json.loads(a.overrides)
     augment = ov.pop("_augment", True)
     global GRAD_GROUPS
-    GRAD_GROUPS = GRAD_GROUPS_SIMPLE if a.arch == "simple" else GRAD_GROUPS_V2
+    GRAD_GROUPS = {"simple": GRAD_GROUPS_SIMPLE, "mlp": GRAD_GROUPS_MLP}.get(
+        a.arch, GRAD_GROUPS_V2)
     model_cls, cfg_cls = (f() for f in ARCH[a.arch])
     if model_cls is None:
         raise SystemExit(f"--arch {a.arch} not available: model_simple.py is missing")
