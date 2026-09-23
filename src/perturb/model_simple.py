@@ -399,8 +399,97 @@ class SiteTokenConfig:
     #: the raw sequence edit, and what the edit changed about what it reads.
     res_pre: float = 1.0
     res_post: float = 1.0
+    #: Which modality asks the questions.
+    #:
+    #: ``seq_to_struct``  sequence queries the structure: "given this residue, what of the
+    #:                    local geometry matters". The query changes with the mutation.
+    #: ``struct_to_seq``  the structure queries the sequence: "given this position, what is
+    #:                    sitting here now". The KEYS and VALUES change with the mutation.
+    #:
+    #: The reversal is not symmetric, and one consequence is worth knowing before reading
+    #: any result. Under ``struct_to_seq`` the query is the wild-type structure, which is
+    #: IDENTICAL in both branches, so the residual term cancels exactly in the difference
+    #: the head reads:
+    #:     (r_pre * s + r_post * A_mt) - (r_pre * s + r_post * A_wt) = r_post * (A_mt - A_wt)
+    #: res_pre therefore has no effect on the edit signal in this direction -- it only
+    #: rescales a constant the head sees. Tuning it here would be tuning nothing.
+    attn_direction: str = "seq_to_struct"
+    #: Modulate the sequence by the structure with a FiLM instead of attending to it:
+    #:     x = (1 + gamma(structure)) * sequence + beta(structure)
+    #: The difference from attention is what it can express. FiLM is per RESIDUE -- position
+    #: i's structure scales position i's sequence and nothing else -- while attention lets
+    #: residue i read residue j. So FiLM cannot carry spatial context, only a local gate.
+    #: It is also much cheaper: two 64x64 maps against attention's four plus an input map.
+    #:
+    #: The edit survives it cleanly. The structure is the wild type in both branches, so
+    #: gamma and beta are identical there and the difference is
+    #:     (1 + gamma(s)) * (seq_mt - seq_wt)
+    #: -- beta cancels outright and the edit is gated, never mixed with anything constant.
+    film_struct: bool = False
+    #: Reduce raw embeddings inside the network instead of by a fold-local PCA. 0 keeps
+    #: the PCA path. Set to a group width (128) and the model builds a GroupedReduce per
+    #: modality, sized from the ACTUAL input width, which differs between ESM (1280),
+    #: AntiBERTy (512) and ProteinMPNN (128).
+    group_reduce: int = 0
+    group_out: int = 16
+    #: the true input widths, which only the trainer knows; set from the batch at build time
+    in_seq: int = 0
+    in_str: int = 0
+    #: Pool both modalities across residues, then let the model learn how much of each to
+    #: use, per row, from all three inputs together:
+    #:     g_seq, g_str = sigmoid(W [z_seq ; z_str ; chem])
+    #:     head sees  [g_seq * z_seq ; g_str * z_str ; chem]
+    #: The gates are vectors, not scalars, so the choice is per dimension rather than one
+    #: number per modality.
+    #:
+    #: Worth stating plainly: z_str is pooled from the WILD-TYPE structure, so it is
+    #: constant across every mutation of a complex -- the same complex-identity channel
+    #: that the binding-site pools were, and those turned out to be worth +0.003. What
+    #: makes this different is that the GATE is computed from z_seq, which does carry the
+    #: edit, so the edit decides how much structure to admit rather than the structure
+    #: being added unconditionally.
+    gated_fusion: bool = False
+    #: Pool ProteinMPNN over the mutated residues and CONCATENATE it with the sequence
+    #: edit and the chem columns, with no gate, no FiLM and no attention. Until now the
+    #: structure could only enter through one of those three, so the plainest way of
+    #: combining the two modalities had never actually been run -- which makes it the
+    #: missing control for all three of them.
+    concat_struct: bool = False
     input_noise: float = 0.0
     feature_dropout: float = 0.0
+
+
+class GroupedReduce(nn.Module):
+    """1280 -> 160 as ten independent 128 -> 16 maps, not one dense 1280 -> 160.
+
+    Replaces the fold-local PCA with something the network learns. A dense layer would be
+    1280 x 160 = 204,800 parameters against 752 training rows, which is more weights in one
+    layer than the whole rest of the model. Block-diagonal, it is 10 x 128 x 16 = 20,480:
+    a tenth of the cost, and each block sees a contiguous slice of the embedding.
+
+    The slicing is arbitrary -- ESM dimensions carry no group structure -- so this is a
+    parameter-saving constraint, not a claim about the representation. What it buys over
+    PCA is that the reduction is fitted to the LABEL rather than to variance, and that it
+    is not refit per fold.
+    """
+
+    def __init__(self, in_dim: int, group: int = 128, out_per_group: int = 16):
+        super().__init__()
+        if in_dim % group:
+            raise ValueError(f"{in_dim} does not divide into groups of {group}")
+        self.n, self.group, self.out = in_dim // group, group, out_per_group
+        self.w = nn.Parameter(torch.empty(self.n, group, out_per_group))
+        nn.init.normal_(self.w, std=group ** -0.5)
+
+    @property
+    def out_dim(self) -> int:
+        return self.n * self.out
+
+    def forward(self, x):
+        b, l, _ = x.shape
+        # (b, l, n, group) x (n, group, out) -> (b, l, n, out), then flattened
+        return torch.einsum("blng,ngo->blno",
+                            x.view(b, l, self.n, self.group), self.w).reshape(b, l, -1)
 
 
 class CrossAttn(nn.Module):
@@ -436,19 +525,35 @@ class PerturbSiteToken(nn.Module):
     def __init__(self, cfg: SiteTokenConfig | None = None):
         super().__init__()
         c = self.cfg = cfg or SiteTokenConfig()
-        w = c.proj or c.pca_dim
-        self.proj = nn.Linear(c.pca_dim, c.proj, bias=False) if c.proj else None
+        # With group_reduce the raw embedding is reduced here instead of by a PCA, and
+        # the two modalities have different widths (ESM 1280 / AntiBERTy 512 / MPNN 128),
+        # so each gets its own block-diagonal map sized from the real input.
+        self.gr_seq = self.gr_str = None
+        seq_in = c.pca_dim
+        if c.group_reduce:
+            self.gr_seq = GroupedReduce(c.in_seq or c.pca_dim, c.group_reduce, c.group_out)
+            self.gr_str = GroupedReduce(c.in_str or c.pca_dim, c.group_reduce, c.group_out)
+            seq_in = self.gr_seq.out_dim
+        w = c.proj or seq_in
+        self.proj = nn.Linear(seq_in, c.proj, bias=False) if c.proj else None
         pw = c.pool_proj or w
-        self.pool_proj = (nn.Linear(c.pca_dim, c.pool_proj, bias=False)
+        self.pool_proj = (nn.Linear(seq_in, c.pool_proj, bias=False)
                           if c.pool_proj and c.use_site_pool else None)
         # ProteinMPNN's PCA output is 128-d like the sequence's, so `proj` maps both into
         # one space and no separate input layer is needed before the dot product.
         self.attn = (CrossAttn(w, c.n_heads, c.dropout, c.res_pre, c.res_post)
                      if c.cross_attn else None)
+        if c.film_struct:
+            self.g_str, self.b_str = nn.Linear(w, w), nn.Linear(w, w)
+            for lin in (self.g_str, self.b_str):
+                nn.init.normal_(lin.weight, std=0.02)   # off zero, so it acts from step 0
+                nn.init.zeros_(lin.bias)
         # K and V must arrive at the attention's width, so this maps to w, not to a free
         # choice -- mpnn_proj is a flag for WHETHER it is separate, not for how wide.
-        self.mpnn_proj = (nn.Linear(c.pca_dim, w, bias=False)
-                          if c.cross_attn and c.mpnn_proj else None)
+        str_in = self.gr_str.out_dim if self.gr_str is not None else c.pca_dim
+        self.mpnn_proj = (nn.Linear(str_in, w, bias=False)
+                          if (c.cross_attn or c.film_struct or c.concat_struct)
+                          and c.mpnn_proj else None)
 
         # Each block is normalised on its OWN, then concatenated. A single LayerNorm over
         # the concatenation would normalise across blocks that are not the same kind of
@@ -463,6 +568,18 @@ class PerturbSiteToken(nn.Module):
             [nn.LayerNorm(pw, elementwise_affine=False) for _ in range(2)]
         ) if c.use_site_pool else None
         d = w * n_tok + (pw * 2 if c.use_site_pool else 0) + c.chem_dim
+        if c.concat_struct:
+            # its own norm, for the same reason the other blocks have one: the edit is
+            # a difference of two token vectors and is small, the structure pool is an
+            # absolute vector and is not
+            self.norm_str = nn.LayerNorm(w, elementwise_affine=False)
+            d += w
+        if c.gated_fusion:
+            # both modalities pooled, plus chem, all seen by the gate
+            zs = w
+            d = zs * 2 + c.chem_dim
+            self.gate = nn.Linear(d, zs * 2)
+            self.norm_str = nn.LayerNorm(zs, elementwise_affine=False)
         blocks: list[nn.Module] = []
         for _ in range(c.layers):
             blocks += [nn.Linear(d, c.hidden), nn.GELU(), nn.Dropout(c.dropout)]
@@ -472,25 +589,39 @@ class PerturbSiteToken(nn.Module):
 
     def forward(self, batch) -> torch.Tensor:
         c = self.cfg
-        noise = mask = None
-        if self.training and (c.input_noise > 0 or c.feature_dropout > 0):
-            ref = batch["seq_ab_wt"]
-            if c.input_noise > 0:
-                noise = c.input_noise * ref.std(dim=(0, 1), keepdim=True)
-            if c.feature_dropout > 0:
-                keep = (torch.rand(ref.shape[0], 1, ref.shape[2], device=ref.device,
-                                   dtype=ref.dtype) >= c.feature_dropout)
-                mask = keep.to(ref.dtype) / (1.0 - c.feature_dropout)
+        # The scale and the dropout mask are per WIDTH. They used to be taken once from
+        # seq_ab_wt and applied to everything, which held only while the PCA made the
+        # sequence and the structure both 128 wide. Without it the sequence is 1280 and
+        # the structure 128, and every configuration that reads structure -- attention or
+        # FiLM -- died on the mismatch. A plain no-PCA run never touched it, so this
+        # surfaced only once cross-attention was asked for without the PCA.
+        draws: dict[int, tuple] = {}
 
         def px(x):
-            # One draw per row, applied to WT and MUT alike, so the pair stays comparable
-            if noise is not None:
-                x = x + torch.randn_like(x) * noise
-            if mask is not None:
-                x = x * mask
+            # The feature-dropout mask is drawn once per width and reused, so WT and MUT
+            # lose the same columns and it cancels in their difference.
+            if not (self.training and (c.input_noise > 0 or c.feature_dropout > 0)):
+                return x
+            w = x.shape[-1]
+            if w not in draws:
+                n = (c.input_noise * x.std(dim=(0, 1), keepdim=True)
+                     if c.input_noise > 0 else None)
+                m = None
+                if c.feature_dropout > 0:
+                    keep = (torch.rand(x.shape[0], 1, w, device=x.device, dtype=x.dtype)
+                            >= c.feature_dropout)
+                    m = keep.to(x.dtype) / (1.0 - c.feature_dropout)
+                draws[w] = (n, m)
+            n, m = draws[w]
+            if n is not None:
+                x = x + torch.randn_like(x) * n
+            if m is not None:
+                x = x * m
             return x
 
         def tok_proj(x):
+            if self.gr_seq is not None:
+                x = self.gr_seq(x)
             return self.proj(x) if self.proj is not None else x
 
         def pool_map(x):
@@ -502,16 +633,47 @@ class PerturbSiteToken(nn.Module):
         # Exactly one side carries the mutation, so the other contributes zeros and the
         # sum picks out the mutated token without needing to know which side it was on.
         def tokens(which: str, side: str):
-            x = tok_proj(px(batch[f"seq_{side}_{which}"]))
-            if self.attn is not None:
+            seq = tok_proj(px(batch[f"seq_{side}_{which}"]))
+            if c.film_struct:
                 st = px(batch[f"struct_{side}"])
-                kv = (self.mpnn_proj(st) if self.mpnn_proj is not None
-                      else tok_proj(st))               # wild-type structure, both branches
-                x = self.attn(x, kv, batch[f"mask_{side}"])
+                if self.gr_str is not None:
+                    st = self.gr_str(st)
+                stp = (self.mpnn_proj(st) if self.mpnn_proj is not None else tok_proj(st))
+                seq = (1 + self.g_str(stp)) * seq + self.b_str(stp)
+                return site_mean(seq, batch[f"site_{side}"])
+            if self.attn is None:
+                return site_mean(seq, batch[f"site_{side}"])
+            st = px(batch[f"struct_{side}"])
+            if self.gr_str is not None:
+                st = self.gr_str(st)
+            stp = (self.mpnn_proj(st) if self.mpnn_proj is not None
+                   else tok_proj(st))                  # wild-type structure, both branches
+            if c.attn_direction == "struct_to_seq":
+                # the structure asks; the sequence answers, and it is the answer that the
+                # mutation changes
+                x = self.attn(stp, seq, batch[f"mask_{side}"])
+            else:
+                x = self.attn(seq, stp, batch[f"mask_{side}"])
             return site_mean(x, batch[f"site_{side}"])
 
         tok_wt = sum(tokens("wt", s) for s in ("ab", "ag"))
         tok_mt = sum(tokens("mt", s) for s in ("ab", "ag"))
+        if c.gated_fusion:
+            z_seq = self.norm_tok[0](tok_mt - tok_wt)
+            z_str = 0
+            for side in ("ab", "ag"):
+                st = px(batch[f"struct_{side}"])
+                if self.gr_str is not None:
+                    st = self.gr_str(st)
+                stp = self.mpnn_proj(st) if self.mpnn_proj is not None else tok_proj(st)
+                z_str = z_str + site_mean(stp, batch[f"site_{side}"])
+            z_str = self.norm_str(z_str)
+            ch = batch["chem"] if c.chem_dim else z_seq[:, :0]
+            g = torch.sigmoid(self.gate(torch.cat([z_seq, z_str, ch], dim=-1)))
+            zs = z_seq.shape[-1]
+            z = torch.cat([g[:, :zs] * z_seq, g[:, zs:] * z_str, ch], dim=-1)
+            return self.mlp(z).squeeze(-1)
+
         raw = [tok_mt - tok_wt] if c.subtract else [tok_wt, tok_mt]
         parts = [n(x) for n, x in zip(self.norm_tok, raw)]
 
@@ -521,6 +683,15 @@ class PerturbSiteToken(nn.Module):
                 x = pool_map(px(batch[f"seq_{s}_wt"]))
                 pooled = (x * m).sum(1) / m.sum(1).clamp(min=1.0)
                 parts.append(self.norm_pool[i](pooled))
+        if c.concat_struct:
+            z_str = 0
+            for side in ("ab", "ag"):
+                st = px(batch[f"struct_{side}"])
+                if self.gr_str is not None:
+                    st = self.gr_str(st)
+                stp = self.mpnn_proj(st) if self.mpnn_proj is not None else tok_proj(st)
+                z_str = z_str + site_mean(stp, batch[f"site_{side}"])
+            parts.append(self.norm_str(z_str))
         if c.chem_dim:
             parts.append(batch["chem"])
         return self.mlp(torch.cat(parts, dim=-1)).squeeze(-1)

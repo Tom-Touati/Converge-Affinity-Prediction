@@ -157,3 +157,79 @@ def test_shared_perturbation_cancels_in_the_delta():
 def test_it_is_actually_smaller():
     n = sum(p.numel() for p in PerturbSimple().parameters() if p.requires_grad)
     assert n < 51089, f"{n:,} parameters is not smaller than the attention model's 51,089"
+
+
+# ------------------------------------------------------- two towers, combined late
+from src.perturb.model_simple import PerturbTwoTower, TwoTowerConfig  # noqa: E402
+
+
+def tt_batch(b=3, l=9, dim=128, mutate=False, seed=0, pad_to=None):
+    g = torch.Generator().manual_seed(seed)
+    L = pad_to or l
+    def pad(x):
+        out = torch.zeros(b, L, x.shape[-1]); out[:, : x.shape[1]] = x; return out
+    ab = torch.randn(b, l, dim, generator=g)
+    ab_mt = ab.clone()
+    if mutate:
+        ab_mt[:, 2] += torch.randn(b, dim, generator=g)
+    ag = torch.randn(b, l, dim, generator=g)
+    s_ab = torch.zeros(b, l); s_ab[:, 2] = 1.0
+    return {"seq_ab_wt": pad(ab), "seq_ab_mt": pad(ab_mt),
+            "seq_ag_wt": pad(ag), "seq_ag_mt": pad(ag.clone()),
+            "site_ab": pad(s_ab.unsqueeze(-1)).squeeze(-1),
+            "site_ag": torch.zeros(b, L)}
+
+
+def test_subtract_is_zero_on_a_null_edit_and_concat_is_not():
+    """The whole point of the ablation, asserted rather than assumed.
+
+    subtract can only express what the edit changed. concat also hands the head the
+    wild-type vector, which is constant across every mutation of a complex -- so it can
+    answer from complex identity alone, and on these labels that scores pooled +0.672.
+    """
+    for combine, expect_zero in (("subtract", True), ("concat", False)):
+        m = PerturbTwoTower(TwoTowerConfig(combine=combine)).eval()
+        for p in m.mlp.parameters():
+            torch.nn.init.normal_(p, std=0.1)
+        with torch.no_grad():
+            y = m(tt_batch(mutate=False))
+        if expect_zero:
+            assert torch.allclose(y, torch.zeros_like(y), atol=1e-6), \
+                f"subtract gave {y.tolist()} on a null edit"
+        else:
+            assert y.abs().max() > 1e-3, \
+                "concat gave zero on a null edit; it should be able to see the wild type"
+
+
+def test_both_towers_share_weights():
+    """Subtracting two differently-parameterised towers compares two different things."""
+    m = PerturbTwoTower(TwoTowerConfig())
+    names = {n for n, _ in m.named_parameters()}
+    assert not any("tower" in n and ("_wt" in n or "_mt" in n) for n in names), \
+        f"found per-tower parameters: {sorted(names)}"
+    b = tt_batch(mutate=True, seed=2)
+    swapped = dict(b)
+    swapped["seq_ab_wt"], swapped["seq_ab_mt"] = b["seq_ab_mt"], b["seq_ab_wt"]
+    swapped["seq_ag_wt"], swapped["seq_ag_mt"] = b["seq_ag_mt"], b["seq_ag_wt"]
+    ms = PerturbTwoTower(TwoTowerConfig(combine="subtract")).eval()
+    with torch.no_grad():
+        z = ms.tower(b, "mt", None) - ms.tower(b, "wt", None)
+        z_sw = ms.tower(swapped, "mt", None) - ms.tower(swapped, "wt", None)
+    # The MLP's INPUT negates, which is what shared towers guarantee. Its OUTPUT does not:
+    # GELU is not an odd function, so MLP(-z) != -MLP(z). Asserting on the output would be
+    # asserting the head is antisymmetric, which it is not and was never meant to be --
+    # the first version of this test did exactly that and failed against a correct model.
+    assert torch.allclose(z, -z_sw, atol=1e-5), \
+        "swapping wild type and mutant did not negate the difference; the towers differ"
+
+
+@pytest.mark.parametrize("combine", ["concat", "subtract"])
+def test_two_tower_padding_invariance(combine):
+    cfg = TwoTowerConfig(combine=combine)
+    m = PerturbTwoTower(cfg).eval()
+    for p in m.mlp.parameters():
+        torch.nn.init.normal_(p, std=0.1)
+    with torch.no_grad():
+        a = m(tt_batch(mutate=True, seed=1))
+        b = m(tt_batch(mutate=True, seed=1, pad_to=40))
+    assert torch.allclose(a, b, atol=1e-5)

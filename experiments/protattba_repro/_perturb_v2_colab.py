@@ -42,6 +42,14 @@ ARCH = {"v2": (lambda: PerturbV2, lambda: PerturbV2Config),
 # model can be probed on real batches without a GPU session -- which is how the gradient
 # check runs. PERTURB_TOKENIZER likewise, since locally the tokenizer comes from the hub
 # rather than from a directory the bootstrap downloaded.
+#: Which model encodes the ANTIBODY side. "esm" keeps the original behaviour; "antiberty"
+#: reads the per-residue AntiBERTy cache instead. The antigen side is always ESM -- an
+#: antibody model has nothing to say about an antigen, and 385 of 940 rows are mutated
+#: there. Set from --seq-ab in main(), read by Cache.seq and fold_pca.
+SEQ_AB = "esm"
+#: Skip the fold-local PCA entirely and hand the model raw embeddings. Set from --no-pca.
+NO_PCA = False
+
 ROOT = Path(os.environ.get("PERTURB_ROOT", "/content/perturb"))
 TOKENIZER = os.environ.get("PERTURB_TOKENIZER", str(ROOT / "model" / "esm2_650m"))
 OUT = ROOT / "out"
@@ -83,6 +91,38 @@ class Cache:
         off, n = self.index[k]
         return np.asarray(self.store[off:off + n], np.float32)[1:-1]
 
+    def _load_antiberty(self):
+        """Per-residue AntiBERTy, antibody side only. Keyed on sha1 of the sequence.
+
+        Positions outside a variable domain are exact zeros in this cache: AntiBERTy saw
+        ~110-130 residue variable domains and our antibody side is the chains concatenated
+        at median 429. 1200 of 1202 mutated antibody residues fall inside one, so the
+        zeros cost almost nothing -- but they are zeros, not small numbers, so a consumer
+        can tell silence from a weak signal.
+        """
+        import hashlib
+        t = ROOT / "antiberty_tokens.npy"
+        i = ROOT / "antiberty_index.pkl"
+        if not (t.exists() and i.exists()):
+            raise SystemExit(f"--seq-ab antiberty needs {t.name} and {i.name} on the VM")
+        self._ab_store = np.load(t, mmap_mode="r")
+        self._ab_index = pickle.load(open(i, "rb"))["index"]
+        self._ab_key = lambda x: hashlib.sha1(x.encode()).hexdigest()
+        print(f"  antiberty cache: {len(self._ab_index)} sequences, "
+              f"dim {self._ab_store.shape[1]}", flush=True)
+
+    def antiberty(self, s):
+        if not hasattr(self, "_ab_store"):
+            self._load_antiberty()
+        off, n = self._ab_index[self._ab_key(s)]
+        return np.asarray(self._ab_store[off:off + n], np.float32)
+
+    def seq(self, side, s):
+        """The encoder for this side. ESM everywhere unless the antibody side was switched."""
+        if side == "ab" and SEQ_AB == "antiberty":
+            return self.antiberty(s)
+        return self.tokens(s)
+
     def mpnn(self, key):
         if key not in self._mpnn:
             z = np.load(ROOT / "mpnn_per_residue" / f"{key}.npz", allow_pickle=False)
@@ -99,53 +139,99 @@ class Cache:
                     ag_wt_aa=g("ag_wt_aa"), ag_mt_aa=g("ag_mt_aa"))
 
 
+class Identity:
+    """Stands in for a fitted PCA when --no-pca is set.
+
+    The DS calls .transform on whatever fold_pca returns, so the cheapest way to skip the
+    projection is to return something that does nothing rather than branch at every call
+    site. n_components_ is reported so the per-fold log still prints a width.
+    """
+
+    def __init__(self, dim):
+        self.n_components_ = dim
+        self.explained_variance_ratio_ = np.ones(1)
+
+    def transform(self, x):
+        return np.asarray(x, np.float32)
+
+
 def fold_pca(rows, fold, cache, dim, seed=0):
-    """Two PCAs, one per modality, fit on the training fold's CROPPED tokens only."""
+    """One PCA per side per modality, fit on the training fold's CROPPED tokens only.
+
+    The sides used to share a sequence PCA, which was fine while both were ESM. They cannot
+    once the antibody side is AntiBERTy: 512 dimensions against 1280, and two different
+    models' output spaces have no common basis to find. Fitting per side is also the more
+    honest default even for ESM -- antibody variable domains and antigens are different
+    distributions, and one basis over both spends its components on telling them apart.
+
+    The cache file name carries the encoder, so switching encoders cannot silently reuse a
+    basis fitted for the other one.
+    """
+    if NO_PCA:
+        # Widths are read off the cache itself rather than assumed: the antibody side is
+        # 512 under AntiBERTy and 1280 under ESM, and the model has to be told which.
+        r0 = rows.iloc[0]
+        w_ab = cache.seq("ab", r0.ab_wt).shape[1]
+        w_ag = cache.seq("ag", r0.ag_wt).shape[1]
+        w_st = cache.mpnn(r0.complex_key)[0].shape[1]
+        print(f"  fold {fold}: NO PCA -- raw widths ab {w_ab}, ag {w_ag}, struct {w_st}",
+              flush=True)
+        return Identity(w_ab), Identity(w_ag), Identity(w_st)
     PCA_DIR.mkdir(parents=True, exist_ok=True)
-    f = PCA_DIR / f"fold{fold}_pca{dim}.joblib"
+    f = PCA_DIR / f"fold{fold}_pca{dim}_{SEQ_AB}.joblib"
     if f.exists():
         return joblib.load(f)
     from sklearn.decomposition import PCA
     tr = rows[rows.fold != fold]
     rng = np.random.default_rng(seed)
-    seq_rows, str_rows = [], []
+    per_side, str_rows = {"ab": [], "ag": []}, []
     for r in tr.itertuples():
         c = cache.crop(r.row_id)
-        for col, idx in ((r.ab_wt, c["ab_idx"]), (r.ag_wt, c["ag_idx"])):
-            t = cache.tokens(col)
+        for side, col in (("ab", r.ab_wt), ("ag", r.ag_wt)):
+            t = cache.seq(side, col)
+            idx = c[f"{side}_idx"]
             take = idx[idx < len(t)]
             if len(take):
-                seq_rows.append(t[take][rng.choice(len(take), min(len(take), 24), replace=False)])
+                per_side[side].append(
+                    t[take][rng.choice(len(take), min(len(take), 24), replace=False)])
         h_ab, h_ag = cache.mpnn(r.complex_key)
         for h, idx in ((h_ab, c["ab_idx"]), (h_ag, c["ag_idx"])):
             take = idx[idx < len(h)]
             if len(take):
                 str_rows.append(h[take][rng.choice(len(take), min(len(take), 24), replace=False)])
-    Xs, Xt = np.concatenate(seq_rows), np.concatenate(str_rows)
-    p_seq = PCA(n_components=min(dim, Xs.shape[1]), random_state=seed).fit(Xs)
+
+    fits = {}
+    for side in ("ab", "ag"):
+        X = np.concatenate(per_side[side])
+        fits[side] = PCA(n_components=min(dim, X.shape[1]), random_state=seed).fit(X)
+        print(f"  fold {fold}: PCA seq[{side}] {X.shape} -> {fits[side].n_components_} "
+              f"({fits[side].explained_variance_ratio_.sum():.0%})", flush=True)
+    Xt = np.concatenate(str_rows)
     p_str = PCA(n_components=min(dim, Xt.shape[1]), random_state=seed).fit(Xt)
-    joblib.dump((p_seq, p_str), f)
-    print(f"  fold {fold}: PCA seq {Xs.shape} -> {p_seq.n_components_} "
-          f"({p_seq.explained_variance_ratio_.sum():.0%}), "
-          f"struct {Xt.shape} -> {p_str.n_components_} "
+    print(f"  fold {fold}: PCA struct {Xt.shape} -> {p_str.n_components_} "
           f"({p_str.explained_variance_ratio_.sum():.0%})", flush=True)
-    return p_seq, p_str
+    out = (fits["ab"], fits["ag"], p_str)
+    joblib.dump(out, f)
+    return out
 
 
 class DS(Dataset):
     def __init__(self, frame, pcas, cache, cfg, augment, seed, memo=None, chem=None):
         self.f = frame.reset_index(drop=True)
-        self.p_seq, self.p_str = pcas
+        self.p_ab, self.p_ag, self.p_str = pcas
         self.c, self.cfg = cache, cfg
         self.augment, self.rng = augment, np.random.default_rng(seed)
         self.bl = blosum62()
         self.memo = memo if memo is not None else {}
         self.chem = chem          # already standardised, indexed by row_id
 
-    def seq_at(self, s, idx):
-        key = (s, "seq")
+    def seq_at(self, s, idx, side="ab"):
+        # memoised per (sequence, side): the same string could in principle appear on both
+        # sides, and it must not then be projected with the wrong basis
+        key = (s, side)
         if key not in self.memo:
-            self.memo[key] = self.p_seq.transform(self.c.tokens(s)).astype(np.float32)
+            p = self.p_ab if side == "ab" else self.p_ag
+            self.memo[key] = p.transform(self.c.seq(side, s)).astype(np.float32)
         t = self.memo[key]
         take = np.clip(idx, 0, len(t) - 1)
         return t[take]
@@ -163,8 +249,10 @@ class DS(Dataset):
             ag_wt, ag_mt = ag_mt, ag_wt
             y, swap = -y, True                # the crop is unchanged, per the spec
 
-        s_ab_wt = self.seq_at(ab_wt, c["ab_idx"]); s_ab_mt = self.seq_at(ab_mt, c["ab_idx"])
-        s_ag_wt = self.seq_at(ag_wt, c["ag_idx"]); s_ag_mt = self.seq_at(ag_mt, c["ag_idx"])
+        s_ab_wt = self.seq_at(ab_wt, c["ab_idx"], "ab")
+        s_ab_mt = self.seq_at(ab_mt, c["ab_idx"], "ab")
+        s_ag_wt = self.seq_at(ag_wt, c["ag_idx"], "ag")
+        s_ag_mt = self.seq_at(ag_mt, c["ag_idx"], "ag")
 
         h_ab, h_ag = self.c.mpnn(r.complex_key)
         key = (r.complex_key, "str")
@@ -380,9 +468,18 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
                                  num_workers=0)
     tr, va, te = mk(train, augment), mk(val, False), mk(test, False)
 
+    if getattr(cfg, "group_reduce", 0) and not cfg.in_seq:
+        # the model cannot know these; they come from the cache the DS reads
+        r0 = rows.iloc[0]
+        cfg.in_seq = int(cache.seq("ab", r0.ab_wt).shape[1])
+        cfg.in_str = int(cache.mpnn(r0.complex_key)[0].shape[1])
+        print(f"  group_reduce: seq {cfg.in_seq} -> "
+              f"{cfg.in_seq // cfg.group_reduce * cfg.group_out}, "
+              f"struct {cfg.in_str} -> {cfg.in_str // cfg.group_reduce * cfg.group_out}",
+              flush=True)
     model = make_model(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)  # WD/LR set from argv
     lf = torch.nn.MSELoss()
     sweep_row(exp, f"fold {fold} seed {seed} running", n_params)
 
@@ -461,12 +558,24 @@ def main():
     ap.add_argument("--select-on", default="per_complex",
                     choices=["per_complex", "pooled"],
                     help="what early stopping maximises on the validation fold")
+    ap.add_argument("--seq-ab", default="esm", choices=["esm", "antiberty"],
+                    help="which model encodes the antibody side; the antigen is always ESM")
     ap.add_argument("--single-only", action="store_true",
                     help="keep only rows with exactly one mutated residue")
+    ap.add_argument("--no-pca", action="store_true",
+                    help="skip the fold-local PCA and hand the model raw embeddings; the "
+                         "model must then reduce them itself")
+    ap.add_argument("--wd", type=float, default=None,
+                    help="AdamW weight decay; the ladder has always used 1e-2")
+    ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--patience", type=int, default=None)
     ap.add_argument("--clip", type=float, default=4.0,
                     help="clip |ddG| to this, in training and in scoring; 0 disables")
     a = ap.parse_args()
 
+    global SEQ_AB, NO_PCA
+    SEQ_AB = a.seq_ab
+    NO_PCA = a.no_pca
     ov = json.loads(a.overrides)
     augment = ov.pop("_augment", True)
     global GRAD_GROUPS
@@ -497,6 +606,15 @@ def main():
         rows["ddg"] = rows.ddg.clip(-a.clip, a.clip)
         print(f"clipped |ddG| to {a.clip}: {n} of {len(rows)} rows "
               f"({100 * n / len(rows):.1f}%)", flush=True)
+    global LR, WD, PATIENCE
+    if a.wd is not None:
+        WD = a.wd
+    if a.lr is not None:
+        LR = a.lr
+    if a.patience is not None:
+        PATIENCE = a.patience
+    print(f"  optim: lr {LR}, weight_decay {WD}, patience {PATIENCE}", flush=True)
+
     cache = Cache()
     OUT.mkdir(parents=True, exist_ok=True)
     print(f"=== {a.exp} === {len(rows)} rows, device {device}", flush=True)
