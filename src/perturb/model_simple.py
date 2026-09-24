@@ -749,6 +749,18 @@ class SiteTokenConfig:
     #:   seq_to_struct_attn cross-attention: the mutation token queries the RAW per-side
     #:                      structure (not the nn-difference), concatenated. RoPE both sides
     #:   struct_to_seq_attn the reverse direction: structure queries the mutation token
+    #:   bilinear_pool      LATE fusion, not early: pool structure over the whole binding
+    #:                      site to ONE vector per side (summed over sides), pool sequence
+    #:                      via the SAME mechanism z_seq already uses, then cross-correlate
+    #:                      the two pooled summaries -- each projected through its OWN
+    #:                      learned map into a shared space, THEN multiplied elementwise.
+    #:                      The separate projections are the point: a raw elementwise
+    #:                      product of the two RAW pooled vectors has the same near-zero-
+    #:                      collapse problem multiplication always has here (see
+    #:                      mut_pair_op="mul"'s comment); projecting first lets the network
+    #:                      route each channel to whichever channel of the other side it
+    #:                      actually needs to compare against, rather than being locked to
+    #:                      matching index i against index i.
     #:
     #: PURE GEOMETRY, no learned embedding:
     #:   dist_scalar_concat the nearest-neighbour distance itself at the mutated residue
@@ -937,6 +949,10 @@ class PerturbSiteToken(nn.Module):
                     d = w * 2
                 elif mode == "dist_scalar_concat":
                     d = w + 1
+                elif mode == "bilinear_pool":
+                    self.bilin_struct = nn.Linear(w, w)
+                    self.bilin_seq = nn.Linear(w, w)
+                    d = w * 2
             if c.chem_dim:
                 # the two scalar-table modes (geometry columns, mpnn zero-shot scores)
                 # reuse the existing chem plumbing rather than new code -- a plain concat
@@ -1165,6 +1181,17 @@ class PerturbSiteToken(nn.Module):
             z_d = (site_mean(d_for_ag, batch["site_ag"])
                   + site_mean(d_for_ab, batch["site_ab"]))
             return torch.cat([z_seq, z_d], dim=-1)
+
+        if mode == "bilinear_pool":
+            # LATE fusion: pool structure over the whole BINDING SITE (crop, not the
+            # mutated residues -- "wild type site means the binding site")
+            z_st = 0
+            for side in ("ab", "ag"):
+                st = self.struct_ln(gelu(self.mpnn_proj(px(batch[f"struct_{side}"]))))
+                z_st = z_st + site_mean(st, batch[f"mask_{side}"])
+            u, v = self.bilin_struct(z_st), self.bilin_seq(z_seq)
+            z_cc = u * v                    # each projected separately, THEN multiplied
+            return torch.cat([z_seq, z_cc], dim=-1)
 
         raise ValueError(f"unknown mut_pair_struct_inject: {mode!r}")
 
