@@ -421,6 +421,30 @@ the +0.381 comes from the destabilising class (r 0.406) and from separating dest
 from the rest. For affinity maturation, where the task is to rank candidate *improving*
 mutations against each other, this model is a coin flip.
 
+**As a single number: Spearman(sign(ΔΔG), signed error) = −0.55 for `l1_gated` and −0.61 for
+the forest.** Every model in the project is in the range −0.48 to −0.61.
+
+| label | n | mean ΔΔG | forest | `l1_gated` | concat | no-PCA |
+| --- | --- | --- | --- | --- | --- | --- |
+| stabilising (ΔΔG < 0) | 250 | −0.809 | +1.169 | +1.108 | +1.113 | +0.756 |
+| near-neutral (\|ΔΔG\| ≤ 0.5) | 315 | +0.046 | +0.419 | +0.442 | +0.422 | +0.271 |
+| destabilising (ΔΔG > 0) | 657 | +1.562 | −0.531 | −0.669 | −0.756 | −0.771 |
+
+Two readings matter.
+
+**The sign carries most of the error, but not all of it.** −0.61 for the sign against −0.79
+for the full value (§19). So the error is predominantly about which side of zero the label
+falls on, with magnitude contributing the remainder — consistent with shrinkage toward a
+training mean that is 70 % destabilising, rather than a pure sign flip.
+
+**The model is not less *precise* on stabilising mutations — it is precise and wrong.**
+Correlation between label sign and *absolute* error is ≈ 0 (−0.08 to +0.10). For a designer
+that is worse than noise: a confidently wrong sign is actionable in the wrong direction.
+
+`st64_nopca_grouped` is the least biased of the four (−0.478, with +0.756 / −0.771 rather than
++1.169 / −0.531) — and it is also the model with the best stabilising recall (0.48) and the
+best balanced accuracy (0.508). Those are three views of one property.
+
 The mechanism is compression:
 
 ```

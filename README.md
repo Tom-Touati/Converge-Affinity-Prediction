@@ -251,20 +251,40 @@ fold landed. Both are recorded in [AI_PROMPTS.md](AI_PROMPTS.md).
    complexes. No regularisation setting removed the seed variance: raising dropout 75 %, noise
    150 % and weight decay tenfold cost 0.037–0.043 on two architectures and reduced variance on
    neither.
-2. **The neural model loses to a random forest** by 0.081, and retains 34 % under a homology
+2. **The error is systematically anti-correlated with the label's sign, and this is the most
+   actionable defect.** Spearman(sign(ΔΔG), signed error) = **−0.55** for `l1_gated` and
+   **−0.61** for the forest. Concretely:
+
+   | label | n | mean ΔΔG | `l1_gated` mean error | forest |
+   | --- | --- | --- | --- | --- |
+   | stabilising (ΔΔG < 0) | 250 | −0.809 | **+1.108** | +1.169 |
+   | near-neutral (\|ΔΔG\| ≤ 0.5) | 315 | +0.046 | +0.442 | +0.419 |
+   | destabilising (ΔΔG > 0) | 657 | +1.562 | −0.669 | −0.531 |
+
+   Stabilising mutations are over-predicted by about **+1.1 kcal/mol** and destabilising ones
+   under-predicted by **0.5–0.7**. Crucially, the correlation between label sign and
+   *\|error\|* is ≈ 0 (−0.08 to +0.10): the model is **not less precise** on stabilising
+   mutations, it is precise and **systematically wrong in direction**. For a designer that is
+   worse than noise, because a confidently wrong sign is actionable in the wrong direction.
+
+   This is shrinkage toward a training mean that is 70 % destabilising, and it is the same
+   phenomenon as the class bias in §4 and the compressed output range. Reverse-mutation
+   augmentation already attacks it — it moves the training label mean from +0.720 to −0.031 —
+   and it is not enough.
+3. **The neural model loses to a random forest** by 0.081, and retains 34 % under a homology
    split against the forest's 54 %. On this much data, 49 informative columns beat a learned
    representation.
-3. **Pretrained sequence embeddings do not clear zero on their own**, across six probes and
+4. **Pretrained sequence embeddings do not clear zero on their own**, across six probes and
    three protein language models. 26 chemistry columns moved the network +0.191 → +0.266 —
    larger than any architectural change measured. AntiBERTy, antibody-specific, lost to ESM-2
    by 0.046 on a matched control.
-4. **There is no mutant structure.** ProteinMPNN sees the wild-type backbone only, so the
+5. **There is no mutant structure.** ProteinMPNN sees the wild-type backbone only, so the
    structure term is identical for every mutation of a complex. The sharpest structural
    limitation of the design.
-5. **Label noise caps the achievable correlation** — within-complex label sd has a median of
+6. **Label noise caps the achievable correlation** — within-complex label sd has a median of
    1.104 kcal/mol.
-6. **Three complexes hold 24 % of the rows**, so any pooled statistic is partly about them.
-7. **Only 8 of 45 configurations have three complete seeds.** The rest are single-seed and
+7. **Three complexes hold 24 % of the rows**, so any pooled statistic is partly about them.
+8. **Only 8 of 45 configurations have three complete seeds.** The rest are single-seed and
    their individual numbers are not interpretable at the resolution the tables print them.
 
 ## 6. Next steps, in the order I would do them
