@@ -215,6 +215,10 @@ Spearman is unchanged at +0.3613). Even calibrated it does not reach the best ne
   that class r = 0.007. X→A is 46 % of the data and the model is twice as good on it. Valine is
   under-predicted by 1.4 kcal/mol and ranked backwards. 21 of 53 complexes are too small to
   enter the headline metric at all.
+- **Three quarters of test rows have a near-identical training twin** (median TM 0.991), and
+  only 19.8 % are genuinely hard. On those hard rows the forest scores +0.270 and the network
+  +0.117 — so the headline numbers are 75 % weighted toward near-retrieval, and the honest
+  expectation on a novel target is much lower.
 - **It is not a pipeline bug.** Across 940 rows and 1,726 mutated sites: zero residue
   mismatches, and ‖t_mut − t_wt‖ puts the mutated sites in the top-k on 97 % of sides at a
   median of 22× the median residue. `make align`.

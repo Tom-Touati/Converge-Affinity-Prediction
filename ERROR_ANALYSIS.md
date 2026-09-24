@@ -634,3 +634,57 @@ complementary signal exists rather than as a validated model: the blend weight w
 on held-out data, and +0.027 sits just inside the forest's own 0.032 seed spread. The
 robustness across two different networks and two weights is what makes it worth pursuing —
 and it is a cheaper, better-evidenced next step than any architecture in Part II.
+
+## 20. How many test rows are actually hard — by structural distance to training
+
+Every number in this repository averages over test rows that differ enormously in how much
+help the training folds give them. Difficulty here is the **maximum TM-score from a test
+complex to any complex in its own training folds**, so it reflects the split the model was
+trained under. Regenerate with `python scripts/difficulty_tiers.py`.
+
+```
+          complexes  rows  rows %  median max TM
+easy             39   707    75.2          0.991
+medium            2    47     5.0          0.649
+hard             12   186    19.8          0.429
+```
+
+easy ≥ 0.80 · medium ≥ 0.50 · hard < 0.50, on `frozen5` (by complex).
+
+**Three quarters of the test rows have a near-identical training twin, at a median TM of
+0.991.** That is not "structurally similar" — it is effectively the same complex under a
+different PDB id (1KIP / 1KIQ / 1KIR are one antibody–lysozyme system; 1BJ1 / 1CZ8 score
+0.992 against each other). For 75 % of the evaluation the model is being asked a
+near-retrieval question, not a generalisation one.
+
+### Performance collapses on the rows that are actually hard
+
+| tier | complexes | rows | random forest | `l1_gated` |
+| --- | --- | --- | --- | --- |
+| easy | 39 | 707 | +0.421 (22) | +0.350 (22) |
+| medium | 2 | 47 | +0.643 (2) | +0.482 (2) |
+| **hard** | **12** | **186** | **+0.270 (8)** | **+0.117 (8)** |
+
+*(n) is the number of complexes clearing the ≥5-row threshold in that tier.*
+
+**The network loses 67 % of its performance on hard rows** (+0.350 → +0.117); the forest loses
+36 % (+0.421 → +0.270). Both degrade, the network far more — the same asymmetry the cluster
+split showed, now localised to the rows responsible for it rather than inferred from a summary.
+
+The medium tier is two complexes and should not be read as anything.
+
+### Why this reframes the headline
+
+The headline +0.381 and +0.300 are **75 % weighted toward near-retrieval**. On a genuinely
+novel complex — the deployment case for antibody engineering, where the target is new — the
+honest expectations are **+0.270 (forest)** and **+0.117 (network)**.
+
+This also explains the cluster-split result mechanically rather than by analogy. `data/tm_tiers.csv`
+records that under cluster grouping **0 of 54** complexes are easy and **all 54 are hard** — by
+construction, since the split withholds structural relatives. So the cluster numbers (forest
+0.224, network 0.084) are approximately the "hard" column of this table, and the two analyses
+agree.
+
+**What should change because of this.** Any reported number on this dataset should carry its
+difficulty mix, and a model intended for novel targets should be selected on the hard tier
+rather than on the average. Doing the latter selects for retrieval.
