@@ -371,12 +371,21 @@ fold landed. Both are recorded in [AI_PROMPTS.md](AI_PROMPTS.md).
    to training does (+0.17 / +0.37). 261 AB645/AB1101 rows are built, cached and
    leakage-filtered, and have never been trained on.
 
-**Beyond these, the principled answer to a 752-row constraint is to stop spending labels on
-representation learning.** [docs/FUTURE_WORK.md](docs/FUTURE_WORK.md) develops two pretraining
-routes on *unlabelled* structure — CLIP-style contrastive alignment of the two encoders, and
-bidirectional cross-modality prediction whose *residual* isolates what structure adds beyond
-sequence. Both attack the measured defect that our two encoders occupy unrelated spaces joined
-only by a pair of `Linear(128 → 64)` maps trained on 752 labels.
+**The main proposal is bigger than any of these, and it has two halves that only work
+together: more data, and a sequence–structure alignment pretrained specifically on
+antibody–antigen interfaces.** Our two encoders occupy unrelated spaces joined only by a pair
+of `Linear(128 → 64)` maps fitted to 752 labels, and the consequence is measured: performance
+tracks structural proximity to training at Spearman **+0.494** and collapses to **+0.060** on
+complexes with no structural relative. The model learned to recognise, not to generalise.
+
+A *generic* protein alignment would not fix it — it would be dominated by globular cores, while
+antibody binding is loop-mediated, the framework is near-constant across unrelated antibodies
+(which is why this project clusters antibodies at 90 % identity rather than 30 %), and epitopes
+are discontinuous. [docs/FUTURE_WORK.md](docs/FUTURE_WORK.md) specifies the AB/AG-specific
+version: interface neighbourhoods as the unit, negatives drawn from within the same complex and
+CDR, a contrastive term plus a cross-modality prediction term whose *residual* isolates what
+structure adds beyond sequence — and the acceptance test, which is the **hard tier**, not the
+average.
 
 ## 7. Setup and running
 

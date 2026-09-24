@@ -55,88 +55,118 @@ given to the network. It is the untried half of the one intervention that demons
 
 ---
 
-# Tier 2 — pretraining, which is the principled answer to the real constraint
+# Tier 2 — an antibody–antigen-specific joint pretraining
 
-The constraint is 752 labelled rows. Every item above spends that budget more carefully; these
-change how much labelled data is needed in the first place, by moving representation learning
-onto **unlabelled** structures — of which there are thousands (SAbDab holds ~7,000 antibody
-structures; the PDB holds far more protein–protein interfaces).
+**This is the main proposal, and it has two halves that only work together: more data, and a
+sequence–structure alignment trained on antibody–antigen interfaces specifically.**
 
-This is also a direct response to a defect this project measured rather than assumed: our two
-encoders occupy **unrelated representation spaces**, and the only thing aligning them is a pair
-of `Linear(128 → 64)` maps trained on 752 ΔΔG labels. That is a very small amount of
-supervision for a very large alignment problem.
+The constraint is 752 labelled rows. Everything in Tier 1 spends that budget more carefully;
+this changes how much labelled data is needed, by moving representation learning onto
+**unlabelled antibody–antigen structure**, of which there is roughly an order of magnitude
+more than we have labels for.
 
-## 5. CLIP-style contrastive alignment of sequence and structure
+It also answers a defect this project measured rather than assumed. Our two encoders occupy
+**unrelated representation spaces**, and the only thing joining them is a pair of
+`Linear(128 → 64)` maps trained on 752 ΔΔG values. That is very little supervision for a large
+alignment problem, and the consequence is visible: the model's performance tracks structural
+proximity to training at Spearman **+0.494**, and collapses to **+0.060** on complexes with no
+structural relative. It has learned to recognise, not to generalise.
 
-**The idea.** Take a residue (or a local neighbourhood) in a known complex. It has an ESM-2
-embedding and a ProteinMPNN embedding — two views of the same physical object. Train two
-projection heads so that **matched views attract and mismatched views repel**, with the usual
-symmetric InfoNCE objective over a batch:
+## 5. Why it must be antibody–antigen-specific, not generic protein
 
-```
-z_s = f_seq(ESM(residue i))          z_t = f_str(MPNN(residue i))
-L   = InfoNCE(z_s, z_t) + InfoNCE(z_t, z_s)      temperature-scaled cosine
-```
+A generic sequence–structure alignment — over the whole PDB — would be dominated by globular
+protein cores, which is the wrong regime three times over:
 
-Negatives are other residues in the batch. Then **freeze** `f_seq` and `f_str` and drop them
-into the model in place of the two projections currently learned from ΔΔG.
+- **Antibody binding is loop-mediated.** The CDRs are hypervariable, conformationally flexible
+  and solvent-exposed. A generic objective sees them as a small, noisy minority; here they are
+  the entire question.
+- **The framework is near-constant across antibodies.** Two unrelated antibodies sit at 70–80 %
+  sequence identity, which is why this project's homology clustering links antibodies at 90 %
+  rather than the usual 30 % (`src/splits.py`). A generic contrastive objective would spend
+  most of its capacity on framework it could memorise, and would call two unrelated antibodies
+  the same thing.
+- **Epitopes are discontinuous.** The antigen side of the interface is assembled from residues
+  distant in sequence. An alignment trained on contiguous local neighbourhoods will not
+  represent that.
 
-**Why this should help here specifically:**
+Our own encoder comparison is consistent with this and is currently under-explained.
+**AntiBERTy lost to ESM-2 by 0.046** — but in a setup where the antigen stayed ESM-2 and *one
+shared projection served both sides*, so an antibody-specific prior was being asked to live in
+a space fitted to a general one. That comparison should be re-run after the alignment below
+exists, not before.
 
-- It learns the alignment from **unlabelled structure**, so it is not rationed by our 940 rows.
-  The thing we cannot afford to learn from labels is exactly the thing this learns for free.
-- It attacks the measured homology problem. Our embeddings retain 34 % under a homology split
-  because much of what they carry is *recognition*. A contrastive objective over many complexes
-  rewards the part of the sequence representation that is **predictive of local geometry** —
-  which is physics — and is indifferent to the part that merely identifies the protein.
-- The negatives can be chosen to target our failures. Sampling negatives from *the same
-  complex* forces the alignment to be residue-specific rather than complex-specific, which is
-  the precise failure mode §8 of the error analysis identifies: predicting a complex's mean
-  scores +0.672 pooled and +0.000 per complex.
+## 6. The pretraining task
 
-**Sensible ablations**, since this project's own lesson is that mechanisms must be priced
-against controls: random negatives versus same-complex negatives; residue-level versus
-neighbourhood-level views; and the alignment heads frozen versus fine-tuned on ΔΔG.
+**Data.** SAbDab (~7,000 antibody structures, continuously updated), restricted to those with a
+bound antigen; AbDb for cleaned, numbered Fv pairs; and the antibody–antigen subset of the PDB
+beyond SKEMPI. Leakage control is non-negotiable and this project already has the machinery for
+it: exclude, per fold, any pretraining complex whose PDB id or homology cluster appears in that
+fold's test set (`src/fusion/sampling.py::exclude_leaked`, and the cluster definition in
+`src/splits.py`).
 
-**Risk, stated plainly.** Alignment is not the same objective as ΔΔG prediction. A
-representation can be perfectly aligned and carry nothing about mutational sensitivity. The
-honest test is the same control structure used throughout: does the aligned model beat the same
-model with randomly initialised projections, at three seeds.
+**The unit is an interface neighbourhood, not a residue.** For each contact across the
+interface, take the local neighbourhood on both sides. That makes the positive pair
+*"this CDR loop against this epitope patch"* rather than *"this residue in this fold"*, which
+is the relation ΔΔG actually depends on.
 
-## 6. Bidirectional cross-modality prediction
+**Objective — two terms, and the second is the one that diagnoses.**
 
-**The idea.** Instead of pulling the two modalities together, train each to **predict the
-other**: a head that maps ESM-2 → ProteinMPNN embedding and another that maps ProteinMPNN →
-ESM-2, on unlabelled complexes, under a regression loss.
+1. **Contrastive alignment.** Project the ESM-2 view and the ProteinMPNN view of the same
+   neighbourhood into one space and train symmetric InfoNCE so matched views attract:
 
-**Why this is more interesting than it first sounds.** What the model *fails* to predict is the
-useful part. If structure can be predicted from sequence almost perfectly, the structure branch
-is adding nothing a language model does not already encode — which would be a direct, testable
-answer to the question this project could only answer as a score ("what does ProteinMPNN add
-beyond ESM?"). If it cannot, the **residual** `MPNN(x) − predict_from_seq(x)` isolates the
-structure-specific information, and *that residual* is what should be fused rather than the raw
-embedding.
+   ```
+   z_s = f_seq(ESM(nbhd))     z_t = f_str(MPNN(nbhd))
+   L   = InfoNCE(z_s, z_t) + InfoNCE(z_t, z_s)
+   ```
 
-**It is a sharper version of the fusion question.** Our fusion ladder compared six ways of
-mixing two representations and found the mechanism did not matter. This asks a prior question —
-how much non-redundant information is there to mix — and the answer would explain the ladder's
-null result rather than just recording it.
+   **Negative sampling is where the antibody specificity is enforced.** Negatives drawn from
+   *other complexes* teach complex identity — the exact failure in ERROR_ANALYSIS §8, where
+   predicting a complex's mean scores +0.672 pooled and +0.000 per complex. Negatives drawn
+   from **within the same complex**, and ideally from **within the same CDR**, force the
+   representation to be position-specific. That is a design decision this project's evidence
+   makes for us.
 
-**Concretely:** train on SAbDab complexes, measure per-residue reconstruction R², and report it
-sliced by burial and interface proximity. My expectation, from §A3's observation that
-ProteinMPNN's signal is local: reconstruction will be good on exposed residues and poor on
-buried, tightly-packed ones — which are exactly the rows the model fails on (§16, valine).
+2. **Bidirectional cross-modality prediction.** Train ESM → MPNN and MPNN → ESM on the same
+   neighbourhoods under a regression loss. What the model *fails* to predict is the useful
+   part: if structure is near-perfectly predictable from sequence, the structure branch adds
+   nothing a language model does not already encode — a direct answer to a question our fusion
+   ladder could only answer as a score. If it is not, the **residual**
+   `MPNN(x) − predict_from_seq(x)` isolates the structure-specific information, and *that*
+   is what should be fused rather than the raw embedding.
 
-## 7. Antibody-specific pretraining, done properly
+   This is the sharper version of the fusion question. The ladder compared six ways of mixing
+   two representations and found the mechanism did not matter; this asks how much
+   non-redundant information there is to mix, and would **explain** that null rather than
+   record it.
 
-AntiBERTy lost to ESM-2 by 0.046 on a matched control here. That is a real result but a narrow
-one: the antigen stayed ESM-2 either way, and **one shared projection served both sides**, so
-two unrelated spaces were being forced through one map. Either of the two objectives above
-removes that confound, at which point an antibody-specific encoder deserves a second test — its
-prior should be better on CDR loops, which is where the mutations are.
+**Then** freeze `f_seq` and `f_str` and drop them into `cat128_reg2_l1` in place of the two
+projections currently fitted to 752 labels. Everything downstream is unchanged, so the
+comparison is clean.
 
----
+## 7. How to tell whether it worked
+
+The lesson of this project is that a mechanism means nothing without a control, so:
+
+- **Primary:** the same model with the aligned projections, against the same model with
+  randomly initialised ones, at **three seeds**. Anything smaller than the seed spread is not
+  a result.
+- **The test that actually matters:** performance on the **hard tier** — the 19.8 % of rows
+  with no near-identical training twin, where the model currently scores **+0.060**. If
+  pretraining is doing what it is supposed to, that number moves. If only the easy tier
+  improves, the alignment has learned recognition again and should be rejected.
+- **A diagnostic that costs nothing:** re-measure Spearman(proximity, per-complex r). It is
+  +0.494 now. Pretraining that generalises should *reduce* it.
+- **Reconstruction R² sliced by burial**, from term 2. Prediction: good on exposed residues,
+  poor on buried and tightly packed ones — which are exactly the rows the model fails on
+  (§16, valine, under-predicted by 1.4 kcal/mol and ranked backwards). If that holds, it both
+  validates the diagnostic and names the next target.
+
+**Risks, stated.** Alignment is not ΔΔG prediction — a representation can be perfectly aligned
+and carry nothing about mutational sensitivity. Contrastive objectives are sensitive to the
+negative distribution, which is why the sampling above is specified rather than left to a
+default. And SAbDab is itself redundant: many entries are the same antibody against the same
+antigen, so it must be clustered before it is counted as data, exactly as our 53 complexes
+were.
 
 # Tier 3 — more data, which everything else points at
 
