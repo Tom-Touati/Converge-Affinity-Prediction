@@ -55,10 +55,19 @@ def main() -> None:
                 / c.loc[train.row_id.values].std().replace(0, 1.0))
 
     from model_simple import PerturbSiteToken, SiteTokenConfig
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--two-branch", action="store_true")
+    ap.add_argument("--layers", type=int, default=1)
+    ap.add_argument("--alpha-init", type=float, default=-1.56)
+    ap.add_argument("--edit-op", default="sub", choices=["sub", "mul"])
+    a, _ = ap.parse_known_args()
     cfg = SiteTokenConfig(pca_dim=128, proj=64, subtract=True, use_site_pool=False,
-                          hidden=128, layers=1, dropout=0.35, input_noise=0.25,
+                          hidden=128, layers=a.layers, dropout=0.35, input_noise=0.25,
                           feature_dropout=0.35, chem_dim=chem.shape[1] if chem is not None else 0,
-                          mpnn_proj=64, delta_xattn=True, n_heads=2, split_proj=True)
+                          mpnn_proj=64, delta_xattn=True, n_heads=2, split_proj=True,
+                          two_branch=a.two_branch, pool_alpha_init=a.alpha_init,
+                          edit_op=a.edit_op)
     net = PerturbSiteToken(cfg).eval()
 
     ds = T.DS(train, pcas, cache, cfg, False, seed=0, chem=chem)
@@ -68,17 +77,25 @@ def main() -> None:
 
     # rebuild the two blocks exactly as forward does, without the noise
     with torch.no_grad():
-        pooled, n_sites = 0, 0
+        which = ("wt", "mt") if cfg.two_branch else ("delta",)
+        acc, n_sites = {k: 0 for k in which}, 0
         for side in ("ab", "ag"):
-            d_tok = (net.proj_side[side](batch[f"seq_{side}_mt"])
-                     - net.proj_side[side](batch[f"seq_{side}_wt"]))
             kv = net.mpnn_proj(batch[f"struct_{side}"])
-            out = net.attn(d_tok, kv, batch[f"mask_{side}"])
             site = batch[f"site_{side}"].unsqueeze(-1)
-            pooled = pooled + (out * site).sum(1)
+            for k in which:
+                if k == "delta":
+                    p_mt = net.proj_side[side](batch[f"seq_{side}_mt"])
+                    p_wt = net.proj_side[side](batch[f"seq_{side}_wt"])
+                    q = p_mt * p_wt if a.edit_op == "mul" else p_mt - p_wt
+                else:
+                    q = net.proj_side[side](batch[f"seq_{side}_{k}"])
+                acc[k] = acc[k] + (net.attn(q, kv, batch[f"mask_{side}"]) * site).sum(1)
             n_sites = n_sites + site.sum(1)
+        pooled = (torch.cat([acc["wt"], acc["mt"]], -1) if cfg.two_branch else acc["delta"])
         alpha = torch.nn.functional.softplus(net.pool_alpha)
         z = pooled / (n_sites.clamp(min=1.0) * alpha)
+        if cfg.two_branch:
+            z = net.branch_mix(z)
         ch = batch["chem"]
 
     def stat(name, t):

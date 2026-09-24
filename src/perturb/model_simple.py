@@ -608,6 +608,22 @@ class SiteTokenConfig:
     #: far short of the slowest component's ~47,000-residue wavelength, so cross-chain pairs
     #: land at a large consistent separation rather than a false zero.
     rope_chain_span: int = 1024
+    #: How the mutant and wild-type sequence embeddings combine into the "delta" query.
+    #:
+    #: ``sub``  mt - wt, a DIFFERENCE. Zero wherever the model did not change anything,
+    #:          large wherever it did, sign carries the direction of the change. This is
+    #:          what every other block in the project reads.
+    #: ``mul``  mt * wt, elementwise -- a per-CHANNEL similarity rather than a change. Large
+    #:          positive where both embeddings agree in sign and magnitude on that channel
+    #:          (the mutation preserved whatever that channel encodes), near zero where
+    #:          either side is near zero on it, and negative where they disagree in sign
+    #:          (the mutation flipped it). A channel large in wt and near-zero in mt gives a
+    #:          near-zero product either way -- "this channel no longer applies" and "this
+    #:          channel was never active" are NOT distinguished, which a subtraction does
+    #:          distinguish (it would show a large negative). The standard alternative to a
+    #:          difference for comparing two vectors of the same space (NLI-style
+    #:          ``[u, v, u*v, u-v]``), tried here on its own rather than alongside the sub.
+    edit_op: str = "sub"
     #: Give each input its OWN first linear layer instead of one shared map.
     #:
     #: A shared projection forces the antibody, the antigen and ProteinMPNN into a single
@@ -983,8 +999,9 @@ class PerturbSiteToken(nn.Module):
                     continue
                 for k in which:
                     if k == "delta":
-                        seq = (tok_proj(px(batch[f"seq_{side}_mt"]), side)
-                               - tok_proj(px(batch[f"seq_{side}_wt"]), side))
+                        p_mt = tok_proj(px(batch[f"seq_{side}_mt"]), side)
+                        p_wt = tok_proj(px(batch[f"seq_{side}_wt"]), side)
+                        seq = p_mt * p_wt if c.edit_op == "mul" else p_mt - p_wt
                     else:
                         seq = tok_proj(px(batch[f"seq_{side}_{k}"]), side)
                     if c.attn_direction == "struct_to_seq":
