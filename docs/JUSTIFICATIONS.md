@@ -105,8 +105,37 @@ would not have helped either.
 **Chosen.** As above. Alternatives considered: ESM-2 35M/150M, AntiBERTy, CurrAb, ESM-IF1,
 SaProt.
 
-**Why ProteinMPNN.** An inverse-folding model scores *this residue in this pocket*, which is
-the conditional the mutation question asks. It is also cheap and runs on CPU.
+**Why ProteinMPNN — it encodes local geometry, which is exactly what a binding site is.**
+Its encoder is a message-passing network over a k-nearest-neighbour graph: each residue is
+described by distances and relative orientations to its spatial neighbours, encoded as radial
+basis functions over inter-atomic distances (N, CA, C, O and a virtual CB) plus a relative
+positional term. The representation of a residue is therefore **a description of the pocket
+around it** — which atoms are nearby, at what distance, in what arrangement.
+
+That is the question a binding-site mutation asks. ΔΔG on mutation is governed by what the
+substituted side chain can and cannot do in the space it occupies: whether it is buried or
+exposed, what it packs against, which contacts it makes across the interface. A global fold
+descriptor cannot answer that; a local geometric one can. And because it is an *inverse
+folding* model, its output is directly the conditional we want — how compatible is this
+residue with this pocket — rather than a generic embedding we would have to teach a head to
+interpret.
+
+Two further consequences of that locality, both of which we relied on:
+
+- **It is invariant to rotation and translation by construction**, since it sees only relative
+  geometry. That is why structure-rotation augmentation is a no-op here (§B5) — the features
+  would be identical.
+- **Its signal really is local, and we measured it.** Pooling ProteinMPNN over the *whole*
+  binding area instead of at the mutated residues costs ~0.05 (`area_concat` +0.227 against
+  `cat128_reg2_l1` +0.293). Averaged over ~85 interface residues the local detail washes out
+  and what remains is nearly constant per complex. The encoder's value is precisely that it is
+  resolved per residue, so pooling it coarsely discards the thing it is good at.
+
+**Evidence it contributes.** Adding ProteinMPNN to pooled ESM in the forest is worth
+**+0.093** (0.273 → 0.366, three seeds) — well clear of the 0.032 seed spread, and the
+cleanest single-modality-versus-both comparison in the project.
+
+It is also cheap: CPU-only, ~7 minutes for all 54 complexes, and frozen, so it is paid once.
 
 **Why ESM-2 rather than an antibody-specific model.** Measured, not assumed:
 **AntiBERTy lost to ESM-2 by 0.046** on a matched control (`st64_nopool_chem_abty` +0.166 vs

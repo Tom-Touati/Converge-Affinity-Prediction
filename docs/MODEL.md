@@ -26,6 +26,15 @@ Both encoders are **frozen**. Nothing in them trains.
 substitution applied and then passed through ESM again. Editing a latent vector instead would
 assume the encoder is linear in the substitution, which it is not.
 
+**Why ProteinMPNN for the structure side.** Its encoder is a message-passing network over a
+k-nearest-neighbour graph — each residue represented by distances and relative orientations to
+its spatial neighbours. A residue's embedding is therefore **a description of the pocket around
+it**, which is precisely what a binding-site mutation is a question about: what the substituted
+side chain can do in the space it occupies. Being an inverse-folding model, its output is
+already the conditional we want (how compatible is this residue with this pocket) rather than a
+generic embedding. It is also rotation- and translation-invariant by construction, and cheap —
+CPU-only, ~7 minutes for all 54 complexes, frozen.
+
 **There is no mutant structure.** ProteinMPNN sees the wild-type backbone only — the single
 sharpest limitation of this design, and the reason the structure term is identical for every
 mutation of a given complex.
