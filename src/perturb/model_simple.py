@@ -713,6 +713,48 @@ class SiteTokenConfig:
     #: GELU on pair_ffn's OWN output, before the sum -- off by default (the mul variant
     #: was asked to stay linear there), on for the sub variant by request.
     mut_pair_act: bool = False
+    #: Extends mut_pair_ffn (meant for mut_pair_op="sub") with a structural cross-
+    #: attention term, concatenated with the sequence term before the mlp.
+    #:
+    #: KEY/VALUE: for every ag crop residue, GELU(mpnn_proj(struct_ag)) minus its
+    #: nearest ab residue's GELU(mpnn_proj(struct_ab)) -- nearest by the crop's
+    #: wild-type Ca distance matrix, the same mechanism ab_ag_nn uses -- one difference
+    #: token per ag position: how this ag position's local structural environment
+    #: differs from the ab residue closest to it.
+    #:
+    #: QUERY: "the mutations" -- the same LN(mt)-LN(wt) tokens the sequence term already
+    #: computes, from EITHER side, run once with ab as query and once with ag, both
+    #: against the SAME ag-indexed difference tokens, summed. Computed and attended at
+    #: every crop position, pooled at the mutated ones afterward -- the same idiom every
+    #: delta_xattn-style term in this file uses, rather than a variable-length gather.
+    #:
+    #: RoPE on both sides (base 200, as tuned for this dataset): the query's own residue
+    #: index, whichever side it comes from, against the key's ag residue index.
+    mut_pair_struct_xattn: bool = False
+    #: A second, more general way to inject structure into mut_pair_ffn's sequence-only
+    #: backbone -- one mode string covering 8 distinct mechanisms, plus chem_dim>0 covers
+    #: two more (raw scalar concat, via the existing chem/geom table plumbing rather than
+    #: new code). "none" is the pure sequence-only baseline.
+    #:
+    #: LEARNED-EMBEDDING mechanisms, all built from mpnn_proj(struct):
+    #:   site_concat        wt structure, site_mean pooled at the MUTATED residues, CONCAT
+    #:   crop_concat        wt structure, pooled over the whole BINDING SITE (crop), CONCAT
+    #:   film_site          site-pooled structure FiLM-modulates the sequence term instead
+    #:                      of being concatenated: z = (1+gamma(s))*z_seq + beta(s)
+    #:   gated_site         a learned gate decides how much of the site-structure term
+    #:                      to add: z = z_seq + sigmoid(Linear([z_seq,s])) * Linear(s)
+    #:   nn_diff_concat     the ag-vs-nearest-ab structural difference mut_pair_struct_xattn
+    #:                      attends to, concatenated directly instead -- tests whether
+    #:                      the attention step itself was why structure didn't help there
+    #:   seq_to_struct_attn cross-attention: the mutation token queries the RAW per-side
+    #:                      structure (not the nn-difference), concatenated. RoPE both sides
+    #:   struct_to_seq_attn the reverse direction: structure queries the mutation token
+    #:
+    #: PURE GEOMETRY, no learned embedding:
+    #:   dist_scalar_concat the nearest-neighbour distance itself at the mutated residue
+    #:                      (a raw number, not an embedding of one)
+    mut_pair_struct_inject: str = "none"
+
     #: Give each input its OWN first linear layer instead of one shared map.
     #:
     #: A shared projection forces the antibody, the antigen and ProteinMPNN into a single
@@ -872,8 +914,34 @@ class PerturbSiteToken(nn.Module):
         if c.mut_pair_ffn:
             self.pair_ln = nn.LayerNorm(w, elementwise_affine=False)  # no params, so one
             self.pair_ffn = nn.Linear(w, w)                           # instance is fine
-            blocks: list[nn.Module] = []
             d = w
+            if c.mut_pair_struct_xattn:
+                self.mpnn_proj = nn.Linear(seq_in, w, bias=False)
+                self.diff_attn = CrossAttn(w, c.n_heads, c.dropout,
+                                           rope=True, rope_base=c.rope_base)
+                d = w * 2                       # sequence term concat structure term
+            mode = c.mut_pair_struct_inject
+            if mode != "none":
+                self.mpnn_proj = nn.Linear(seq_in, w, bias=False)
+                self.struct_ln = nn.LayerNorm(w, elementwise_affine=False)
+                if mode in ("site_concat", "crop_concat", "nn_diff_concat"):
+                    d = w * 2
+                elif mode == "film_site":
+                    self.film = nn.Linear(w, 2 * w)                 # -> gamma, beta
+                elif mode == "gated_site":
+                    self.gate = nn.Linear(2 * w, w)
+                    self.gate_val = nn.Linear(w, w, bias=False)
+                elif mode in ("seq_to_struct_attn", "struct_to_seq_attn"):
+                    self.diff_attn = CrossAttn(w, c.n_heads, c.dropout,
+                                               rope=True, rope_base=c.rope_base)
+                    d = w * 2
+                elif mode == "dist_scalar_concat":
+                    d = w + 1
+            if c.chem_dim:
+                # the two scalar-table modes (geometry columns, mpnn zero-shot scores)
+                # reuse the existing chem plumbing rather than new code -- a plain concat
+                d += c.chem_dim
+            blocks: list[nn.Module] = []
             for _ in range(c.layers):
                 blocks += [nn.Linear(d, c.hidden), nn.GELU(), nn.Dropout(c.dropout)]
                 d = c.hidden
@@ -988,6 +1056,118 @@ class PerturbSiteToken(nn.Module):
             acc = acc + (h * site).sum(1)
         return acc
 
+    def _mut_pair_struct(self, batch, px, tok_proj) -> torch.Tensor:
+        """ag-indexed structural diffs (ag minus nearest ab, geometry) as keys/values;
+        the mutation tokens (LN(mt)-LN(wt), from either side) as queries. RoPE both sides.
+        """
+        dist = batch["dist"]                                      # (B, Lab, Lag)
+        nn_idx = dist.argmin(dim=1, keepdim=True).squeeze(1).unsqueeze(-1)  # (B, Lag, 1)
+        gelu = torch.nn.functional.gelu
+        st_ab = gelu(self.mpnn_proj(px(batch["struct_ab"])))
+        st_ag = gelu(self.mpnn_proj(px(batch["struct_ag"])))
+        nn_ab = torch.gather(st_ab, 1, nn_idx.expand(-1, -1, st_ab.shape[-1]))
+        struct_diff = st_ag - nn_ab                                # (B, Lag, w)
+        kv_mask = batch["mask_ag"].bool()
+        kv_pos = self.rope_pos(batch, "ag")
+
+        acc = 0
+        for side in ("ab", "ag"):
+            site = batch[f"site_{side}"].unsqueeze(-1)
+            p_mt = gelu(tok_proj(px(batch[f"seq_{side}_mt"]), side))
+            p_wt = gelu(tok_proj(px(batch[f"seq_{side}_wt"]), side))
+            q = self.pair_ln(p_mt) - self.pair_ln(p_wt)     # the mutation token, ANY side
+            q_pos = self.rope_pos(batch, side)
+            out = self.diff_attn(q, struct_diff, kv_mask, q_pos, kv_pos)
+            acc = acc + (out * site).sum(1)
+        return acc
+
+    def _mut_seq(self, batch, px, tok_proj, side: str) -> torch.Tensor:
+        """The per-position mutation token, GELU(proj) -> LN(mt)-LN(wt), NOT yet pooled.
+
+        Shared by _mut_pair_ffn (which pools it immediately) and every struct_inject
+        mode that needs the per-residue field to query or gate against.
+        """
+        gelu = torch.nn.functional.gelu
+        p_mt = gelu(tok_proj(px(batch[f"seq_{side}_mt"]), side))
+        p_wt = gelu(tok_proj(px(batch[f"seq_{side}_wt"]), side))
+        return self.pair_ln(p_mt) - self.pair_ln(p_wt)
+
+    def _mut_pair_struct_inject(self, batch, px, tok_proj) -> torch.Tensor:
+        """z_seq from _mut_pair_ffn, plus one of 8 structural mechanisms -- see
+        SiteTokenConfig.mut_pair_struct_inject for what each mode means.
+        """
+        c = self.cfg
+        mode = c.mut_pair_struct_inject
+        z_seq = self._mut_pair_ffn(batch, px, tok_proj)
+        if mode == "none":
+            return z_seq
+
+        gelu = torch.nn.functional.gelu
+        dist = batch["dist"]                                       # (B, Lab, Lag)
+
+        if mode in ("site_concat", "crop_concat"):
+            key = "site" if mode == "site_concat" else "mask"
+            z_st = 0
+            for side in ("ab", "ag"):
+                st = self.struct_ln(gelu(self.mpnn_proj(px(batch[f"struct_{side}"]))))
+                z_st = z_st + site_mean(st, batch[f"{key}_{side}"])
+            return torch.cat([z_seq, z_st], dim=-1)
+
+        if mode == "film_site":
+            z_st = 0
+            for side in ("ab", "ag"):
+                st = self.struct_ln(gelu(self.mpnn_proj(px(batch[f"struct_{side}"]))))
+                z_st = z_st + site_mean(st, batch[f"site_{side}"])
+            gamma, beta = self.film(z_st).chunk(2, dim=-1)
+            return (1 + gamma) * z_seq + beta
+
+        if mode == "gated_site":
+            z_st = 0
+            for side in ("ab", "ag"):
+                st = self.struct_ln(gelu(self.mpnn_proj(px(batch[f"struct_{side}"]))))
+                z_st = z_st + site_mean(st, batch[f"site_{side}"])
+            g = torch.sigmoid(self.gate(torch.cat([z_seq, z_st], dim=-1)))
+            return z_seq + g * self.gate_val(z_st)
+
+        if mode == "nn_diff_concat":
+            # symmetric: an ag residue paired with its nearest ab, AND the reverse, each
+            # pooled at ITS OWN side's mutated positions -- a mutation on either side
+            # reaches a real term, unlike a one-directional version would.
+            st_ab = self.struct_ln(gelu(self.mpnn_proj(px(batch["struct_ab"]))))
+            st_ag = self.struct_ln(gelu(self.mpnn_proj(px(batch["struct_ag"]))))
+            nn_for_ag = dist.argmin(dim=1, keepdim=True).squeeze(1).unsqueeze(-1)  # (B,Lag,1)
+            nn_for_ab = dist.argmin(dim=2, keepdim=True)                          # (B,Lab,1)
+            diff_ag = st_ag - torch.gather(st_ab, 1, nn_for_ag.expand(-1, -1, st_ab.shape[-1]))
+            diff_ab = st_ab - torch.gather(st_ag, 1, nn_for_ab.expand(-1, -1, st_ag.shape[-1]))
+            z_st = site_mean(diff_ag, batch["site_ag"]) + site_mean(diff_ab, batch["site_ab"])
+            return torch.cat([z_seq, z_st], dim=-1)
+
+        if mode in ("seq_to_struct_attn", "struct_to_seq_attn"):
+            z_st = 0
+            for side in ("ab", "ag"):
+                st = gelu(self.mpnn_proj(px(batch[f"struct_{side}"])))
+                mut = self._mut_seq(batch, px, tok_proj, side)     # per-position, unpooled
+                pos = self.rope_pos(batch, side)
+                mask = batch[f"mask_{side}"].bool()
+                site = batch[f"site_{side}"].unsqueeze(-1)
+                if mode == "seq_to_struct_attn":
+                    out = self.diff_attn(mut, st, mask, pos, pos)
+                else:
+                    out = self.diff_attn(st, mut, mask, pos, pos)
+                z_st = z_st + (out * site).sum(1)
+            return torch.cat([z_seq, z_st], dim=-1)
+
+        if mode == "dist_scalar_concat":
+            # the raw number, not an embedding of one: how far is the mutated residue
+            # from its nearest partner on the other side
+            d_for_ag = dist.min(dim=1).values.unsqueeze(-1)        # (B, Lag, 1)
+            d_for_ab = dist.min(dim=2).values.unsqueeze(-1)        # (B, Lab, 1)
+            z_d = (site_mean(d_for_ag, batch["site_ag"])
+                  + site_mean(d_for_ab, batch["site_ab"]))
+            return torch.cat([z_seq, z_d], dim=-1)
+
+        raise ValueError(f"unknown mut_pair_struct_inject: {mode!r}")
+
     def _seq_mul_struct_attn(self, batch, px, tok_proj) -> torch.Tensor:
         """mt*wt sequence term (pooled at the mutated site) concat a no-residual structure
         query pooled over the BINDING SITE -- the whole crop, not just the mutated
@@ -1096,10 +1276,22 @@ class PerturbSiteToken(nn.Module):
             def px0(x): return x               # no noise/dropout in this reference check
             def tp0(x, side="ab"):
                 return self.proj_side[side](x) if self.proj_side is not None else x
-            fn = (self._mut_pair_ffn if c.mut_pair_ffn
-                 else self._seq_mul_struct_attn if c.seq_mul_struct_attn
-                 else self._ab_ag_nn if c.ab_ag_nn else self._ab_ag_interaction)
-            return self.mlp(fn(batch, px0, tp0)).squeeze(-1)
+            if c.mut_pair_ffn:
+                if c.mut_pair_struct_inject != "none":
+                    z = self._mut_pair_struct_inject(batch, px0, tp0)
+                else:
+                    z = self._mut_pair_ffn(batch, px0, tp0)
+                    if c.mut_pair_struct_xattn:
+                        z = torch.cat([z, self._mut_pair_struct(batch, px0, tp0)], dim=-1)
+                if c.chem_dim:
+                    # the two scalar-table injection modes (geometry columns, mpnn
+                    # zero-shot scores) add no model code -- just this concat
+                    z = torch.cat([z, batch["chem"]], dim=-1)
+            else:
+                fn = (self._seq_mul_struct_attn if c.seq_mul_struct_attn
+                     else self._ab_ag_nn if c.ab_ag_nn else self._ab_ag_interaction)
+                z = fn(batch, px0, tp0)
+            return self.mlp(z).squeeze(-1)
         # The scale and the dropout mask are per WIDTH. They used to be taken once from
         # seq_ab_wt and applied to everything, which held only while the PCA made the
         # sequence and the structure both 128 wide. Without it the sequence is 1280 and
