@@ -682,13 +682,14 @@ class SiteTokenConfig:
     #: they answer different questions) and passed to the mlp alone. No chem, no geom.
     seq_mul_struct_attn: bool = False
     #: Sequence only, no structure, no chem. At each MUTATED residue: LayerNorm the
-    #: projected mutant and wild-type embeddings separately, multiply them elementwise,
+    #: projected mutant and wild-type embeddings separately -- with a GELU right on that
+    #: initial projection, the one activation in this design -- multiply the two elementwise,
     #: push the product through one Linear (shared across sides -- it acts on an
     #: already-fused mt*wt product, not a raw single-modality input, so the no-shared-
     #: first-layer rule does not apply to it), NO activation before the sum, then SUM
     #: over the mutated residues -- a plain sum, no division by count and no learned
     #: pooling scale this time. Summed over ab and ag the same way every other pooled
-    #: term here is. The mlp head's own GELU is the first nonlinearity the signal meets.
+    #: term here is.
     #:
     #: No zero invariant: mt==wt gives LN(wt) * LN(wt), the square of a normalised vector,
     #: not zero -- there is no subtraction anywhere in this design. Same property that
@@ -952,14 +953,17 @@ class PerturbSiteToken(nn.Module):
             self.ord_gap = nn.Parameter(torch.full((c.ordinal - 1,), 0.5))
 
     def _mut_pair_ffn(self, batch, px, tok_proj) -> torch.Tensor:
-        """At each mutated residue: LN(mt) * LN(wt) -> Linear -> GELU, summed over sites."""
+        """At each mutated residue: GELU(proj) -> LN(mt)*LN(wt) -> Linear, summed raw."""
         acc = 0
         for side in ("ab", "ag"):
             site = batch[f"site_{side}"].unsqueeze(-1)
-            p_mt = tok_proj(px(batch[f"seq_{side}_mt"]), side)
-            p_wt = tok_proj(px(batch[f"seq_{side}_wt"]), side)
+            # the activation sits on the INITIAL projection, not on pair_ffn's output --
+            # local to this check, not on the shared proj_side every other architecture
+            # in this file reads unactivated
+            p_mt = torch.nn.functional.gelu(tok_proj(px(batch[f"seq_{side}_mt"]), side))
+            p_wt = torch.nn.functional.gelu(tok_proj(px(batch[f"seq_{side}_wt"]), side))
             prod = self.pair_ln(p_mt) * self.pair_ln(p_wt)
-            h = self.pair_ffn(prod)             # no activation here -- summed raw
+            h = self.pair_ffn(prod)             # still no activation before the sum
             acc = acc + (h * site).sum(1)
         return acc
 
