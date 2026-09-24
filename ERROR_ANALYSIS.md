@@ -712,3 +712,95 @@ agree.
 **What should change because of this.** Any reported number on this dataset should carry its
 difficulty mix, and a model intended for novel targets should be selected on the hard tier
 rather than on the average. Doing the latter selects for retrieval.
+
+## 21. Frequency versus proximity — which kind of support actually helps
+
+§15 asked whether a complex's **frequency** (how many rows it has) predicts performance; §20
+asked how far it is from the training set. This separates the two, because they are different
+kinds of support and only one of them matters.
+
+For each complex: rows in the dataset, count of other complexes within a TM threshold in its
+*training* folds, and the maximum TM to any training complex.
+
+```
+53 complexes
+  rows per complex           median 9,  max 87
+  neighbours at TM >= 0.8 in training   median 2, max 11, and ZERO for 14 complexes
+```
+
+### Spearman against per-complex r (32 scorable complexes)
+
+| support measure | forest | `l1_gated` |
+| --- | --- | --- |
+| **frequency** — rows the complex has | +0.039 | +0.092 |
+| neighbours in training at TM ≥ 0.8 | +0.071 | +0.186 |
+| neighbours in training at TM ≥ 0.5 | +0.064 | +0.200 |
+| **proximity** — max TM to any training complex | **+0.170** | **+0.369** |
+
+**How often a complex appears is very nearly irrelevant** (+0.039 / +0.092). **How close it is
+to something in training is what matters**, and it matters roughly twice as much to the network
+as to the forest (+0.369 against +0.170).
+
+That is the homology dependence of §11 and §20 measured a third way, on a different axis, and
+it agrees: the network's performance tracks structural proximity, the forest's much less so.
+
+### Binned by how many structural relatives a complex has in training
+
+| neighbours (TM ≥ 0.8) | complexes | rows | forest | `l1_gated` |
+| --- | --- | --- | --- | --- |
+| **0 — isolated** | 10 | 221 | 0.345 | **0.190** |
+| 1–2 | 11 | 326 | 0.370 | 0.297 |
+| 3+ | 11 | 342 | **0.473** | **0.404** |
+
+The network **more than doubles**, 0.190 → 0.404, as structural relatives accumulate; the
+forest improves by less than half that, 0.345 → 0.473. Ten complexes — 221 rows, 24 % of the
+data — have no structural relative in training at all, and on those the network is at 0.190.
+
+**The practical reading.** Adding more *measurements of complexes we already have* should be
+expected to do little: frequency does not predict performance. Adding *new complexes near an
+untested region of structure space* is what would help, and the isolated bin is where the model
+is weakest.
+
+## 22. The cluster split, and why it is the honest protocol
+
+The numbers above explain why this project reports a homology-clustered split alongside the
+by-complex one, and why the cluster split is treated as the more honest of the two.
+
+**How the clusters are built** (`src/splits.py`). Links between complexes come from three
+sources, unioned into connected components:
+
+1. **SKEMPI's own `Hold_out_proteins` annotation** — using the dataset authors' definition of
+   homology is the most defensible default. It is not repeated on every row, so it is unioned
+   across all rows of a complex.
+2. **Pairwise sequence identity on either side** — local Smith-Waterman with BLOSUM62, identity
+   over the shorter sequence. **Antigens link at 30 %**, the usual homology threshold.
+   **Antibodies link at 90 %**, deliberately much higher: shared framework regions put two
+   *unrelated* antibodies at 70–80 % identity, so the usual threshold would merge everything.
+3. **Curator notes** — SKEMPI flags "HyHEL-10 and HyHEL-63 are very similar" on 151 rows. That
+   is a manual link regardless of what the automatic thresholds return.
+
+Connected components of that graph are the clusters; folds are assigned over clusters, giving
+4 folds rather than 5.
+
+**Why it matters, in one line.** Under by-complex grouping **42 of 54 complexes gain a TM > 0.8
+training twin; under cluster grouping, 0 of 54 do.** `data/tm_tiers.csv` records every complex
+as `hard` under cluster grouping, by construction.
+
+So the two protocols are not two views of the same difficulty — they are the two ends of §20's
+tier table:
+
+| | easy rows | hard rows | forest | network |
+| --- | --- | --- | --- | --- |
+| by complex (`frozen5`) | 75 % | 20 % | 0.418 | 0.246 |
+| by cluster | 0 % | 100 % | 0.224 | 0.084 |
+| §20's *hard tier only*, by complex | — | — | 0.270 | 0.117 |
+
+The cluster numbers and the hard-tier numbers agree to within the seed noise, which is the
+check that the two analyses are measuring the same thing. **A by-complex split reports
+performance that is three-quarters near-retrieval; a cluster split reports performance on
+genuinely novel structure.** For antibody engineering against a new target, the second is the
+number that matters — and it is 0.224 for the baseline and 0.084 for the network.
+
+The by-complex split is still reported because it is the field's de facto protocol
+(RDE-Network, DiffAffinity) and dropping it would make this work incomparable to published
+results. It is reported *alongside*, never instead.

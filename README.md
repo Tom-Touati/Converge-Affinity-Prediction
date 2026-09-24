@@ -268,6 +268,10 @@ Spearman is unchanged at +0.3613). Even calibrated it does not reach the best ne
   that class r = 0.007. X→A is 46 % of the data and the model is twice as good on it. Valine is
   under-predicted by 1.4 kcal/mol and ranked backwards. 21 of 53 complexes are too small to
   enter the headline metric at all.
+- **Proximity predicts performance; frequency does not.** How many rows a complex has barely
+  correlates with per-complex r (+0.04 forest / +0.09 network); how structurally close it is to
+  training does (+0.17 / +0.37). Complexes with no structural relative in training — 10 of 53,
+  24 % of rows — score 0.190 on the network against 0.404 for those with three or more.
 - **Three quarters of test rows have a near-identical training twin** (median TM 0.991), and
   only 19.8 % are genuinely hard. On those hard rows the forest scores +0.270 and the network
   +0.117 — so the headline numbers are 75 % weighted toward near-retrieval, and the honest
