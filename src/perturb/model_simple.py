@@ -489,6 +489,31 @@ class SiteTokenConfig:
     #: one arrangement in the family that lets a mutation's representation depend on what
     #: it is binding to. Uses the same CrossAttn block; set cross_attn as well.
     ab_ag_attn: bool = False
+    #: The sequence EDIT queries the structure.
+    #:
+    #: Every other attention variant here makes raw sequence tokens the queries and pools
+    #: afterwards, so the thing being attended is a residue, not a mutation. Here the query
+    #: is `proj(mut) - proj(wt)` at each mutated position, and the keys and values are the
+    #: ProteinMPNN tokens over the binding site. The question asked is therefore "given this
+    #: edit, what does the surrounding structure say about it" rather than "given this
+    #: residue, what does the structure say".
+    #:
+    #: Pooling is a sum over the mutated positions divided by their count AND by a learned
+    #: positive scalar: mean / alpha. The division by count makes multi-point and
+    #: single-point rows comparable; alpha lets the network set how loudly this block speaks
+    #: against the chem columns it is concatenated with. It is deliberately NOT followed by
+    #: a LayerNorm, which would undo it.
+    delta_xattn: bool = False
+    #: Initial value of the learned pooling denominator, BEFORE softplus.
+    #:
+    #: Not zero, which is the obvious choice and the wrong one. softplus(0) = 0.693 left the
+    #: attended edit at sd 0.216 against the chem block's 0.799 -- a 3.7x mismatch at the
+    #: concatenation, with the quieter block being the only one that varies between
+    #: mutations of the same complex. -1.56 gives softplus = 0.187, which puts the two at
+    #: parity on fold 0 (measured by probe_fusion_scale.py). Training is free to move it;
+    #: this only decides where it starts, and starting a block 3.7x too quiet means its
+    #: gradient is small exactly when it most needs to learn.
+    pool_alpha_init: float = -1.56
     #: Give each input its OWN first linear layer instead of one shared map.
     #:
     #: A shared projection forces the antibody, the antigen and ProteinMPNN into a single
@@ -595,7 +620,7 @@ class PerturbSiteToken(nn.Module):
         # ProteinMPNN's PCA output is 128-d like the sequence's, so `proj` maps both into
         # one space and no separate input layer is needed before the dot product.
         self.attn = (CrossAttn(w, c.n_heads, c.dropout, c.res_pre, c.res_post)
-                     if (c.cross_attn or c.ab_ag_attn) else None)
+                     if (c.cross_attn or c.ab_ag_attn or c.delta_xattn) else None)
         if c.film_struct:
             self.g_str, self.b_str = nn.Linear(w, w), nn.Linear(w, w)
             for lin in (self.g_str, self.b_str):
@@ -606,7 +631,8 @@ class PerturbSiteToken(nn.Module):
         str_in = self.gr_str.out_dim if self.gr_str is not None else c.pca_dim
         # Always separate when structure is read at all: falling back to the sequence
         # projection is exactly the weight sharing this is meant to avoid.
-        uses_struct = c.cross_attn or c.film_struct or c.concat_struct
+        uses_struct = (c.cross_attn or c.film_struct or c.concat_struct
+                       or c.delta_xattn)
         self.mpnn_proj = (nn.Linear(str_in, w, bias=False)
                           if uses_struct and (c.mpnn_proj or c.split_proj) else None)
 
@@ -623,6 +649,11 @@ class PerturbSiteToken(nn.Module):
             [nn.LayerNorm(pw, elementwise_affine=False) for _ in range(2)]
         ) if c.use_site_pool else None
         d = w * n_tok + (pw * 2 if c.use_site_pool else 0) + c.chem_dim
+        if c.delta_xattn:
+            d = w + c.chem_dim
+            # softplus keeps the denominator positive: a learned scalar free to cross
+            # zero would flip the sign of this whole block part-way through training
+            self.pool_alpha = nn.Parameter(torch.full((1,), c.pool_alpha_init))
         if c.concat_struct:
             # its own norm, for the same reason the other blocks have one: the edit is
             # a difference of two token vectors and is small, the structure pool is an
@@ -753,6 +784,34 @@ class PerturbSiteToken(nn.Module):
             else:
                 x = self.attn(seq, stp, batch[f"mask_{side}"])
             return site_mean(x, batch[f"site_{side}"])
+
+        if c.delta_xattn:
+            # The QUERY is the edit itself, not a residue. Built over the whole crop so the
+            # batch stays rectangular, then restricted to the mutated positions after the
+            # attention -- gathering variable-length queries per row would need ragged
+            # tensors for no gain.
+            pooled, n_sites = 0, 0
+            for side in ("ab", "ag"):
+                d_tok = (tok_proj(px(batch[f"seq_{side}_mt"]), side)
+                         - tok_proj(px(batch[f"seq_{side}_wt"]), side))
+                st = px(batch[f"struct_{side}"])
+                if self.gr_str is not None:
+                    st = self.gr_str(st)
+                kv = self.mpnn_proj(st) if self.mpnn_proj is not None else tok_proj(st, side)
+                # keys and values are the ProteinMPNN tokens over the binding site: the crop
+                # mask, not the mutated positions
+                out = self.attn(d_tok, kv, batch[f"mask_{side}"])
+                site = batch[f"site_{side}"].unsqueeze(-1)
+                pooled = pooled + (out * site).sum(1)
+                n_sites = n_sites + site.sum(1)
+            # sum over the mutated positions, divided by their count and by a learned
+            # positive scalar. The count makes a 6-point row comparable to a 1-point row;
+            # alpha sets how loudly this speaks next to the chem columns.
+            z = pooled / (n_sites.clamp(min=1.0)
+                          * torch.nn.functional.softplus(self.pool_alpha))
+            if c.chem_dim:
+                z = torch.cat([z, batch["chem"]], dim=-1)
+            return self.mlp(z).squeeze(-1)
 
         tok_wt = sum(tokens("wt", s) for s in ("ab", "ag"))
         tok_mt = sum(tokens("mt", s) for s in ("ab", "ag"))
