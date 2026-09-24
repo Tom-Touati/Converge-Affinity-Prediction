@@ -5,12 +5,88 @@ Part II is the error analysis of the *evaluation*.
 Part III is bias from imbalance -- labels, complexes and mutation types -- and is
 where the aggregate metric is shown to conceal the failures that matter most.
 
+**Start with "The metrics, and why each one exists" below.** Several numbers in this
+document are traps without it: three of the obvious metrics are beaten by a model that never
+looks at the mutation.
+
 > **Superseded in places — see [HANDOFF.md](docs/HANDOFF.md).** Numbers here predate two
 > corrections: the per-complex threshold moved from 10 mutations to 5 (the model to beat
 > reads 0.388, not 0.498, on the same predictions), and residual learning was removed.
 > Any figure produced by a net trained on `ddG - forest_prediction` had the forest added
 > back at inference and is not that network's own score.
 
+
+---
+
+# The metrics, and why each one exists
+
+Every metric here was added because something else failed to catch a specific defect. Read
+this first; several of the numbers below are traps without it.
+
+## The standard table — `scripts/report_runs.py`, printed for every run
+
+| metric | the question it answers | what it caught |
+| --- | --- | --- |
+| **`per_cx_r`, `per_cx_rho`** | can the model rank mutations *within* one complex | **the headline.** Everything else exists to stop it being read naively |
+| **`cx_neg`** | how many complexes end with a *negative* within-complex correlation | 6–11 of 32. The mean conceals that the model is actively wrong on some complexes |
+| **`pooled_r`** | correlation over all rows at once | reported in order to be discredited — the complex-mean floor scores **+0.672** on it |
+| **`rmse`** | absolute error, kcal/mol | dominated by between-complex structure; the floor beats every model at **1.144** |
+| **`bias`** | mean signed error | −0.05 to −0.53 depending on model, and strongly seed-dependent |
+| **`rmse_deb`** | RMSE after removing that offset | separates "wrong on average" from "wrong per row" |
+| **`sign`** | direction correct on \|ΔΔG\| > 0.5 | 0.76–0.82, which looks good and is mostly the 70 %-destabilising prior |
+| **`sign_bal`** | the same, class-balanced | **0.59 for the forest.** This is the one that exposes the prior |
+| **`conc`** | of two mutations on one complex, is the ordering right (pairs > 0.5 apart) | the design question restated; forest 0.74, networks ~0.66 |
+
+## Two reference lines, without which none of the above is readable
+
+**The floor — predicting each complex's own mean**, a model that never looks at the mutation:
+**+0.672 pooled, 1.144 RMSE, 0.580 balanced accuracy, +0.000 per complex.** It beats every
+model in this project on three of those four. `report_runs.py` prints it beneath every
+comparison for that reason (§8).
+
+**The ceiling — label noise.** Measurement sd is **0.240 kcal/mol** across 107 repeated
+(complex, mutation) pairs, implying a maximum attainable per-complex Pearson of **0.979**. We
+reach 0.381, so about 60 % of the reachable signal is unclaimed and the assay is not what
+withholds it (§23).
+
+## Why the headline metric cannot be gamed by bias or compression
+
+Pearson correlation is invariant to any affine transform of the predictions, so neither a
+constant offset nor a compressed output range can move it. Verified rather than asserted:
+
+| transform | per-complex r | RMSE | balanced acc |
+| --- | --- | --- | --- |
+| forest, as scored | +0.3974 | 1.335 | 0.439 |
+| forest, bias removed (−0.050) | **+0.3974** | 1.334 | 0.434 |
+| forest, bias *and* scale corrected | **+0.3974** | 1.530 | 0.502 |
+| `cat128_reg2_l1`, as scored | +0.3003 | 1.448 | 0.463 |
+| `cat128_reg2_l1`, bias removed (−0.161) | **+0.3003** | 1.439 | 0.435 |
+
+Identical to four decimals. So the submitted model carrying a −0.161 bias against the forest's
+−0.050 gives it **no advantage or disadvantage** in the headline comparison.
+
+What *is* bias-sensitive: **RMSE**, which is why raw and debiased are printed side by side; and
+the **classification metrics**, heavily — which is why calibration moves stabilising recall
+0.06 → 0.29 while leaving Spearman at +0.3613 (§14).
+
+One detail worth noticing in that table: correcting the *scale* makes RMSE **worse**
+(1.335 → 1.530). Shrinking toward the mean is optimal under squared error when uncertain. The
+compression only becomes a defect at the moment you threshold.
+
+## The four metrics the deeper sections add
+
+| metric | why the standard table was not enough |
+| --- | --- |
+| **balanced 3-class accuracy + per-class recall** (§14) | classes are 13/34/53, so accuracy rewards guessing the majority. This is what exposed the forest finding **7 of 126** stabilising mutations |
+| **Spearman(sign(ΔΔG), signed error)** (§14) | **−0.61.** One number for the central defect. Its companion Spearman(sign, \|error\|) ≈ 0 is what proves the model is *precise and wrong in direction* rather than merely noisy |
+| **Spearman(descriptor, error), partialled** (§19, §24) | raw versions are confounded by the label. Partialling reverses several and reveals others — the forest mis-weights burial, the network mis-weights the substitution |
+| **per-complex r sliced by difficulty** (§20–§21) | the same metric by max TM to training: **+0.367 easy, +0.060 hard.** Arguably the most important number here, since the headline is 75 % weighted toward near-retrieval |
+
+## The one-line summary
+
+The headline is **per-complex correlation**. Pooled correlation, RMSE and accuracy are each
+beaten by a model that ignores the mutation entirely, so all three are reported **with their
+floor attached** or not at all.
 
 # Part I — errors of the model
 
