@@ -12,6 +12,7 @@ network.
 | Where to look | |
 | --- | --- |
 | Results and what beats what | [Results](#results) below |
+| **The multimodal model, specified in full** | **[docs/MODEL.md](docs/MODEL.md)** |
 | Model and the decisions behind it | [The model](#the-model-and-why-it-is-this-one) below |
 | How the two modalities are combined, and six ways that did not help | [Fusion](#multimodal-fusion-what-was-tried) below |
 | Error analysis — the graded core | **[ERROR_ANALYSIS.md](ERROR_ANALYSIS.md)** |
@@ -144,7 +145,40 @@ and the table above says so.
 
 ---
 
-## Multimodal fusion: what was tried
+## The multimodal fusion model
+
+**[`l1_gated`](docs/MODEL.md) — gated fusion of ESM-2 and ProteinMPNN at the mutated residues,
+48,001 parameters.** Fully specified in [docs/MODEL.md](docs/MODEL.md); the essentials:
+
+```
+ESM-2 650M  -> PCA-128 -.
+                         >- Linear(128->64) shared -> site_mean over mutated residues
+ProteinMPNN -> PCA-128 -'
+
+z_seq = LayerNorm( site_mean(mutant) - site_mean(wild-type) )        64
+z_str = LayerNorm( site_mean(structure at those residues) )          64
+chem                                                                 26
+
+g = sigmoid( W [z_seq ; z_str ; chem] )        per-channel gates, both modalities
+z = [ g*z_seq ; g*z_str ; chem ]                                    154
+    Linear(154->128) GELU Drop(0.35) Linear(128->1)
+```
+
+The gate is computed from **both modalities and the chemistry together**, so the model chooses
+per row and per channel how much of each to admit, rather than mixing at a fixed ratio.
+
+| | ensemble | per seed | spread |
+| --- | --- | --- | --- |
+| **`l1_gated`** | **+0.300** | +0.264 / +0.249 / +0.235 | **0.028** |
+| plain concatenation | +0.293 | +0.274 / +0.234 / +0.210 | 0.063 |
+| **no-fusion control** | **+0.212** | — | — |
+
+**It clears the no-fusion control by +0.088**, about three times the seed spread — fusing the
+modalities is worth something and this is the measurement that says so. **It does not beat
+plain concatenation** (+0.007, inside the noise); gating is chosen because it is a real fusion
+mechanism, is no worse, and is twice as stable across seeds.
+
+### The five mechanisms it was chosen over
 
 The interesting result is negative, and it is only interpretable because the control exists.
 
