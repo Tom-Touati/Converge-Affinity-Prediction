@@ -280,6 +280,14 @@ Spearman is unchanged at +0.3613). Even calibrated it does not reach the best ne
 - **Regression to the mean is the dominant error structure**: ρ ≈ −0.8 between signed error and
   true ΔΔG *for every architecture*, and ρ ≈ −0.58 even within a complex. One fact explains the
   class bias, the valine failure and the compressed output range together.
+- **With the label partialled out, the two models fail on different axes.** The forest
+  mis-weights **burial** — at equal true ΔΔG it predicts buried, highly-contacting sites higher
+  (partial ρ −0.59 on distance to partner, +0.50 on contacts, invisible in the raw +0.005 and
+  −0.12). The network mis-weights the **substitution**: it over-predicts alanine (+0.57) and
+  under-predicts large volume and mass changes (−0.52, −0.60). That is the mechanism behind
+  their low error agreement, and behind the blend beating both.
+- **The forest's errors are predictable at ρ = 0.416 from features it already has**,
+  cross-validated by complex. Unused signal, by definition.
 - **Imbalance bias.** The average stabilising mutation is predicted *destabilising*, and within
   that class r = 0.007. X→A is 46 % of the data and the model is twice as good on it. Valine is
   under-predicted by 1.4 kcal/mol and ranked backwards. 21 of 53 complexes are too small to

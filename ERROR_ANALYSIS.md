@@ -576,7 +576,8 @@ rows), and a feature set built per-residue has no way to represent epistasis.
 §14–§17 found failures by hand. This is the same question asked of every available descriptor
 against every model at once, so that a defect belonging to the *task* can be told from one
 belonging to an architecture. Spearman throughout; regenerate with
-`python scripts/error_drivers.py`.
+`python scripts/error_drivers.py`. **The raw correlations below are confounded by the label —
+§24 partials it out, and several of them reverse or vanish.**
 
 ### Signed error — where the models are biased
 
@@ -870,3 +871,91 @@ of the data and is assumed homogeneous. And the bound assumes additive independe
 perfect predictor: it is an upper limit on what *any* model could reach, not a target.
 
 Regenerate with `python scripts/noise_ceiling.py`.
+
+## 24. Descriptors versus error, with the label controlled for
+
+§19 reported raw correlations between descriptors and error. They are **confounded**, and
+badly: |error| correlates with |ΔΔG| at ρ ≈ 0.5 and signed error with ΔΔG at ρ ≈ −0.8, so any
+descriptor that happens to track effect size appears to predict error whether or not it carries
+information the model failed to use.
+
+This partials the label out of both sides — on ranks, quadratically, because regression to the
+mean is not linear in the label — and the picture changes substantially. Regenerate with
+`python scripts/error_drivers_partial.py`.
+
+### Random forest: raw correlations mislead in both directions
+
+| descriptor | \|err\| raw | \|err\| **partial** | err raw | err **partial** |
+| --- | --- | --- | --- | --- |
+| distance to partner chain | −0.272 | **−0.027** | +0.005 | **−0.585** |
+| interface contacts | +0.354 | **+0.093** | −0.116 | **+0.496** |
+| rSASA bound | +0.008 | +0.147 | +0.018 | **−0.494** |
+| ΔrSASA on mutation | +0.360 | **+0.164** | −0.102 | +0.337 |
+| neighbour count | +0.330 | +0.251 | −0.088 | −0.162 |
+| number of mutations | +0.349 | +0.248 | −0.080 | −0.139 |
+| ProteinMPNN log P(wt) | −0.282 | −0.259 | +0.067 | +0.270 |
+
+**Two opposite failures of the raw view, and both matter.**
+
+**Correlations that evaporate.** Distance to the partner chain looked like a strong predictor of
+imprecision at −0.272; controlled, it is **−0.027** — it predicted nothing about error, only
+about effect size. Interface contacts go 0.354 → 0.093, ΔrSASA 0.360 → 0.164. Most of §19's
+"buried, highly-contacting sites are harder" is really just "buried sites have larger effects".
+
+**Correlations that appear.** The reverse is more interesting. Geometry has **almost no raw
+correlation with signed error** (+0.005, −0.116, +0.018) and a very strong one once the label is
+removed: **−0.585, +0.496, −0.494**. These were hidden because regression to the mean dominates
+the raw signal and cancels them.
+
+**What that says.** Take two mutations with the *same* true ΔΔG, one at a buried,
+highly-contacting site and one exposed and distant. The forest predicts the buried one
+**higher**. It is using burial as a proxy for effect size *beyond what the label justifies* —
+and it has these features, so this is not missing information but mis-weighted information.
+That is a concrete, addressable defect, and it is invisible without partialling.
+
+### The network fails on chemistry, not geometry
+
+| descriptor | \|err\| raw | \|err\| partial | err raw | err **partial** |
+| --- | --- | --- | --- | --- |
+| Δ molecular weight | −0.175 | +0.002 | −0.081 | **−0.603** |
+| substitutions to alanine | +0.055 | −0.087 | +0.180 | **+0.566** |
+| Δ volume | −0.133 | +0.034 | −0.034 | **−0.524** |
+| mutant residue identity | −0.166 | −0.076 | −0.139 | −0.355 |
+| Δ hydropathy | +0.144 | +0.081 | +0.120 | +0.337 |
+| BLOSUM of the substitution | −0.179 | −0.075 | −0.082 | −0.308 |
+| distance to partner chain | −0.301 | −0.054 | +0.251 | −0.179 |
+
+The submitted model's directional error is driven by **substitution chemistry**, not by
+geometry: it **over-predicts alanine substitutions** (+0.566) and **under-predicts large
+volume and mass changes** (−0.524, −0.603), at equal true ΔΔG. Geometry barely survives
+partialling for it (−0.179).
+
+**The two models fail on different axes** — the forest mis-weights burial, the network
+mis-weights the substitution itself. That is a mechanism for §19's finding that they agree only
+0.42–0.54 on which rows are hard, and therefore for why blending them beats either.
+
+It is also a pointed comment on the network's inputs. Those 26 chemistry columns are the single
+largest gain measured anywhere in this project (+0.191 → +0.266), and they are simultaneously
+where its directional error concentrates. It has the information and is using it wrongly, which
+is a better problem than not having it.
+
+### How much of the error is predictable at all
+
+A gradient-boosted model predicting **|error|** from these descriptors, cross-validated by
+complex so no complex informs its own prediction:
+
+| | all descriptors | excluding label proxies |
+| --- | --- | --- |
+| random forest | +0.505 | **+0.416** |
+| `cat128_reg2_l1` | +0.333 | **+0.157** |
+
+**The forest's own errors are predictable at ρ = 0.416 from features it already has.** That is
+unused signal by definition — a second model can see where the first will be wrong, using the
+same inputs. It is the strongest quantitative case in this document for the blend in §19, and
+it suggests something narrower would also work: a learned per-row weighting, or simply
+down-weighting burial in the forest's feature set.
+
+The network's errors are much less predictable (+0.157). Read charitably, it has already
+extracted what these descriptors offer; read plainly, its remaining error is noise or lies
+outside anything we measured — and given §23 puts the label-noise ceiling at 0.979, it is more
+likely the latter.
