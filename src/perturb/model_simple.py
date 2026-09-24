@@ -585,8 +585,15 @@ class PerturbSiteToken(nn.Module):
         # K and V must arrive at the attention's width, so this maps to w, not to a free
         # choice -- mpnn_proj is a flag for WHETHER it is separate, not for how wide.
         str_in = self.gr_str.out_dim if self.gr_str is not None else c.pca_dim
+        # gated_fusion belongs in this list and was missing from it. Without it a gated
+        # model set mpnn_proj in its config, got None, and silently fell back to projecting
+        # ProteinMPNN through the SEQUENCE projection -- one Linear(128, 64) shared between
+        # PCA-128 of ESM-2 and PCA-128 of encoder_h_V, which are unrelated spaces. Sharing a
+        # map is right for wild-type against mutant, where the difference has to be taken in
+        # one space; it is not right across modalities, which are only ever concatenated.
         self.mpnn_proj = (nn.Linear(str_in, w, bias=False)
-                          if (c.cross_attn or c.film_struct or c.concat_struct)
+                          if (c.cross_attn or c.film_struct or c.concat_struct
+                              or c.gated_fusion)
                           and c.mpnn_proj else None)
 
         # Each block is normalised on its OWN, then concatenated. A single LayerNorm over

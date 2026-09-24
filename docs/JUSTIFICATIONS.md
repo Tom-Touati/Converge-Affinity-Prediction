@@ -271,7 +271,7 @@ version anyone should actually use is the calibrated one.
 
 ## A6. Fusion by feature concatenation, after measuring five alternatives
 
-**Chosen.** Gating or plain concatenation.
+**Chosen.** Plain concatenation, with **a separate projection per modality**.
 
 **Why.** Not aesthetics — the control. `st64_noattn` (+0.212) is the same network with fusion
 deleted, and **four of five cross-attention variants score at or below it** while costing twice
@@ -280,6 +280,16 @@ the only two that clear the control convincingly.
 
 Antibody↔antigen cross-attention — the mechanism `thoughts.md` proposed and ProtAttBA's own —
 was measured as family A and reaches +0.112 to +0.200, below the simpler families.
+
+**Why concatenation and not gating, given gating scores +0.007 higher.** Because the scores do
+not separate them — +0.007 is well inside both seed spreads — and the architectures do. Every
+gated run shared **one** `Linear(128 → 64)` between ESM-2 and ProteinMPNN: the configs set
+`mpnn_proj=64` and the model silently ignored it, `gated_fusion` having been omitted from the
+condition that builds the structure projection. Sharing a map between wild-type and mutant is
+necessary, since their difference has to be taken in one space. Sharing it across two encoders
+that are only ever concatenated is not, and it removes the ability to scale each modality
+independently. Concatenation gives each its own projection at 36,353 parameters against 48,001.
+The bug is fixed; a correct gated run is an open item rather than a result.
 
 ---
 

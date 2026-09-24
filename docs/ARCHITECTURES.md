@@ -21,7 +21,7 @@ in the table.
 | --- | --- | --- | --- | --- |
 | **A.** full attention model (v2/v3/v4) | `full` | 810,886 | +0.200 | capacity is not the constraint |
 | **B.** pooled-delta MLPs | `mlp_delta_chem_reg` | 85,376 | +0.266 | chem features carry the gain |
-| **C.** site-token fusion ladder | **`l1_gated` ← the model** | 48,001 | **+0.300** | fusion *mechanism* is not the constraint |
+| **C.** site-token fusion ladder | **`cat128_reg2_l1` ← the model** | 36,353 | +0.293 | fusion *mechanism* is not the constraint |
 | **D.** random forest on 49 columns | `E0a_rf_handcrafted` | — | **+0.381** | the **baseline** the model is measured against |
 
 The largest model in the project (810k parameters) scores **+0.200**. The best neural model
@@ -91,8 +91,8 @@ a config so exactly one thing changes per run.
 
 | run | params | per-cx r | mechanism |
 | --- | --- | --- | --- |
-| `l1_gated` | 48,001 | **+0.300** | gated fusion, one-layer head |
-| `cat128_reg2_l1` | 36,353 | +0.293 | plain concatenation, one-layer head |
+| **`cat128_reg2_l1` ← the model** | 36,353 | +0.293 | plain concatenation, one-layer head, **separate projection per modality** |
+| `l1_gated` | 48,001 | +0.300 | gated fusion — but see the note below: it shares one projection across modalities |
 | `st64_gated_fusion` | 64,513 | +0.282 | gated fusion, two-layer head |
 | `st64_film_struct` | 52,993 | +0.227 | FiLM on the structure delta |
 | `st64_xattn_rev` | 77,441 | +0.241 | cross-attention, structure → sequence |
@@ -106,6 +106,15 @@ a config so exactly one thing changes per run.
 model with the attention removed, while costing twice the parameters. Gating and concatenation
 clear it; they are also the two cheapest mechanisms. Cross-attention over ProteinMPNN — the
 most elaborate thing built — does not pay for itself.
+
+**A defect in the gated runs, found late.** Every `gated_fusion` run in this table projected
+ESM-2 and ProteinMPNN through the **same** `Linear(128 → 64)`. Their configs set
+`mpnn_proj=64`; the model ignored it, because `gated_fusion` was missing from the condition
+that constructs the structure projection. So the gated numbers describe a model sharing one map
+between two unrelated representation spaces, and the +0.007 it holds over concatenation — along
+with its tighter seed spread — cannot be attributed to gating. The condition is fixed in
+`model_simple.py`. Re-running gated fusion correctly is an open item; the submitted model is the
+concatenation variant, which gives each modality its own projection.
 
 ### C2. Representation choices
 

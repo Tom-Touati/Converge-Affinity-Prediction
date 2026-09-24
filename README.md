@@ -3,12 +3,12 @@
 Predicting how a mutation changes antibody–antigen binding free energy, from **sequence and
 3D structure**, on the antibody–antigen subset of SKEMPI 2.0.
 
-**The model is `l1_gated`: a learned per-channel gate over ESM-2 and ProteinMPNN
-representations, read at the mutated residues. 48,001 trainable parameters, both encoders
-frozen.**
+**The model is `cat128_reg2_l1`: ESM-2 and ProteinMPNN each given their own projection, read
+at the mutated residues, concatenated with substitution chemistry into a single-hidden-layer
+head. 36,353 trainable parameters, both encoders frozen.**
 
-It was chosen over cross-attention, FiLM and plain concatenation — and *how* it was chosen is
-why this README is organised the way it is. On **940 rows across 53 complexes**, with a
+It was chosen over cross-attention, FiLM and gated fusion — and *how* it was chosen is why
+this README is organised the way it is. On **940 rows across 53 complexes**, with a
 measured seed-to-seed spread of 0.028–0.117, most architectural differences in this problem
 are smaller than the noise. Establishing which differences are real became the substance of
 the work.
@@ -27,24 +27,30 @@ the work.
 ## 1. The model
 
 ```
-ESM-2 650M per residue  -> PCA-128 -.
-                                     >- Linear(128->64), shared -> site_mean at mutated residues
-ProteinMPNN encoder_h_V -> PCA-128 -'
+ESM-2 650M per residue  -> PCA-128 -> Linear(128->64)  proj_seq  (shared WT/MUT)
+ProteinMPNN encoder_h_V -> PCA-128 -> Linear(128->64)  proj_str  (its OWN map)
 
 z_seq = LayerNorm( site_mean(mutant) - site_mean(wild-type) )      64   the edit
 z_str = LayerNorm( site_mean(structure at those residues) )        64   the pocket
 chem                                                               26   substitution chemistry
 
-g = sigmoid( W [ z_seq ; z_str ; chem ] )          per-channel gates, W: 154 -> 128
-z = [ g[:64]*z_seq ; g[64:]*z_str ; chem ]                        154
+z = [ z_seq ; z_str ; chem ]                                      154
     Linear(154->128) -> GELU -> Dropout(0.35) -> Linear(128->1)
 ```
 
-**The fusion.** Each of the 128 channels gets its own gate, and the gate is computed from
-**both modalities and the chemistry jointly**. The model therefore chooses, per row and per
-channel, how much sequence and how much structure to admit — conditioned on what the mutation
-is. Concatenation mixes at a fixed ratio; attention lets tokens query each other but pays for
-a full attention block. Gating sits between them, at 19,840 parameters.
+**The fusion, and one weight-sharing decision that matters.** Each modality gets **its own**
+`Linear(128 → 64)`. The sequence map is shared between the wild-type and mutant branches, and
+that sharing is necessary — the subtraction only means anything if both land in one space.
+Sharing *across* modalities would not be: ESM-2 and ProteinMPNN are never subtracted from one
+another, only concatenated, so a common space buys nothing and costs the ability to scale each
+modality independently.
+
+This is not a hypothetical. An earlier draft submitted a gated-fusion model that scored +0.300,
+and it turned out to be sharing one projection between the two encoders — its config requested
+a separate structure projection and the model silently ignored it. The +0.007 it appeared to
+gain is well inside both seed spreads, so the coherent architecture is preferred and nothing
+measurable is given up. The bug is fixed; re-running gated fusion properly is a next step, not
+a result.
 
 **Three representation decisions that matter more than the fusion does:**
 
@@ -119,10 +125,19 @@ On 752 training rows per fold, a full attention block cannot pay for itself. Gat
 concatenation are the two cheapest mechanisms and the only two that clear the control
 convincingly.
 
-**Gating over concatenation — and what that claim rests on.** +0.300 against +0.293 is +0.007,
-*inside* the noise. Gating is **not** measurably more accurate. It is chosen because it is a
-genuine conditional fusion, is no worse, and is **twice as stable**: seed spread 0.028 against
-0.063, with its worst seed (+0.235) above concatenation's worst (+0.210).
+**Concatenation over gating, and why the scores do not decide it.** Gated fusion reads +0.300
+against concatenation's +0.293 — a +0.007 difference, well inside both seed spreads, so the
+scores do not separate them. The deciding factor is architectural: **the gated runs were
+sharing one `Linear(128 → 64)` between ESM-2 and ProteinMPNN.** Their config set
+`mpnn_proj=64` and the model silently ignored it, because `gated_fusion` was missing from the
+condition that builds the structure projection. Two encoders with unrelated output spaces were
+being forced through one map.
+
+Concatenation gives each modality its own projection, costs nothing measurable, and is
+smaller (36,353 against 48,001). The gated model's tighter seed spread (0.028 against 0.063) is
+its one real advantage and it is **not** claimable either, since it came from the buggy
+configuration. The bug is fixed in `model_simple.py`; re-running gated fusion with a real
+structure projection is a next step, not a result.
 
 ### Dimensionality reduction — PCA and a learned grouped projection are equivalent
 
@@ -182,8 +197,8 @@ Grouped 5-fold cross-validation, **no complex shared between folds**. `make repo
 
 ```
 model                                 ens  per seed  spread  n  neg    bal  bal-cal   stab
-l1_gated  (the model)               +0.300    +0.249   0.028  3    7  0.463    0.459   0.25
-plain concatenation                 +0.293    +0.239   0.063  3    6  0.439    0.457   0.19
+cat128_reg2_l1  (the model)         +0.293    +0.239   0.063  3    6  0.439    0.457   0.19
+gated fusion (shared-proj bug)      +0.300    +0.249   0.028  3    7  0.463    0.459   0.25
 cross-attention (best of five)      +0.241    +0.182   0.046  3    9  0.454    0.445   0.35
 no-fusion control                   +0.212    +0.212     -    1    9  0.392    0.423   0.13
 --- baseline ---
@@ -194,8 +209,8 @@ E0a_rf_handcrafted (chem+geom+MPNN) +0.381    +0.379   0.032  3    6  0.444    0
 
 `ens` averages seeds then scores once; `per seed` scores each separately. **`spread` is the
 number to read every comparison against.** Quoting one without the other is how a model appears
-to gain 0.05 by being written up differently — `l1_gated` is +0.300 as an ensemble and +0.249
-as the mean of its seeds, from identical predictions.
+to gain 0.05 by being written up differently — the model reads +0.293 as an ensemble and
++0.239 as the mean of its seeds, from identical predictions.
 
 **Two rows to read before the model's.**
 
@@ -241,11 +256,11 @@ cluster split withholds.** This is the single most important caveat on the neura
 
 | | balanced acc | stabilising recall |
 | --- | --- | --- |
-| `l1_gated` | **0.463** | **0.25** |
+| `cat128_reg2_l1` | **0.439** | **0.19** |
 | random forest | 0.444 | **0.06** |
 | random forest, quantile-calibrated | 0.498 | 0.29 |
 
-The forest finds **7 of 126** stabilising mutations. The neural model finds four times as many.
+The forest finds **7 of 126** stabilising mutations. The neural model finds three times as many.
 For affinity maturation — *finding* affinity-improving mutations rather than ranking known ones
 — that matters more than the correlation gap.
 
@@ -290,18 +305,18 @@ fold landed. Both are recorded in [AI_PROMPTS.md](AI_PROMPTS.md).
    150 % and weight decay tenfold cost 0.037–0.043 on two architectures and reduced variance on
    neither.
 2. **The error is systematically anti-correlated with the label's sign, and this is the most
-   actionable defect.** Spearman(sign(ΔΔG), signed error) = **−0.55** for `l1_gated` and
-   **−0.61** for the forest. Concretely:
+   actionable defect.** Spearman(sign(ΔΔG), signed error) = **−0.61** for the submitted
+   model and **−0.61** for the forest. Concretely:
 
-   | label | n | mean ΔΔG | `l1_gated` mean error | forest |
+   | label | n | mean ΔΔG | model mean error | forest |
    | --- | --- | --- | --- | --- |
-   | stabilising (ΔΔG < 0) | 250 | −0.809 | **+1.108** | +1.169 |
-   | near-neutral (\|ΔΔG\| ≤ 0.5) | 315 | +0.046 | +0.442 | +0.419 |
-   | destabilising (ΔΔG > 0) | 657 | +1.562 | −0.669 | −0.531 |
+   | stabilising (ΔΔG < 0) | 250 | −0.809 | **+1.113** | +1.169 |
+   | near-neutral (\|ΔΔG\| ≤ 0.5) | 315 | +0.046 | +0.422 | +0.419 |
+   | destabilising (ΔΔG > 0) | 657 | +1.562 | −0.756 | −0.531 |
 
    Stabilising mutations are over-predicted by about **+1.1 kcal/mol** and destabilising ones
    under-predicted by **0.5–0.7**. Crucially, the correlation between label sign and
-   *\|error\|* is ≈ 0 (−0.08 to +0.10): the model is **not less precise** on stabilising
+   *\|error\|* is ≈ 0 (−0.06 for this model, −0.08 to +0.10 across all four): the model is **not less precise** on stabilising
    mutations, it is precise and **systematically wrong in direction**. For a designer that is
    worse than noise, because a confidently wrong sign is actionable in the wrong direction.
 
@@ -389,7 +404,7 @@ Neural training: **Colab T4**, driven from the CLI in `experiments/protattba_rep
 | the same | CPU | ~160 min |
 | ProteinMPNN per residue, 54 complexes | CPU | ~7 min |
 | one forest rung, 5 folds × 3 seeds | CPU | ~20 s |
-| **`l1_gated`, 5 folds × 3 seeds** | **T4** | **~25 min** |
+| **`cat128_reg2_l1`, 5 folds × 3 seeds** | **T4** | **~25 min** |
 | the full neural ladder as run (~45 configurations) | T4 | ~14 h |
 | `pytest tests` (non-torch) | CPU | ~43 s |
 
