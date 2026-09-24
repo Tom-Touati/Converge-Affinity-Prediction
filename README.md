@@ -59,6 +59,30 @@ a full attention block. Gating sits between them, at 19,840 parameters.
   pools arrive ~7× larger than the edit (2.396 vs 0.327); normalised jointly, the pools set the
   scale and the edit — the only part that varies between mutations of one complex — is crushed.
 
+### Augmentation and input perturbation
+
+Three are applied, all training-only, and they are not interchangeable — what matters is what
+each does to `mutant − wild-type`, the quantity the model actually consumes.
+
+| | setting | effect on the edit |
+| --- | --- | --- |
+| reverse-mutation | p = 0.5 | exact: ΔΔG is antisymmetric, so swapping negates the label |
+| feature dropout | 0.35, mask shared across branches | `mask·(mt − wt)` — zeroes features *of* the edit |
+| Gaussian input noise | 0.25 × per-feature sd, drawn **per branch** | does **not** cancel; compounds by √2 |
+
+**Reverse-mutation is exact label information, not a heuristic.** It moves the training label
+mean from **+0.720 to −0.031**, removing the incentive to guess "destabilising" on a set that
+is 70 % destabilising. Measured realised rate 51 %; a row escapes reversal across 25 epochs
+with probability 3×10⁻⁸.
+
+**The Gaussian noise is the one that misbehaves.** Because it is drawn independently on the
+wild-type and mutant branches it compounds rather than cancels, reaching **0.8× the edit's own
+standard deviation** — the edit has sd 0.128, the noise contributes 0.25 × 0.282 × √2 = 0.0998.
+At the heaviest regularisation tried it would exceed the signal. This is the most likely reason
+heavier regularisation kept *costing* accuracy without reducing seed variance, and sharing the
+draw is a two-line change (next steps §3). Measured by
+`experiments/protattba_repro/audit_augmentation.py`.
+
 Full specification, parameter breakdown and training protocol: **[docs/MODEL.md](docs/MODEL.md)**.
 
 ## 2. How the fusion was chosen

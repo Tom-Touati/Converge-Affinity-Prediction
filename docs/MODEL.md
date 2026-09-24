@@ -97,7 +97,10 @@ LayerNorms          affine=False                          0
 | gradient clip | 10 (above the measured norm of 5.0–5.3, so it rarely binds) |
 | early stopping | on **per-complex Spearman**, patience 10 |
 | validation split | whole complexes until 20 % of training **rows** are reached |
-| augmentation | reverse-mutation with p = 0.5, training only |
+| augmentation | reverse-mutation, p = 0.5, training only |
+| input noise | Gaussian, 0.25 × per-feature sd, training only |
+| feature dropout | 0.35, mask drawn once per width and shared across branches |
+| head dropout | 0.35 |
 | protocol | 5 folds by complex × 3 seeds |
 
 **Early stopping is on per-complex Spearman, not on loss.** Selecting on loss selects for
@@ -105,6 +108,25 @@ predicting complex means, which is the failure mode the whole evaluation is buil
 
 **The validation split counts rows, not complexes.** Complexes range from 2 to 87 rows, so
 taking a fixed fraction of *complexes* gives wildly variable validation sizes.
+
+**Three perturbations, and they behave differently in the difference the model consumes.**
+
+- **Reverse-mutation** is exact label information, not a heuristic: ΔΔG is antisymmetric, so
+  swapping wild-type and mutant negates it. It moves the training label mean from **+0.720 to
+  −0.031**, removing the incentive to guess "destabilising" on a set that is 70 % destabilising.
+- **Feature dropout** uses one mask per width, reused across branches, so it becomes
+  `mask·(mt − wt)` — it zeroes features *of* the edit rather than corrupting it. 35 % dropped,
+  survivors scaled 1.54×, a median of 83 of 128 features surviving.
+- **Gaussian input noise** is the one that misbehaves. It is drawn **fresh on each branch**, so
+  it does **not** cancel in the difference — it compounds by √2 and reaches **0.8× the edit's
+  own standard deviation** at this setting (edit sd 0.128; noise 0.25 × 0.282 × √2 = 0.0998).
+  At the heaviest setting tried it would exceed the signal. The code comment claimed both were
+  shared across branches; that was true of the mask and false of the noise.
+
+Measured by `experiments/protattba_repro/audit_augmentation.py`, which runs on the local caches
+and needs no GPU. This is the most likely reason heavier regularisation kept *costing* accuracy
+(−0.037 and −0.043 on two architectures) without reducing seed variance, and sharing the noise
+draw is listed first among the untried levers.
 
 ## Results
 
