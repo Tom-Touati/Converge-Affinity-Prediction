@@ -206,11 +206,21 @@ so pooled correlation, RMSE and accuracy largely measure whether a model can ide
 complex. That is why per-complex is the headline and why `report_runs.py` prints this floor
 beneath every comparison.
 
-**The random forest baseline beats the neural model**, +0.381 against +0.300 — about 2.5× the
-seed spread, one of the few gaps here that clears the noise. It uses 49 handcrafted columns
-spanning both modalities (substitution chemistry; interface geometry; ProteinMPNN
-log-likelihoods) and no learned representation at all. Reported rather than buried; §5 says
-what it means.
+**The random forest is a baseline, not a competing submission** — it exists to establish what
+these features support *without* a learned representation, and it is reported prominently
+because a submission that buries its own baseline is not worth reading.
+
+It beats the neural model, +0.381 against +0.300 — about 2.5× the seed spread, one of the few
+gaps here that clears the noise. It uses 49 handcrafted columns spanning both modalities
+(substitution chemistry; interface geometry; ProteinMPNN log-likelihoods) and no learned
+representation at all. It also trains in ~20 seconds on CPU.
+
+That comparison is the point of running it. It establishes that on 752 training rows per fold,
+49 informative columns outperform a learned representation — a finding about *the problem*, not
+about this particular network — and, by being run on both splits, that the networks lean on
+homology far more than it does. It simultaneously shows where the neural model *is* better:
+stabilising recall 0.25 against 0.06. A weaker baseline would have told us none of this.
+§5 and [docs/JUSTIFICATIONS.md §A5](docs/JUSTIFICATIONS.md) say more.
 
 ### Generalisation under a homology split
 

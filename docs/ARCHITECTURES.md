@@ -21,8 +21,8 @@ in the table.
 | --- | --- | --- | --- | --- |
 | **A.** full attention model (v2/v3/v4) | `full` | 810,886 | +0.200 | capacity is not the constraint |
 | **B.** pooled-delta MLPs | `mlp_delta_chem_reg` | 85,376 | +0.266 | chem features carry the gain |
-| **C.** site-token fusion ladder | `l1_gated` | 48,001 | **+0.300** | fusion *mechanism* is not the constraint |
-| **D.** random forest on 49 columns | `E0a_rf_handcrafted` | — | **+0.381** | the model |
+| **C.** site-token fusion ladder | **`l1_gated` ← the model** | 48,001 | **+0.300** | fusion *mechanism* is not the constraint |
+| **D.** random forest on 49 columns | `E0a_rf_handcrafted` | — | **+0.381** | the **baseline** the model is measured against |
 
 The largest model in the project (810k parameters) scores **+0.200**. The best neural model
 (48k) scores **+0.300**. The forest, with no learned representation at all, scores **+0.381**.

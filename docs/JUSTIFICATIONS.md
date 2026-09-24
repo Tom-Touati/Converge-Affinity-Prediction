@@ -186,23 +186,46 @@ the seed noise in the network, and reduction is a net negative in the forest. Th
 instance of the pattern in §A2 and §C1 — the representation pipeline is not where the
 performance is.
 
-## A5. A random forest is the submitted model, not the neural fusion network
+## A5. The random forest is a BASELINE, not the submission
 
-**Chosen.** `E0a_rf_handcrafted` — chemistry + interface geometry + ProteinMPNN.
+**Chosen.** `E0a_rf_handcrafted` — chemistry + interface geometry + ProteinMPNN — is built,
+tuned and reported as the reference the multimodal model is measured against. The submitted
+model is `l1_gated` ([docs/MODEL.md](MODEL.md)).
 
-**Why.** +0.381 against the best network's +0.300, which is ~2.5× the seed spread and one of
-the few differences in this project that clears the noise. It also retains 54 % under the
-homology split where the network retains 34 %.
+**Why a baseline at all, and why this one.** A multimodal deep model on 940 rows is only worth
+building if it beats what the same features support without one. The forest is the strongest
+thing that can be built on this data cheaply: it consumes both modalities (chemistry is
+sequence-derived, geometry and ProteinMPNN are structural), it trains in ~20 seconds on CPU,
+and tree ensembles are the appropriate hypothesis class for a few hundred rows and 49
+informative columns. Anything weaker would have been a straw man.
 
-**Why this is still a multimodal answer.** Chemistry describes the substitution (sequence);
-geometry and ProteinMPNN describe the site (structure). Pooled ESM alone reaches 0.273; adding
-ProteinMPNN takes it to 0.366; handcrafted columns take it to 0.418. The modalities are
-combined at the feature level and the combination beats either alone.
+**It is a demanding baseline, and that is the point.** It scores **+0.381** against the
+network's **+0.300** — about 2.5× the seed spread, one of the few gaps in this project that
+clears the noise — and retains **54 %** under the homology split where the network retains
+**34 %**. A baseline that the deep model comfortably beat would have told us far less.
 
-**The honest caveat.** The forest has the *worst* stabilising recall in the table (0.06), and a
-network reaches 0.48. If the downstream task is finding affinity-improving mutations rather
-than ranking known ones, the network is the better choice — stated in the README rather than
-buried.
+**What the comparison establishes.** Three things, none of which would be visible without it:
+
+- On 752 training rows per fold, **49 informative columns outperform a learned
+  representation**. That is the headline finding about this problem, not about this model.
+- **The networks are leaning on homology** and the forest much less so — visible only because
+  both were run on both splits.
+- The neural model is nevertheless **better where it matters for design**: balanced accuracy
+  0.463 against 0.444, and stabilising recall **0.25 against 0.06**. The forest finds 7 of 126
+  affinity-improving mutations. That asymmetry is the strongest argument for keeping the
+  multimodal model in the picture at all, and it is invisible without the baseline to contrast.
+
+**Why the forest is not submitted despite scoring higher.** The assignment asks for a
+multimodal sequence-and-structure model and states that state-of-the-art performance is not
+expected. Submitting the baseline because it wins the headline metric would answer a different
+question, discard the fusion work that the task is actually about, and hide the class-recall
+result above. The forest's number is reported prominently instead — in the results table, in
+the limitations, and here — because a submission that buries its own baseline is not worth
+reading.
+
+**The baseline's own defect, for completeness.** The forest has the worst stabilising recall in
+the project. Quantile calibration lifts it 0.06 → 0.29 at zero cost to ranking (§C5), so the
+version anyone should actually use is the calibrated one.
 
 ## A6. Fusion by feature concatenation, after measuring five alternatives
 
