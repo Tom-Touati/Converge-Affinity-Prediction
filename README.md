@@ -285,13 +285,13 @@ Spearman is unchanged at +0.3613). Even calibrated it does not reach the best ne
   under-predicted by 1.4 kcal/mol and ranked backwards. 21 of 53 complexes are too small to
   enter the headline metric at all.
 - **Proximity predicts performance; frequency does not.** How many rows a complex has barely
-  correlates with per-complex r (+0.04 forest / +0.09 network); how structurally close it is to
-  training does (+0.17 / +0.37). Complexes with no structural relative in training — 10 of 53,
-  24 % of rows — score 0.190 on the network against 0.404 for those with three or more.
+  correlates with per-complex r (+0.04 forest / +0.14 model); how structurally close it is to
+  training does (+0.17 / **+0.49**). Complexes with no structural relative in training — 10 of
+  53, 24 % of rows — score **0.132** on the model against 0.432 for those with three or more.
 - **Three quarters of test rows have a near-identical training twin** (median TM 0.991), and
-  only 19.8 % are genuinely hard. On those hard rows the forest scores +0.270 and the network
-  +0.117 — so the headline numbers are 75 % weighted toward near-retrieval, and the honest
-  expectation on a novel target is much lower.
+  only 19.8 % are genuinely hard. On those hard rows the forest scores +0.270 and the model
+  **+0.060** — so the headline numbers are 75 % weighted toward near-retrieval, and the honest
+  expectation on a novel target is far lower.
 - **It is not a pipeline bug.** Across 940 rows and 1,726 mutated sites: zero residue
   mismatches, and ‖t_mut − t_wt‖ puts the mutated sites in the top-k on 97 % of sides at a
   median of 22× the median residue. `make align`.
@@ -353,8 +353,8 @@ fold landed. Both are recorded in [AI_PROMPTS.md](AI_PROMPTS.md).
    sequence versus structure, for which mutations — cannot be answered from the artifacts. This
    turns the fusion mechanism from a score into an explanation, and it is the first thing to do.
 2. **Blend the forest with the network.** They agree only 0.42–0.54 on which rows are hard, and
-   a fixed 25 % blend lifts per-complex r from +0.397 to +0.418–0.424 across two different
-   networks. The weight was not tuned on held-out data, so validate it — but it is better
+   a fixed 25 % blend lifts per-complex r from +0.397 to +0.416 with the submitted model, and
+   +0.424 with `st64_nopca_grouped`. The weight was not tuned on held-out data, so validate it — but it is better
    evidenced than any architecture change here.
 3. **Share the input-noise draw across branches.** Measured: the noise is drawn independently
    per branch, so it compounds by √2 and reaches **0.8× the delta's own sd** — at the heaviest

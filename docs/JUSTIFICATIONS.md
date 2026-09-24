@@ -232,7 +232,7 @@ performance is.
 
 **Chosen.** `E0a_rf_handcrafted` — chemistry + interface geometry + ProteinMPNN — is built,
 tuned and reported as the reference the multimodal model is measured against. The submitted
-model is `l1_gated` ([docs/MODEL.md](MODEL.md)).
+model is `cat128_reg2_l1` ([docs/MODEL.md](MODEL.md)).
 
 **Why a baseline at all, and why this one.** A multimodal deep model on 940 rows is only worth
 building if it beats what the same features support without one. The forest is the strongest
@@ -242,7 +242,7 @@ and tree ensembles are the appropriate hypothesis class for a few hundred rows a
 informative columns. Anything weaker would have been a straw man.
 
 **It is a demanding baseline, and that is the point.** It scores **+0.381** against the
-network's **+0.300** — about 2.5× the seed spread, one of the few gaps in this project that
+network's **+0.293** — about 2.5× the seed spread, one of the few gaps in this project that
 clears the noise — and retains **54 %** under the homology split where the network retains
 **34 %**. A baseline that the deep model comfortably beat would have told us far less.
 
@@ -253,7 +253,7 @@ clears the noise — and retains **54 %** under the homology split where the net
 - **The networks are leaning on homology** and the forest much less so — visible only because
   both were run on both splits.
 - The neural model is nevertheless **better where it matters for design**: balanced accuracy
-  0.463 against 0.444, and stabilising recall **0.25 against 0.06**. The forest finds 7 of 126
+  0.439 against 0.444, and stabilising recall **0.19 against 0.06**. The forest finds 7 of 126
   affinity-improving mutations. That asymmetry is the strongest argument for keeping the
   multimodal model in the picture at all, and it is invisible without the baseline to contrast.
 

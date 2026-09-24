@@ -1,6 +1,6 @@
 # Error analysis
 
-Part I is the error analysis of the random forest, which is the model.
+Part I is the error analysis of the random forest, which is the **baseline**.
 Part II is the error analysis of the *evaluation*.
 Part III is bias from imbalance -- labels, complexes and mutation types -- and is
 where the aggregate metric is shown to conceal the failures that matter most.
@@ -423,10 +423,10 @@ the +0.381 comes from the destabilising class (r 0.406) and from separating dest
 from the rest. For affinity maturation, where the task is to rank candidate *improving*
 mutations against each other, this model is a coin flip.
 
-**As a single number: Spearman(sign(ΔΔG), signed error) = −0.55 for `l1_gated` and −0.61 for
-the forest.** Every model in the project is in the range −0.48 to −0.61.
+**As a single number: Spearman(sign(ΔΔG), signed error) = −0.61 for the submitted model
+(`cat128_reg2_l1`, the `concat` column below) and −0.61 for the forest.** Every model in the project is in the range −0.48 to −0.61.
 
-| label | n | mean ΔΔG | forest | `l1_gated` | concat | no-PCA |
+| label | n | mean ΔΔG | forest | gated | **`cat128_reg2_l1`** | no-PCA |
 | --- | --- | --- | --- | --- | --- | --- |
 | stabilising (ΔΔG < 0) | 250 | −0.809 | +1.169 | +1.108 | +1.113 | +0.756 |
 | near-neutral (\|ΔΔG\| ≤ 0.5) | 315 | +0.046 | +0.419 | +0.442 | +0.422 | +0.271 |
@@ -583,7 +583,7 @@ belonging to an architecture. Spearman throughout; regenerate with
 Correlation between a descriptor and `y_pred − y_true`. Negative means the model
 under-predicts as the descriptor grows.
 
-| descriptor | forest | gated | concat | nopca |
+| descriptor | forest | gated | **cat128** | nopca |
 | --- | --- | --- | --- | --- |
 | **true ΔΔG** | **−0.792** | **−0.775** | **−0.842** | **−0.705** |
 | **deviation from the complex's own mean** | −0.592 | −0.576 | −0.599 | −0.573 |
@@ -615,7 +615,7 @@ sign to everything else, consistent with §16's finding that X→A is the over-r
 
 ### Absolute error — where the models are imprecise
 
-| descriptor | forest | gated | concat | nopca |
+| descriptor | forest | gated | **cat128** | nopca |
 | --- | --- | --- | --- | --- |
 | \|ΔΔG\| | 0.535 | 0.489 | 0.586 | 0.446 |
 | deviation from the complex mean | 0.188 | 0.326 | 0.315 | 0.327 |
@@ -651,11 +651,11 @@ Testing that directly, z-scoring each model within complex and blending:
 | | per-complex r |
 | --- | --- |
 | forest alone | +0.397 |
-| `l1_gated` alone | +0.300 |
+| **`cat128_reg2_l1`** alone | +0.293 |
 | `st64_nopca_grouped` alone | +0.274 |
-| forest + `l1_gated`, 25 % net | **+0.418** |
+| **forest + `cat128_reg2_l1`, 25 % net** | **+0.416** |
+| forest + `cat128_reg2_l1`, 50 % net | +0.403 |
 | forest + `st64_nopca_grouped`, 25 % net | **+0.424** |
-| forest + `st64_nopca_grouped`, 50 % net | +0.414 |
 
 **Four of four blends beat the forest**, by up to +0.027. Read that as a demonstration that
 complementary signal exists rather than as a validated model: the blend weight was not chosen
@@ -687,15 +687,15 @@ near-retrieval question, not a generalisation one.
 
 ### Performance collapses on the rows that are actually hard
 
-| tier | complexes | rows | random forest | `l1_gated` |
+| tier | complexes | rows | random forest | **`cat128_reg2_l1`** |
 | --- | --- | --- | --- | --- |
-| easy | 39 | 707 | +0.421 (22) | +0.350 (22) |
-| medium | 2 | 47 | +0.643 (2) | +0.482 (2) |
-| **hard** | **12** | **186** | **+0.270 (8)** | **+0.117 (8)** |
+| easy | 39 | 707 | +0.421 (22) | +0.367 (22) |
+| medium | 2 | 47 | +0.643 (2) | +0.420 (2) |
+| **hard** | **12** | **186** | **+0.270 (8)** | **+0.060 (8)** |
 
 *(n) is the number of complexes clearing the ≥5-row threshold in that tier.*
 
-**The network loses 67 % of its performance on hard rows** (+0.350 → +0.117); the forest loses
+**The network loses 84 % of its performance on hard rows** (+0.367 → +0.060); the forest loses
 36 % (+0.421 → +0.270). Both degrade, the network far more — the same asymmetry the cluster
 split showed, now localised to the rows responsible for it rather than inferred from a summary.
 
@@ -705,7 +705,7 @@ The medium tier is two complexes and should not be read as anything.
 
 The headline +0.381 and +0.300 are **75 % weighted toward near-retrieval**. On a genuinely
 novel complex — the deployment case for antibody engineering, where the target is new — the
-honest expectations are **+0.270 (forest)** and **+0.117 (network)**.
+honest expectations are **+0.270 (forest)** and **+0.060 (network)**.
 
 This also explains the cluster-split result mechanically rather than by analogy. `data/tm_tiers.csv`
 records that under cluster grouping **0 of 54** complexes are easy and **all 54 are hard** — by
@@ -734,31 +734,32 @@ For each complex: rows in the dataset, count of other complexes within a TM thre
 
 ### Spearman against per-complex r (32 scorable complexes)
 
-| support measure | forest | `l1_gated` |
+| support measure | forest | **`cat128_reg2_l1`** |
 | --- | --- | --- |
-| **frequency** — rows the complex has | +0.039 | +0.092 |
-| neighbours in training at TM ≥ 0.8 | +0.071 | +0.186 |
-| neighbours in training at TM ≥ 0.5 | +0.064 | +0.200 |
-| **proximity** — max TM to any training complex | **+0.170** | **+0.369** |
+| **frequency** — rows the complex has | +0.039 | +0.142 |
+| neighbours in training at TM ≥ 0.8 | +0.071 | +0.358 |
+| neighbours in training at TM ≥ 0.5 | +0.064 | +0.314 |
+| **proximity** — max TM to any training complex | **+0.170** | **+0.494** |
 
 **How often a complex appears is very nearly irrelevant** (+0.039 / +0.092). **How close it is
-to something in training is what matters**, and it matters roughly twice as much to the network
-as to the forest (+0.369 against +0.170).
+to something in training is what matters**, and it matters about three times as much to the network
+as to the forest (+0.494 against +0.170).
 
 That is the homology dependence of §11 and §20 measured a third way, on a different axis, and
 it agrees: the network's performance tracks structural proximity, the forest's much less so.
 
 ### Binned by how many structural relatives a complex has in training
 
-| neighbours (TM ≥ 0.8) | complexes | rows | forest | `l1_gated` |
+| neighbours (TM ≥ 0.8) | complexes | rows | forest | **`cat128_reg2_l1`** |
 | --- | --- | --- | --- | --- |
-| **0 — isolated** | 10 | 221 | 0.345 | **0.190** |
-| 1–2 | 11 | 326 | 0.370 | 0.297 |
-| 3+ | 11 | 342 | **0.473** | **0.404** |
+| **0 — isolated** | 10 | 221 | 0.345 | **0.132** |
+| 1–2 | 11 | 326 | 0.370 | 0.302 |
+| 3+ | 11 | 342 | **0.473** | **0.432** |
 
-The network **more than doubles**, 0.190 → 0.404, as structural relatives accumulate; the
-forest improves by less than half that, 0.345 → 0.473. Ten complexes — 221 rows, 24 % of the
-data — have no structural relative in training at all, and on those the network is at 0.190.
+The network **more than triples**, 0.132 → 0.432, as structural relatives accumulate; the
+forest improves by less than a third, 0.345 → 0.473. Ten complexes — 221 rows, 24 % of the
+data — have no structural relative in training at all, and on those the network is at **0.132**,
+against the forest's 0.345.
 
 **The practical reading.** Adding more *measurements of complexes we already have* should be
 expected to do little: frequency does not predict performance. Adding *new complexes near an
