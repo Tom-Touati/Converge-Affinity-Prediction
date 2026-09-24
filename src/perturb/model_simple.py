@@ -681,6 +681,20 @@ class SiteTokenConfig:
     #: Both terms are summed over ab and ag separately, then CONCATENATED (not added --
     #: they answer different questions) and passed to the mlp alone. No chem, no geom.
     seq_mul_struct_attn: bool = False
+    #: Sequence only, no structure, no chem. At each MUTATED residue: LayerNorm the
+    #: projected mutant and wild-type embeddings separately, multiply them elementwise,
+    #: push the product through one Linear (shared across sides -- it acts on an
+    #: already-fused mt*wt product, not a raw single-modality input, so the no-shared-
+    #: first-layer rule does not apply to it), NO activation before the sum, then SUM
+    #: over the mutated residues -- a plain sum, no division by count and no learned
+    #: pooling scale this time. Summed over ab and ag the same way every other pooled
+    #: term here is. The mlp head's own GELU is the first nonlinearity the signal meets.
+    #:
+    #: No zero invariant: mt==wt gives LN(wt) * LN(wt), the square of a normalised vector,
+    #: not zero -- there is no subtraction anywhere in this design. Same property that
+    #: made ab_ag_nn_across="mul" unstable (seed spread 0.224, the widest in the project);
+    #: worth watching for here too rather than assuming it away.
+    mut_pair_ffn: bool = False
     #: Give each input its OWN first linear layer instead of one shared map.
     #:
     #: A shared projection forces the antibody, the antigen and ProteinMPNN into a single
@@ -837,6 +851,17 @@ class PerturbSiteToken(nn.Module):
             blocks += [nn.Linear(d, 1)]
             self.mlp = nn.Sequential(*blocks)
             return
+        if c.mut_pair_ffn:
+            self.pair_ln = nn.LayerNorm(w, elementwise_affine=False)  # no params, so one
+            self.pair_ffn = nn.Linear(w, w)                           # instance is fine
+            blocks: list[nn.Module] = []
+            d = w
+            for _ in range(c.layers):
+                blocks += [nn.Linear(d, c.hidden), nn.GELU(), nn.Dropout(c.dropout)]
+                d = c.hidden
+            blocks += [nn.Linear(d, 1)]
+            self.mlp = nn.Sequential(*blocks)
+            return
         pw = c.pool_proj or w
         self.pool_proj = (nn.Linear(seq_in, c.pool_proj, bias=False)
                           if c.pool_proj and c.use_site_pool else None)
@@ -925,6 +950,18 @@ class PerturbSiteToken(nn.Module):
             # something the optimiser is merely encouraged to discover.
             self.ord_b0 = nn.Parameter(torch.zeros(1))
             self.ord_gap = nn.Parameter(torch.full((c.ordinal - 1,), 0.5))
+
+    def _mut_pair_ffn(self, batch, px, tok_proj) -> torch.Tensor:
+        """At each mutated residue: LN(mt) * LN(wt) -> Linear -> GELU, summed over sites."""
+        acc = 0
+        for side in ("ab", "ag"):
+            site = batch[f"site_{side}"].unsqueeze(-1)
+            p_mt = tok_proj(px(batch[f"seq_{side}_mt"]), side)
+            p_wt = tok_proj(px(batch[f"seq_{side}_wt"]), side)
+            prod = self.pair_ln(p_mt) * self.pair_ln(p_wt)
+            h = self.pair_ffn(prod)             # no activation here -- summed raw
+            acc = acc + (h * site).sum(1)
+        return acc
 
     def _seq_mul_struct_attn(self, batch, px, tok_proj) -> torch.Tensor:
         """mt*wt sequence term (pooled at the mutated site) concat a no-residual structure
@@ -1030,11 +1067,12 @@ class PerturbSiteToken(nn.Module):
 
     def forward(self, batch) -> torch.Tensor:
         c = self.cfg
-        if c.ab_ag_interaction or c.ab_ag_nn or c.seq_mul_struct_attn:
+        if (c.ab_ag_interaction or c.ab_ag_nn or c.seq_mul_struct_attn or c.mut_pair_ffn):
             def px0(x): return x               # no noise/dropout in this reference check
             def tp0(x, side="ab"):
                 return self.proj_side[side](x) if self.proj_side is not None else x
-            fn = (self._seq_mul_struct_attn if c.seq_mul_struct_attn
+            fn = (self._mut_pair_ffn if c.mut_pair_ffn
+                 else self._seq_mul_struct_attn if c.seq_mul_struct_attn
                  else self._ab_ag_nn if c.ab_ag_nn else self._ab_ag_interaction)
             return self.mlp(fn(batch, px0, tp0)).squeeze(-1)
         # The scale and the dropout mask are per WIDTH. They used to be taken once from
