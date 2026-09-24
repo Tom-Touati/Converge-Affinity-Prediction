@@ -100,6 +100,25 @@ convincingly.
 genuine conditional fusion, is no worse, and is **twice as stable**: seed spread 0.028 against
 0.063, with its worst seed (+0.235) above concatenation's worst (+0.210).
 
+### Dimensionality reduction — PCA and a learned grouped projection are equivalent
+
+ESM-2 emits 1280 dimensions per residue against 752 training rows, so something must reduce
+it. Three approaches, same model otherwise:
+
+| reduction | per-cx r | seeds |
+| --- | --- | --- |
+| fold-local PCA-128 | +0.219 / +0.212 | 1 + 1 |
+| learned grouped projection, ten 128→16 blocks, no PCA | +0.274 / +0.199 | 1 + 1 |
+| PCA-256 instead of PCA-128 (MLP family) | +0.159 vs +0.157 | 1 |
+
+Two seeds each: **grouped projection +0.236, PCA-128 +0.216** — a +0.020 difference against a
+0.075 spread *within* the grouped projection's own two seeds. PCA is kept because it is
+cheaper, auditable per fold, and nothing beats it outside the noise. The grouped projection is
+block-diagonal deliberately: 20,480 parameters against 204,800 for a dense `Linear(1280, 160)`.
+
+**In the forest, reduction actively hurts** — pooled ESM + ProteinMPNN scores 0.366 raw and
+0.303 through PCA-128. Full detail in [docs/JUSTIFICATIONS.md §A4b](docs/JUSTIFICATIONS.md).
+
 ### The training objective — a within-complex ranking loss was tried and did not improve
 
 The headline metric is a *within-complex* correlation, so the obvious move is to optimise it

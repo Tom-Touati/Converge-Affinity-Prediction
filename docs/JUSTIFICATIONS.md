@@ -138,6 +138,54 @@ obviously the right one — ΔΔG is not additive in the mutation count
 seven complexes entirely. **Evidence it is imperfect:** multi-point rows are 80 % worse on MAE
 than single-point at the same correlation (ERROR_ANALYSIS §17).
 
+## A4b. Dimensionality reduction: PCA, a learned grouped projection, and neither
+
+ESM-2 emits 1280 dimensions per residue against 752 training rows per fold. Something has to
+reduce it, and the choice is not free — it decides what reaches the model before the model
+sees anything. Three approaches were measured.
+
+**1. Fold-local PCA** (the default). Fitted on the training folds only, separately per side,
+refit for every fold so nothing leaks. 128 components keep ~81–90 % of variance.
+
+**2. A learned grouped projection** (`GroupedReduce`). No PCA at all: the raw 1280-d embedding
+is reduced *inside* the network as ten independent 128 → 16 blocks. Block-diagonal rather than
+dense for an arithmetic reason — a dense `Linear(1280, 160)` is 204,800 parameters against
+**20,480**, and on 752 rows the dense version is not a reduction at all.
+
+**3. No reduction** — raw embeddings straight into a forest.
+
+| reduction | model | per-cx r | seeds |
+| --- | --- | --- | --- |
+| fold-local PCA-128 | site-token net | +0.219 / +0.212 | 1 + 1 |
+| **grouped projection, no PCA** | the same net | **+0.274 / +0.199** | 1 + 1 |
+| grouped projection + heavier reg | the same net | +0.193 | 3 |
+| PCA-128 | pooled-delta MLP | +0.157 | 1 |
+| PCA-256 | pooled-delta MLP | +0.159 | 1 |
+
+Averaging the two seeds each: **grouped projection +0.236, PCA-128 +0.216.**
+
+**Why PCA is kept anyway.** The +0.020 is inside the noise, and the two seeds of the grouped
+projection are **+0.274 and +0.199** — a 0.075 spread on an identical configuration, which is
+the widest we measured anywhere. The grouped projection was reported as a +0.062 win before its
+replicate arrived; it did not survive. PCA-128 is retained because it is cheaper, because it is
+fitted per fold with an auditable variance-explained figure, and because nothing measured beats
+it outside the noise.
+
+**PCA-128 versus PCA-256** makes no difference either: +0.157 against +0.159 in the MLP family.
+
+**In the forest, reduction actively hurts.** Pooled ESM + ProteinMPNN scores **0.366** raw and
+**0.303** through PCA-128 — reduction costs 0.063. The forest's `max_features="sqrt"` already
+samples a subset per split, so PCA removes information the tree ensemble was handling on its
+own. Separately measured earlier: raw ESM concatenation scores 0.262 against a 0.500 control,
+which is dilution rather than reduction failure — 3,853 ESM columns against 49 informative
+ones — and PCA-32 gives 0.473 against a matched 0.499 control, delta −0.026, CI
+[−0.065, +0.013], **not clearing zero**.
+
+**The conclusion across all three.** How the embedding is reduced changes results by less than
+the seed noise in the network, and reduction is a net negative in the forest. This is another
+instance of the pattern in §A2 and §C1 — the representation pipeline is not where the
+performance is.
+
 ## A5. A random forest is the submitted model, not the neural fusion network
 
 **Chosen.** `E0a_rf_handcrafted` — chemistry + interface geometry + ProteinMPNN.
