@@ -33,11 +33,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from src import paths                 # noqa: E402
 
 MUT = re.compile(r"^([A-Z])([A-Za-z0-9])(-?\d+[A-Za-z]?)([A-Z])$")
+#: "cat128" is the SUBMITTED model; the others are there to show which failures are shared.
 MODELS = {
-    "forest": ("reports", "E0a_rf_handcrafted_seed0"),
-    "gated":  ("oof", "l1_gated"),
-    "concat": ("oof", "cat128_reg2_l1"),
-    "nopca":  ("oof", "st64_nopca_grouped"),
+    "forest":  ("reports", "E0a_rf_handcrafted_seed0"),   # the baseline
+    "cat128":  ("oof", "cat128_reg2_l1"),                 # the submitted model
+    "gated":   ("oof", "l1_gated"),
+    "nopca":   ("oof", "st64_nopca_grouped"),
 }
 MIN_ABS = 0.05          # ignore correlations smaller than this in the summary
 

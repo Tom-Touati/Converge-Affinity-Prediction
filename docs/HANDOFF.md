@@ -43,6 +43,10 @@ Dropping is a holding policy, not the right answer. See §9.
 
 **The random forest is the model. The neural network does not beat it, on either split.**
 
+> *Superseded — see the banner at the top.* The submitted model is `cat128_reg2_l1`; the forest
+> is the **baseline**. It is still the better ranker (+0.381 against +0.293), which is reported
+> as such in [MODEL.md](MODEL.md) and `ERROR_ANALYSIS.md`, not hidden.
+
 Cluster-grouped split (the reported one), all models scored on identical rows:
 
 | model | per-complex ρ | vs forest |

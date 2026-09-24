@@ -50,7 +50,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", default="E0a_rf_handcrafted_seed0")
-    ap.add_argument("--net", default="l1_gated")
+    ap.add_argument("--net", default="cat128_reg2_l1")   # the submitted model
     a, _ = ap.parse_known_args()
 
     tm = pd.read_csv("data/tm_matrix.csv", index_col=0)
@@ -83,7 +83,7 @@ def main() -> None:
         preds[a.net] = pd.read_csv(o).groupby("row_id").ddg_pred.mean()
 
     print("\nper-complex r within each tier (complexes with >= 5 rows):\n")
-    hdr = f"{'tier':<9}{'complexes':>11}{'rows':>7}" + "".join(f"{k:>14}" for k in preds)
+    hdr = f"{'tier':<9}{'complexes':>11}{'rows':>7}" + "".join(f"{k:>17}" for k in preds)
     print(hdr); print("-" * len(hdr))
     D = d.set_index("row_id")
     for tier in order:
@@ -99,7 +99,7 @@ def main() -> None:
                 rs.append(float(np.corrcoef(g, tt)[0, 1]))
             cells.append(f"{np.mean(rs):+.3f} ({len(rs)})" if rs else "   -")
         print(f"{tier:<9}{int((t.tier == tier).sum()):>11}{len(idx):>7}"
-              + "".join(f"{c:>14}" for c in cells))
+              + "".join(f"{c:>17}" for c in cells))
     print("\n(n) is the number of complexes that clear the >=5-row threshold in that tier.")
 
     # the same question for the cluster split, which is why it is the harder protocol

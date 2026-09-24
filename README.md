@@ -1,4 +1,4 @@
-# Antibody–antigen ΔΔG: a gated multimodal model
+# Antibody–antigen ΔΔG: a frozen-encoder multimodal model
 
 Predicting how a mutation changes antibody–antigen binding free energy, from **sequence and
 3D structure**, on the antibody–antigen subset of SKEMPI 2.0.
@@ -106,8 +106,8 @@ structure branch **deleted**.
 
 | fusion mechanism | params | per-cx r | vs control |
 | --- | --- | --- | --- |
-| **gated fusion** ← the model | 48,001 | **+0.300** | **+0.088** |
-| plain concatenation | 36,353 | +0.293 | +0.081 |
+| **plain concatenation** ← **the model** | **36,353** | **+0.293** | **+0.081** |
+| gated fusion *(shared one projection across modalities — a bug)* | 48,001 | +0.300 | +0.088 |
 | cross-attention, structure → sequence | 77,441 | +0.241 | +0.029 |
 | FiLM on the structure delta | 52,993 | +0.227 | +0.015 |
 | cross-attention, weighted residual 0.2/0.8 | 77,441 | +0.208 | −0.004 |
@@ -204,15 +204,18 @@ Grouped 5-fold cross-validation, **no complex shared between folds**. `make repo
 
 ```
 model                                 ens  per seed  spread  n  neg    bal  bal-cal   stab
-cat128_reg2_l1  (the model)         +0.293    +0.239   0.063  3    6  0.439    0.457   0.19
-gated fusion (shared-proj bug)      +0.300    +0.249   0.028  3    7  0.463    0.459   0.25
-cross-attention (best of five)      +0.241    +0.182   0.046  3    9  0.454    0.445   0.35
-no-fusion control                   +0.212    +0.212     -    1    9  0.392    0.423   0.13
+cat128_reg2_l1  <- the model        +0.293    +0.239   0.063  3    6  0.439    0.457   0.19
+l1_gated       (shared-proj bug)    +0.300    +0.249   0.028  3    7  0.463    0.459   0.25
+st64_xattn_rev (best of five xattn) +0.241    +0.241     -    1    4  0.444    0.441   0.44
+st64_noattn    (no-fusion control)  +0.212    +0.212     -    1    9  0.392    0.423   0.13
 --- baseline ---
 E0a_rf_handcrafted (chem+geom+MPNN) +0.381    +0.379   0.032  3    6  0.444    0.498   0.06
 --- floor ---
 [complex mean only]                 +0.000                         0.580            0.58
 ```
+
+Run names, not descriptions, so each row can be checked against `results/oof/<name>.csv`.
+The two single-seed rows are marked `-` in `spread` and should be read as indicative only.
 
 `ens` averages seeds then scores once; `per seed` scores each separately. **`spread` is the
 number to read every comparison against.** Quoting one without the other is how a model appears
@@ -408,16 +411,38 @@ pip install -r requirements.txt          # Python 3.10; torch pinned, see requir
 make data                                # SKEMPI -> data/processed/*.parquet   (~65 s)
 make splits                              # frozen homology folds -> data/folds.csv  (~28 s)
 make features                            # geometry, ESM, ProteinMPNN caches
-make ladder                              # every rung, each writing reports/<name>/
+make ladder                              # the CLASSICAL ladder (mean -> GBT -> forest baseline)
 make report                              # the results table, all runs on one truth
 make errors                              # slice tables and diagnostics
 make align                               # verify each mutation is where we index it
 make test                                # split-integrity and harness tests
 ```
 
+**To train the submitted model, `cat128_reg2_l1`.** The neural runs are driven separately,
+from `experiments/protattba_repro/`, because they run on a Colab T4 rather than the dev
+machine. The whole launcher is one command:
+
+```bash
+python _run_ladder.py cat128_reg2_l1     # 5 folds x 3 seeds, ~25 min on a T4
+```
+
+which expands to exactly this, if you prefer to see it spelled out:
+
+```bash
+python _perturb_v2_colab.py --exp cat128_reg2_l1 --arch sitetok \
+  --folds 0 1 2 3 4 --seeds 0 1 2 --wd 0.1 --clip 4 --select-on per_complex \
+  --overrides '{"pca_dim": 128, "proj": 64, "subtract": true, "use_site_pool": false, "hidden": 128, "layers": 1, "input_noise": 0.25, "feature_dropout": 0.35, "chem_dim": 26, "concat_struct": true, "mpnn_proj": 64, "dropout": 0.35}'
+```
+
+It writes `out/cat128_reg2_l1_results.csv` and per-row predictions, which are collected into
+`results/oof/cat128_reg2_l1.csv` — the file every table and every error-analysis script in
+this repository reads. Re-running is safe: a configuration with five folds already on disk is
+skipped rather than retrained.
+
 `scripts/final_table.py` produces the results table above; `scripts/bias_analysis.py` and
-`scripts/error_drivers.py` produce Part III of the error analysis. `data/folds.csv` is
-committed and frozen — nothing downstream regenerates it.
+`scripts/error_drivers.py` produce Part III of the error analysis. Both default to
+`cat128_reg2_l1` as the network under test. `data/folds.csv` is committed and frozen —
+nothing downstream regenerates it.
 
 **Known environment issue:** `tests/test_perturb_*.py` require torch, which fails to load on
 the development machine (8 GB RAM, `WinError 1114`). The other tests pass; the torch tests run

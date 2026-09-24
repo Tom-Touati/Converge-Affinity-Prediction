@@ -1,5 +1,9 @@
 # Error analysis
 
+The submitted model is **`cat128_reg2_l1`** ([docs/MODEL.md](docs/MODEL.md)); the random
+forest is the **baseline** it is measured against. Both are analysed here, side by side,
+because the most useful findings below are the ones where they fail *differently*.
+
 Part I is the error analysis of the random forest, which is the **baseline**.
 Part II is the error analysis of the *evaluation*.
 Part III is bias from imbalance -- labels, complexes and mutation types -- and is
@@ -712,12 +716,13 @@ features *are* the geometry.
 Spearman between per-row \|error\|:
 
 ```
-         forest  gated  concat  nopca
-forest    1.000  0.464   0.542  0.422
-gated     0.464  1.000   0.866  0.611
-concat    0.542  0.866   1.000  0.630
-nopca     0.422  0.611   0.630  1.000
+        forest  cat128  gated  nopca
+forest   1.000   0.542  0.464  0.422
+cat128   0.542   1.000  0.866  0.630
+gated    0.464   0.866  1.000  0.611
+nopca    0.422   0.630  0.611  1.000
 ```
+(`cat128` is `cat128_reg2_l1`, the submitted model.)
 
 The two networks in the same family agree at 0.866 — near-duplicates, which is why the fusion
 ladder in Part II went nowhere. But **the forest agrees with the networks only 0.42–0.54**, so
