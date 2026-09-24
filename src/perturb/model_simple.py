@@ -484,6 +484,11 @@ class SiteTokenConfig:
     #: itself between thresholds, which a 3-way softmax can do freely -- a softmax is happy
     #: to call something both stabilising and destabilising before neutral.
     ordinal: int = 0
+    #: Antibody tokens attend to ANTIGEN tokens and vice versa -- across the interface,
+    #: rather than from sequence to structure. This is ProtAttBA's mechanism, and it is the
+    #: one arrangement in the family that lets a mutation's representation depend on what
+    #: it is binding to. Uses the same CrossAttn block; set cross_attn as well.
+    ab_ag_attn: bool = False
     input_noise: float = 0.0
     feature_dropout: float = 0.0
 
@@ -571,7 +576,7 @@ class PerturbSiteToken(nn.Module):
         # ProteinMPNN's PCA output is 128-d like the sequence's, so `proj` maps both into
         # one space and no separate input layer is needed before the dot product.
         self.attn = (CrossAttn(w, c.n_heads, c.dropout, c.res_pre, c.res_post)
-                     if c.cross_attn else None)
+                     if (c.cross_attn or c.ab_ag_attn) else None)
         if c.film_struct:
             self.g_str, self.b_str = nn.Linear(w, w), nn.Linear(w, w)
             for lin in (self.g_str, self.b_str):
@@ -703,6 +708,14 @@ class PerturbSiteToken(nn.Module):
                     stp = ((stp * m).sum(1) / m.sum(1).clamp(min=1.0)).unsqueeze(1)
                 seq = (1 + self.g_str(stp)) * seq + self.b_str(stp)
                 return site_mean(seq, batch[f"site_{side}"])
+            if c.ab_ag_attn:
+                # across the interface: this side's tokens ask the partner chain's tokens.
+                # Both branches use the SAME `which`, so a mutation changes the query on the
+                # mutated side and the keys on the other -- which is the point.
+                other = "ag" if side == "ab" else "ab"
+                seq_o = tok_proj(px(batch[f"seq_{other}_{which}"]))
+                x = self.attn(seq, seq_o, batch[f"mask_{other}"])
+                return site_mean(x, batch[f"site_{side}"])
             if self.attn is None:
                 return site_mean(seq, batch[f"site_{side}"])
             st = px(batch[f"struct_{side}"])

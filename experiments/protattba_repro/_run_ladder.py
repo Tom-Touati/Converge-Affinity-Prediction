@@ -80,27 +80,36 @@ AREA = dict(ST, use_site_pool=False, chem_dim=26, mpnn_proj=64, layers=1,
 L1 = dict(ST, use_site_pool=False, chem_dim=26, mpnn_proj=64, layers=1,
           seeds=[0, 1, 2], **REG2, **CLIP10)
 
+#: The classification table: one row per architecture family, each at its best known
+#: configuration, all with the ordinal head, two seeds each.
+#:
+#: Early stopping is loosened from patience 10 to 25. The ordinal loss moves in much smaller
+#: steps than MSE -- measured gradient norms dropped from ~5.1 to 0.4-0.6 -- so a patience
+#: tuned for the regression runs stops these far too early.
+CLS = dict(ST, use_site_pool=False, chem_dim=26, mpnn_proj=64, layers=1,
+           ordinal=2, seeds=[0, 1], patience=25, **REG2, **CLIP10)
+
 LADDER = [
-    ("area_gated", dict(AREA, gated_fusion=True)),          # already part-run; finish it
-    ("cat128_reg2_l1_noclip", dict(ST, use_site_pool=False, chem_dim=26, concat_struct=True,
-                                   mpnn_proj=64, layers=1, seeds=[0, 1, 2],
-                                   grad_clip=20.0, **REG2)),
-
-    # the three fusion mechanisms on the configuration that is actually ahead
-    ("l1_gated", dict(L1, gated_fusion=True)),
-    ("l1_film", dict(L1, film_struct=True)),
-    ("l1_xattn", dict(L1, cross_attn=True, n_heads=4, attn_direction="seq_to_struct")),
-
-    # Ordinal head instead of regression. MSE asks the model to reproduce a number whose
-    # own repeat measurements disagree by a median of 1.1 kcal/mol within a complex, so a
-    # large share of what it chases is noise. These ask the better-posed question -- which
-    # side of -0.5 and of +0.5 does this mutation fall on -- and keep the ordering, because
-    # one shared scalar drives both thresholds (CORAL). Two extra parameters.
-    #
-    # RMSE is not comparable for these: the head emits a score, not kcal/mol. Read them on
-    # per-complex correlation and concordance only.
-    ("l1_gated_ord", dict(L1, gated_fusion=True, ordinal=2)),
-    ("l1_concat_ord", dict(L1, concat_struct=True, ordinal=2)),
+    # no fusion at all: the control every other row has to beat
+    ("cls_nostruct", dict(CLS)),
+    # plain concatenation of the two modalities
+    ("cls_concat", dict(CLS, concat_struct=True)),
+    # gated fusion -- best regression net at +0.249
+    ("cls_gated", dict(CLS, gated_fusion=True)),
+    # FiLM: structure modulates the sequence edit
+    ("cls_film", dict(CLS, film_struct=True)),
+    # sequence queries structure
+    ("cls_xattn", dict(CLS, cross_attn=True, n_heads=4,
+                       attn_direction="seq_to_struct")),
+    # structure queries sequence -- the direction that led under PCA
+    ("cls_xattn_rev", dict(CLS, cross_attn=True, n_heads=4,
+                           attn_direction="struct_to_seq")),
+    # ProtAttBA's mechanism: antibody tokens attend across the interface to antigen tokens
+    ("cls_abag_xattn", dict(CLS, ab_ag_attn=True, n_heads=4)),
+    # binding-site mean alongside the mutation mean: structure pooled over the whole area
+    ("cls_areapool", dict(CLS, concat_struct=True, struct_area_pool=True)),
+    # the wild-type binding-site pools, which are a complex-identity channel by construction
+    ("cls_sitepool", dict(CLS, concat_struct=True, use_site_pool=True)),
 ]
 
 

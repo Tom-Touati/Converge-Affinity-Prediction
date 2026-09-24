@@ -1,11 +1,12 @@
-"""np12 night queue: finish the one-layer head and its clipping control, then attention on the new representation"""
+"""np12: the second half of the classification table."""
 import os, subprocess, sys, time
 from pathlib import Path
 
 R = Path("/content/perturb")
-PAIRS = [["l1_concat_ord"]]
+PAIRS = [["cls_abag_xattn", "cls_areapool", "cls_sitepool"],
+         ["cls_film", "cls_xattn", "cls_xattn_rev"]]
 
-for pat in ("_split_driver", "_pair_driver", "_run_ladder", "_perturb_v2_colab"):
+for pat in ("_split_driver", "_run_ladder", "_perturb_v2_colab"):
     for line in subprocess.run(["bash", "-lc", "pgrep -af " + pat],
                                capture_output=True, text=True).stdout.splitlines():
         pid = int(line.split()[0])

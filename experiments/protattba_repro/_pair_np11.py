@@ -1,11 +1,13 @@
-"""np11 night queue: the new representation alone, then the fusion mechanisms on it"""
+"""np11: the classification table, three configurations at a time."""
 import os, subprocess, sys, time
 from pathlib import Path
 
 R = Path("/content/perturb")
-PAIRS = [["l1_gated_ord"]]
+PAIRS = [["cls_nostruct", "cls_concat", "cls_gated"],
+         ["cls_film", "cls_xattn", "cls_xattn_rev"],
+         ["cls_abag_xattn", "cls_areapool", "cls_sitepool"]]
 
-for pat in ("_split_driver", "_pair_driver", "_run_ladder", "_perturb_v2_colab"):
+for pat in ("_split_driver", "_run_ladder", "_perturb_v2_colab"):
     for line in subprocess.run(["bash", "-lc", "pgrep -af " + pat],
                                capture_output=True, text=True).stdout.splitlines():
         pid = int(line.split()[0])
