@@ -3,7 +3,7 @@ import os, subprocess, sys, time
 from pathlib import Path
 
 R = Path("/content/perturb")
-PAIRS = [["l1_film"], ["l1_gated_ord"]]
+PAIRS = [["l1_gated_ord"]]
 
 for pat in ("_split_driver", "_pair_driver", "_run_ladder", "_perturb_v2_colab"):
     for line in subprocess.run(["bash", "-lc", "pgrep -af " + pat],

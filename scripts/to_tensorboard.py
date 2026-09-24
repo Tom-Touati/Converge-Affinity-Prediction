@@ -74,6 +74,15 @@ CURVES = {
     "grad/blosum": ("g_blosum",),
     "grad/chain": ("g_chain",),
     "grad/other": ("g_other",),
+    # classification, written only by runs with an ordinal head. The score is binned by
+    # its own quantiles against the training class frequencies, since the head emits a
+    # ranking rather than kcal/mol.
+    "class/accuracy": ("val_acc3",),
+    "class/macro_f1": ("val_macro_f1",),
+    "class/recall_stabilising": ("val_recall_0",),
+    "class/recall_neutral": ("val_recall_1",),
+    "class/recall_destabilising": ("val_recall_2",),
+    "class/opposite_class_rate": ("val_opposite",),
 }
 
 

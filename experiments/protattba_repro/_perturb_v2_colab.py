@@ -74,6 +74,35 @@ GRAD_CLIP = 5.0
 CLASS_EDGES = (-0.5, 0.5)
 
 
+def class_metrics(pred, true, edges=CLASS_EDGES):
+    """Three-class scores for a run whose head emits an ordered score.
+
+    The prediction is a score, not kcal/mol, so it cannot be binned with the same edges as
+    the labels. It is binned by its own QUANTILES, matched to the class frequencies of the
+    training labels -- which is the honest way to turn a ranking into classes when the
+    scale is arbitrary. Accuracy on its own is reported beside macro-F1 and per-class
+    recall because the classes are 13/34/53 and accuracy alone rewards the majority.
+    """
+    t = np.digitize(true, edges)
+    # match the predicted class frequencies to the observed ones
+    q = np.quantile(pred, np.cumsum([np.mean(t == k) for k in range(len(edges))]))
+    pc = np.digitize(pred, q)
+    out = {"val_acc3": float(np.mean(pc == t))}
+    f1s = []
+    for k in range(len(edges) + 1):
+        tp = float(np.sum((pc == k) & (t == k)))
+        rec = tp / max(float(np.sum(t == k)), 1.0)
+        prec = tp / max(float(np.sum(pc == k)), 1.0)
+        f1s.append(0.0 if prec + rec == 0 else 2 * prec * rec / (prec + rec))
+        out[f"val_recall_{k}"] = round(rec, 5)
+    out["val_macro_f1"] = round(float(np.mean(f1s)), 5)
+    # the pair that matters most: never call a stabilising mutation destabilising
+    out["val_opposite"] = round(float(np.mean(((t == 0) & (pc == 2)) |
+                                              ((t == 2) & (pc == 0)))), 5)
+    out["val_acc3"] = round(out["val_acc3"], 5)
+    return out
+
+
 def blosum62():
     from Bio.Align import substitution_matrices
     m = substitution_matrices.load("BLOSUM62")
@@ -532,12 +561,13 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
         r_pool = pear(pv, tv)
         r_cx = per_complex_rho(pv, tv, [i.rsplit("|", 1)[0] for i in vids])
         r = r_cx if select_on == "per_complex" else r_pool
+        cls = class_metrics(pv, tv) if getattr(cfg, "ordinal", 0) else {}
         import resource
         history(exp, dict(epoch=ep, step=(ep + 1) * max(ns, 1), steps=ns,
                           loss=round(tot / max(ns, 1), 5),
                           val_rho="" if np.isnan(r_pool) else round(r_pool, 5),
                           val_cx_rho="" if np.isnan(r_cx) else round(r_cx, 5),
-                          train_rho="",
+                          train_rho="", **cls,
                           **{gk: round(gv, 5) for gk, gv in gstat.items()},
                           val_rmse=round(float(np.sqrt(((pv - tv) ** 2).mean())), 5),
                           seconds=round(time.time() - t0, 1), fold=fold, seed=seed,
