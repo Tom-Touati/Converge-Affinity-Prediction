@@ -1004,7 +1004,10 @@ class PerturbSiteToken(nn.Module):
         # projection is built, ProteinMPNN falls through to the SEQUENCE's Linear, and an
         # antibody sequence, an antigen sequence and an inverse-folding encoding are all
         # forced through one 128 -> 64 map. The parameter count is what exposed it --
-        # 49,793 instead of 57,985, exactly one Linear(128, 64) short.
+        # 49,793 instead of 57,985, exactly one Linear(128, 64) short. (Found and fixed
+        # independently on both sides of a merge -- origin/main's version caught the same
+        # bug with a narrower trigger, c.mpnn_proj alone; kept the broader one since several
+        # of this branch's architectures set split_proj without also setting mpnn_proj.)
         uses_struct = (c.cross_attn or c.film_struct or c.concat_struct
                        or c.delta_xattn or c.gated_fusion)
         self.mpnn_proj = (nn.Linear(str_in, w, bias=False)

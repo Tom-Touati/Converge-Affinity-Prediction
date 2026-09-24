@@ -89,27 +89,27 @@ L1 = dict(ST, use_site_pool=False, chem_dim=26, mpnn_proj=64, layers=1,
 CLS = dict(ST, use_site_pool=False, chem_dim=26, mpnn_proj=64, layers=1,
            ordinal=2, seeds=[0, 1], patience=25, **REG2, **CLIP10)
 
+#: The submitted model: separate projection per modality, concatenated, one-layer head.
+CAT = dict(ST, use_site_pool=False, chem_dim=26, concat_struct=True, mpnn_proj=64,
+           layers=1, seeds=[0, 1, 2], **REG2)
+
 LADDER = [
-    # no fusion at all: the control every other row has to beat
-    ("cls_nostruct", dict(CLS)),
-    # plain concatenation of the two modalities
-    ("cls_concat", dict(CLS, concat_struct=True)),
-    # gated fusion -- best regression net at +0.249
-    ("cls_gated", dict(CLS, gated_fusion=True)),
-    # FiLM: structure modulates the sequence edit
-    ("cls_film", dict(CLS, film_struct=True)),
-    # sequence queries structure
-    ("cls_xattn", dict(CLS, cross_attn=True, n_heads=4,
-                       attn_direction="seq_to_struct")),
-    # structure queries sequence -- the direction that led under PCA
-    ("cls_xattn_rev", dict(CLS, cross_attn=True, n_heads=4,
-                           attn_direction="struct_to_seq")),
-    # ProtAttBA's mechanism: antibody tokens attend across the interface to antigen tokens
-    ("cls_abag_xattn", dict(CLS, ab_ag_attn=True, n_heads=4)),
-    # binding-site mean alongside the mutation mean: structure pooled over the whole area
-    ("cls_areapool", dict(CLS, concat_struct=True, struct_area_pool=True)),
-    # the wild-type binding-site pools, which are a complex-identity channel by construction
-    ("cls_sitepool", dict(CLS, concat_struct=True, use_site_pool=True)),
+    # Antibody<->antigen cross-attention in the CHEAP family. This mechanism has only ever
+    # been measured as the v2/v3/v4 family, which carried it together with BLOSUM, a distance
+    # bias, a chain embedding and RoPE at 51k-810k parameters -- every one of which was later
+    # removed elsewhere without loss. So +0.112..+0.200 prices "ab<->ag attention plus four
+    # things that do not help, in a model 2-20x too big", not the mechanism.
+    #
+    # It is also the one attention variant the seq<->struct result does not refute. That one
+    # plausibly failed because ProteinMPNN's signal is local and near-constant per complex
+    # once pooled, so there was little to align against; this aligns two SEQUENCE
+    # representations across the interface, which is a different proposition.
+    #
+    # Identical to the submitted model in every other respect, so exactly one thing changes.
+    ("ab_ag_l1", dict(CAT, ab_ag_attn=True, n_heads=4)),
+
+    # the submitted model itself, for a same-session control
+    ("cat128_reg2_l1", dict(CAT)),
 ]
 
 

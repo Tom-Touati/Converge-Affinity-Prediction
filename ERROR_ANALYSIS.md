@@ -1,9 +1,25 @@
 # Error analysis
 
-Part I is the error analysis of the random forest, which is the model.
+> **The submitted model changed after this document was written.** `cat128_reg2_l1` was
+> superseded by **`struct_film_chem`** (README §1, [docs/DETAILS.md](docs/DETAILS.md#struct_film_chem)),
+> which beats it on ensemble score, per-seed mean and negative-complex count. The numbered
+> sections below still analyse `cat128_reg2_l1` specifically and have not been re-run against
+> the new model — `scripts/error_drivers.py` has been updated to compare the two by name, but
+> the deeper analysis (Parts I-III) has not. Read what follows as characterising the *previous*
+> submission, not the current one, until it is updated.
+
+The submitted model **was** **`cat128_reg2_l1`** ([docs/MODEL.md](docs/MODEL.md)); the random
+forest is the **baseline** it is measured against. Both are analysed here, side by side,
+because the most useful findings below are the ones where they fail *differently*.
+
+Part I is the error analysis of the random forest, which is the **baseline**.
 Part II is the error analysis of the *evaluation*.
 Part III is bias from imbalance -- labels, complexes and mutation types -- and is
 where the aggregate metric is shown to conceal the failures that matter most.
+
+**Start with "The metrics, and why each one exists" below.** Several numbers in this
+document are traps without it: three of the obvious metrics are beaten by a model that never
+looks at the mutation.
 
 > **Superseded in places — see [HANDOFF.md](docs/HANDOFF.md).** Numbers here predate two
 > corrections: the per-complex threshold moved from 10 mutations to 5 (the model to beat
@@ -11,6 +27,78 @@ where the aggregate metric is shown to conceal the failures that matter most.
 > Any figure produced by a net trained on `ddG - forest_prediction` had the forest added
 > back at inference and is not that network's own score.
 
+
+---
+
+# The metrics, and why each one exists
+
+Every metric here was added because something else failed to catch a specific defect. Read
+this first; several of the numbers below are traps without it.
+
+## The standard table — `scripts/report_runs.py`, printed for every run
+
+| metric | the question it answers | what it caught |
+| --- | --- | --- |
+| **`per_cx_r`, `per_cx_rho`** | can the model rank mutations *within* one complex | **the headline.** Everything else exists to stop it being read naively |
+| **`cx_neg`** | how many complexes end with a *negative* within-complex correlation | 6–11 of 32. The mean conceals that the model is actively wrong on some complexes |
+| **`pooled_r`** | correlation over all rows at once | reported in order to be discredited — the complex-mean floor scores **+0.672** on it |
+| **`rmse`** | absolute error, kcal/mol | dominated by between-complex structure; the floor beats every model at **1.144** |
+| **`bias`** | mean signed error | −0.05 to −0.53 depending on model, and strongly seed-dependent |
+| **`rmse_deb`** | RMSE after removing that offset | separates "wrong on average" from "wrong per row" |
+| **`sign`** | direction correct on \|ΔΔG\| > 0.5 | 0.76–0.82, which looks good and is mostly the 70 %-destabilising prior |
+| **`sign_bal`** | the same, class-balanced | **0.59 for the forest.** This is the one that exposes the prior |
+| **`conc`** | of two mutations on one complex, is the ordering right (pairs > 0.5 apart) | the design question restated; forest 0.74, networks ~0.66 |
+
+## Two reference lines, without which none of the above is readable
+
+**The floor — predicting each complex's own mean**, a model that never looks at the mutation:
+**+0.672 pooled, 1.144 RMSE, 0.580 balanced accuracy, +0.000 per complex.** It beats every
+model in this project on three of those four. `report_runs.py` prints it beneath every
+comparison for that reason (§8).
+
+**The ceiling — label noise.** Measurement sd is **0.240 kcal/mol** across 107 repeated
+(complex, mutation) pairs, implying a maximum attainable per-complex Pearson of **0.979**. We
+reach 0.381, so about 60 % of the reachable signal is unclaimed and the assay is not what
+withholds it (§23).
+
+## Why the headline metric cannot be gamed by bias or compression
+
+Pearson correlation is invariant to any affine transform of the predictions, so neither a
+constant offset nor a compressed output range can move it. Verified rather than asserted:
+
+| transform | per-complex r | RMSE | balanced acc |
+| --- | --- | --- | --- |
+| forest, as scored | +0.3974 | 1.335 | 0.439 |
+| forest, bias removed (−0.050) | **+0.3974** | 1.334 | 0.434 |
+| forest, bias *and* scale corrected | **+0.3974** | 1.530 | 0.502 |
+| `cat128_reg2_l1`, as scored | +0.3003 | 1.448 | 0.463 |
+| `cat128_reg2_l1`, bias removed (−0.161) | **+0.3003** | 1.439 | 0.435 |
+
+Identical to four decimals. So the submitted model carrying a −0.161 bias against the forest's
+−0.050 gives it **no advantage or disadvantage** in the headline comparison.
+
+What *is* bias-sensitive: **RMSE**, which is why raw and debiased are printed side by side; and
+the **classification metrics**, heavily — which is why calibration moves stabilising recall
+0.06 → 0.29 while leaving Spearman at +0.3613 (§14).
+
+One detail worth noticing in that table: correcting the *scale* makes RMSE **worse**
+(1.335 → 1.530). Shrinking toward the mean is optimal under squared error when uncertain. The
+compression only becomes a defect at the moment you threshold.
+
+## The four metrics the deeper sections add
+
+| metric | why the standard table was not enough |
+| --- | --- |
+| **balanced 3-class accuracy + per-class recall** (§14) | classes are 13/34/53, so accuracy rewards guessing the majority. This is what exposed the forest finding **7 of 126** stabilising mutations |
+| **Spearman(sign(ΔΔG), signed error)** (§14) | **−0.61.** One number for the central defect. Its companion Spearman(sign, \|error\|) ≈ 0 is what proves the model is *precise and wrong in direction* rather than merely noisy |
+| **Spearman(descriptor, error), partialled** (§19, §24) | raw versions are confounded by the label. Partialling reverses several and reveals others — the forest mis-weights burial, the network mis-weights the substitution |
+| **per-complex r sliced by difficulty** (§20–§21) | the same metric by max TM to training: **+0.367 easy, +0.060 hard.** Arguably the most important number here, since the headline is 75 % weighted toward near-retrieval |
+
+## The one-line summary
+
+The headline is **per-complex correlation**. Pooled correlation, RMSE and accuracy are each
+beaten by a model that ignores the mutation entirely, so all three are reported **with their
+floor attached** or not at all.
 
 # Part I — errors of the model
 
@@ -379,9 +467,11 @@ The ceiling is the model and the task, not the pipeline.
    seed spread in §9 is what that looks like from the inside. No regularisation setting
    removed it: raising dropout 75%, noise 150% and weight decay tenfold cost 0.037–0.043 on
    two different architectures and reduced variance on neither.
-2. **Label noise.** Within-complex label standard deviation has a median of 1.104 kcal/mol,
-   and repeated (complex, mutation) measurements in SKEMPI disagree at a scale that caps any
-   achievable correlation.
+2. **~~Label noise.~~ Measured, and it is NOT a limit — see §23.** Repeated (complex,
+   mutation) measurements disagree at sd **0.240 kcal/mol**, implying a ceiling of **0.979** on
+   per-complex Pearson. We reach 0.381. This item previously cited a within-complex label sd of
+   1.104 as the noise floor; that is the spread of *different* mutations, which is signal. The
+   assay is not what is holding this back.
 3. **Between-complex variance swamping within-complex signal**, which is §8 — it makes the
    obvious metric the wrong one and rewards the wrong features.
 4. **Representation, last.** Six probes, three protein language models, two structure
@@ -420,6 +510,30 @@ predicted mean +0.280 — the sign is wrong, not just the magnitude.
 the +0.381 comes from the destabilising class (r 0.406) and from separating destabilising
 from the rest. For affinity maturation, where the task is to rank candidate *improving*
 mutations against each other, this model is a coin flip.
+
+**As a single number: Spearman(sign(ΔΔG), signed error) = −0.61 for the submitted model
+(`cat128_reg2_l1`, the `concat` column below) and −0.61 for the forest.** Every model in the project is in the range −0.48 to −0.61.
+
+| label | n | mean ΔΔG | forest | gated | **`cat128_reg2_l1`** | no-PCA |
+| --- | --- | --- | --- | --- | --- | --- |
+| stabilising (ΔΔG < 0) | 250 | −0.809 | +1.169 | +1.108 | +1.113 | +0.756 |
+| near-neutral (\|ΔΔG\| ≤ 0.5) | 315 | +0.046 | +0.419 | +0.442 | +0.422 | +0.271 |
+| destabilising (ΔΔG > 0) | 657 | +1.562 | −0.531 | −0.669 | −0.756 | −0.771 |
+
+Two readings matter.
+
+**The sign carries most of the error, but not all of it.** −0.61 for the sign against −0.79
+for the full value (§19). So the error is predominantly about which side of zero the label
+falls on, with magnitude contributing the remainder — consistent with shrinkage toward a
+training mean that is 70 % destabilising, rather than a pure sign flip.
+
+**The model is not less *precise* on stabilising mutations — it is precise and wrong.**
+Correlation between label sign and *absolute* error is ≈ 0 (−0.08 to +0.10). For a designer
+that is worse than noise: a confidently wrong sign is actionable in the wrong direction.
+
+`st64_nopca_grouped` is the least biased of the four (−0.478, with +0.756 / −0.771 rather than
++1.169 / −0.531) — and it is also the model with the best stabilising recall (0.48) and the
+best balanced accuracy (0.508). Those are three views of one property.
 
 The mechanism is compression:
 
@@ -472,10 +586,12 @@ it has.** The five worst complexes are mostly low-spread ones:
 | 2B2X_HL_A | 70 | −0.179 | 1.038 |
 | 1MLC_AB_E | 24 | −0.164 | 1.062 |
 
-A complex whose mutations all land within ~0.4 kcal/mol of each other is being asked to be
-ranked at a resolution finer than the assay's own reproducibility (within-complex label sd
-has a median of 1.104). A negative correlation there is close to meaningless, yet it enters
-the mean with equal weight — and 2B2X, at 70 rows, is not a small-sample artifact.
+A complex whose mutations all land within ~0.4 kcal/mol of each other is being ranked at a
+resolution close to the assay's reproducibility. With measurement sd **0.240** (§23), a complex
+whose labels span 0.416 has reliability ≈ 0.67 and a ceiling near **0.82** — so those complexes
+are *harder*, not impossible, and a correlation of −0.433 is a real failure rather than an
+artifact of the measurement. They nonetheless enter the mean with the same weight as an 87-row
+complex spanning 2 kcal/mol, and 2B2X at 70 rows is not a small-sample case.
 
 **Implication for the metric.** An unweighted mean over per-complex correlations treats a
 7-row complex with 0.78 spread the same as an 87-row one. Weighting by rows, or excluding
@@ -548,14 +664,15 @@ rows), and a feature set built per-residue has no way to represent epistasis.
 §14–§17 found failures by hand. This is the same question asked of every available descriptor
 against every model at once, so that a defect belonging to the *task* can be told from one
 belonging to an architecture. Spearman throughout; regenerate with
-`python scripts/error_drivers.py`.
+`python scripts/error_drivers.py`. **The raw correlations below are confounded by the label —
+§24 partials it out, and several of them reverse or vanish.**
 
 ### Signed error — where the models are biased
 
 Correlation between a descriptor and `y_pred − y_true`. Negative means the model
 under-predicts as the descriptor grows.
 
-| descriptor | forest | gated | concat | nopca |
+| descriptor | forest | gated | **cat128** | nopca |
 | --- | --- | --- | --- | --- |
 | **true ΔΔG** | **−0.792** | **−0.775** | **−0.842** | **−0.705** |
 | **deviation from the complex's own mean** | −0.592 | −0.576 | −0.599 | −0.573 |
@@ -587,7 +704,7 @@ sign to everything else, consistent with §16's finding that X→A is the over-r
 
 ### Absolute error — where the models are imprecise
 
-| descriptor | forest | gated | concat | nopca |
+| descriptor | forest | gated | **cat128** | nopca |
 | --- | --- | --- | --- | --- |
 | \|ΔΔG\| | 0.535 | 0.489 | 0.586 | 0.446 |
 | deviation from the complex mean | 0.188 | 0.326 | 0.315 | 0.327 |
@@ -607,12 +724,13 @@ features *are* the geometry.
 Spearman between per-row \|error\|:
 
 ```
-         forest  gated  concat  nopca
-forest    1.000  0.464   0.542  0.422
-gated     0.464  1.000   0.866  0.611
-concat    0.542  0.866   1.000  0.630
-nopca     0.422  0.611   0.630  1.000
+        forest  cat128  gated  nopca
+forest   1.000   0.542  0.464  0.422
+cat128   0.542   1.000  0.866  0.630
+gated    0.464   0.866  1.000  0.611
+nopca    0.422   0.630  0.611  1.000
 ```
+(`cat128` is `cat128_reg2_l1`, the submitted model.)
 
 The two networks in the same family agree at 0.866 — near-duplicates, which is why the fusion
 ladder in Part II went nowhere. But **the forest agrees with the networks only 0.42–0.54**, so
@@ -623,14 +741,381 @@ Testing that directly, z-scoring each model within complex and blending:
 | | per-complex r |
 | --- | --- |
 | forest alone | +0.397 |
-| `l1_gated` alone | +0.300 |
+| **`cat128_reg2_l1`** alone | +0.293 |
 | `st64_nopca_grouped` alone | +0.274 |
-| forest + `l1_gated`, 25 % net | **+0.418** |
+| **forest + `cat128_reg2_l1`, 25 % net** | **+0.416** |
+| forest + `cat128_reg2_l1`, 50 % net | +0.403 |
 | forest + `st64_nopca_grouped`, 25 % net | **+0.424** |
-| forest + `st64_nopca_grouped`, 50 % net | +0.414 |
 
 **Four of four blends beat the forest**, by up to +0.027. Read that as a demonstration that
 complementary signal exists rather than as a validated model: the blend weight was not chosen
 on held-out data, and +0.027 sits just inside the forest's own 0.032 seed spread. The
 robustness across two different networks and two weights is what makes it worth pursuing —
 and it is a cheaper, better-evidenced next step than any architecture in Part II.
+
+## 20. How many test rows are actually hard — by structural distance to training
+
+Every number in this repository averages over test rows that differ enormously in how much
+help the training folds give them. Difficulty here is the **maximum TM-score from a test
+complex to any complex in its own training folds**, so it reflects the split the model was
+trained under. Regenerate with `python scripts/difficulty_tiers.py`.
+
+```
+          complexes  rows  rows %  median max TM
+easy             39   707    75.2          0.991
+medium            2    47     5.0          0.649
+hard             12   186    19.8          0.429
+```
+
+easy ≥ 0.80 · medium ≥ 0.50 · hard < 0.50, on `frozen5` (by complex).
+
+**Three quarters of the test rows have a near-identical training twin, at a median TM of
+0.991.** That is not "structurally similar" — it is effectively the same complex under a
+different PDB id (1KIP / 1KIQ / 1KIR are one antibody–lysozyme system; 1BJ1 / 1CZ8 score
+0.992 against each other). For 75 % of the evaluation the model is being asked a
+near-retrieval question, not a generalisation one.
+
+### Performance collapses on the rows that are actually hard
+
+| tier | complexes | rows | random forest | **`cat128_reg2_l1`** |
+| --- | --- | --- | --- | --- |
+| easy | 39 | 707 | +0.421 (22) | +0.367 (22) |
+| medium | 2 | 47 | +0.643 (2) | +0.420 (2) |
+| **hard** | **12** | **186** | **+0.270 (8)** | **+0.060 (8)** |
+
+*(n) is the number of complexes clearing the ≥5-row threshold in that tier.*
+
+**The network loses 84 % of its performance on hard rows** (+0.367 → +0.060); the forest loses
+36 % (+0.421 → +0.270). Both degrade, the network far more — the same asymmetry the cluster
+split showed, now localised to the rows responsible for it rather than inferred from a summary.
+
+The medium tier is two complexes and should not be read as anything.
+
+### Why this reframes the headline
+
+The headline +0.381 and +0.300 are **75 % weighted toward near-retrieval**. On a genuinely
+novel complex — the deployment case for antibody engineering, where the target is new — the
+honest expectations are **+0.270 (forest)** and **+0.060 (network)**.
+
+This also explains the cluster-split result mechanically rather than by analogy. `data/tm_tiers.csv`
+records that under cluster grouping **0 of 54** complexes are easy and **all 54 are hard** — by
+construction, since the split withholds structural relatives. So the cluster numbers (forest
+0.224, network 0.084) are approximately the "hard" column of this table, and the two analyses
+agree.
+
+**What should change because of this.** Any reported number on this dataset should carry its
+difficulty mix, and a model intended for novel targets should be selected on the hard tier
+rather than on the average. Doing the latter selects for retrieval.
+
+## 21. Frequency versus proximity — which kind of support actually helps
+
+§15 asked whether a complex's **frequency** (how many rows it has) predicts performance; §20
+asked how far it is from the training set. This separates the two, because they are different
+kinds of support and only one of them matters.
+
+For each complex: rows in the dataset, count of other complexes within a TM threshold in its
+*training* folds, and the maximum TM to any training complex.
+
+```
+53 complexes
+  rows per complex           median 9,  max 87
+  neighbours at TM >= 0.8 in training   median 2, max 11, and ZERO for 14 complexes
+```
+
+### Spearman against per-complex r (32 scorable complexes)
+
+| support measure | forest | **`cat128_reg2_l1`** |
+| --- | --- | --- |
+| **frequency** — rows the complex has | +0.039 | +0.142 |
+| neighbours in training at TM ≥ 0.8 | +0.071 | +0.358 |
+| neighbours in training at TM ≥ 0.5 | +0.064 | +0.314 |
+| **proximity** — max TM to any training complex | **+0.170** | **+0.494** |
+
+**How often a complex appears is very nearly irrelevant** (+0.039 / +0.092). **How close it is
+to something in training is what matters**, and it matters about three times as much to the network
+as to the forest (+0.494 against +0.170).
+
+That is the homology dependence of §11 and §20 measured a third way, on a different axis, and
+it agrees: the network's performance tracks structural proximity, the forest's much less so.
+
+### Binned by how many structural relatives a complex has in training
+
+| neighbours (TM ≥ 0.8) | complexes | rows | forest | **`cat128_reg2_l1`** |
+| --- | --- | --- | --- | --- |
+| **0 — isolated** | 10 | 221 | 0.345 | **0.132** |
+| 1–2 | 11 | 326 | 0.370 | 0.302 |
+| 3+ | 11 | 342 | **0.473** | **0.432** |
+
+The network **more than triples**, 0.132 → 0.432, as structural relatives accumulate; the
+forest improves by less than a third, 0.345 → 0.473. Ten complexes — 221 rows, 24 % of the
+data — have no structural relative in training at all, and on those the network is at **0.132**,
+against the forest's 0.345.
+
+**The practical reading.** Adding more *measurements of complexes we already have* should be
+expected to do little: frequency does not predict performance. Adding *new complexes near an
+untested region of structure space* is what would help, and the isolated bin is where the model
+is weakest.
+
+## 22. The cluster split, and why it is the honest protocol
+
+The numbers above explain why this project reports a homology-clustered split alongside the
+by-complex one, and why the cluster split is treated as the more honest of the two.
+
+**How the clusters are built** (`src/splits.py`). Links between complexes come from three
+sources, unioned into connected components:
+
+1. **SKEMPI's own `Hold_out_proteins` annotation** — using the dataset authors' definition of
+   homology is the most defensible default. It is not repeated on every row, so it is unioned
+   across all rows of a complex.
+2. **Pairwise sequence identity on either side** — local Smith-Waterman with BLOSUM62, identity
+   over the shorter sequence. **Antigens link at 30 %**, the usual homology threshold.
+   **Antibodies link at 90 %**, deliberately much higher: shared framework regions put two
+   *unrelated* antibodies at 70–80 % identity, so the usual threshold would merge everything.
+3. **Curator notes** — SKEMPI flags "HyHEL-10 and HyHEL-63 are very similar" on 151 rows. That
+   is a manual link regardless of what the automatic thresholds return.
+
+Connected components of that graph are the clusters; folds are assigned over clusters, giving
+4 folds rather than 5.
+
+**Why it matters, in one line.** Under by-complex grouping **42 of 54 complexes gain a TM > 0.8
+training twin; under cluster grouping, 0 of 54 do.** `data/tm_tiers.csv` records every complex
+as `hard` under cluster grouping, by construction.
+
+So the two protocols are not two views of the same difficulty — they are the two ends of §20's
+tier table:
+
+| | easy rows | hard rows | forest | network |
+| --- | --- | --- | --- | --- |
+| by complex (`frozen5`) | 75 % | 20 % | 0.418 | 0.246 |
+| by cluster | 0 % | 100 % | 0.224 | 0.084 |
+| §20's *hard tier only*, by complex | — | — | 0.270 | 0.117 |
+
+The cluster numbers and the hard-tier numbers agree to within the seed noise, which is the
+check that the two analyses are measuring the same thing. **A by-complex split reports
+performance that is three-quarters near-retrieval; a cluster split reports performance on
+genuinely novel structure.** For antibody engineering against a new target, the second is the
+number that matters — and it is 0.224 for the baseline and 0.084 for the network.
+
+The by-complex split is still reported because it is the field's de facto protocol
+(RDE-Network, DiffAffinity) and dropping it would make this work incomparable to published
+results. It is reported *alongside*, never instead.
+
+## 23. The label-noise ceiling — and a correction to what this project claimed
+
+Several documents here asserted that label noise caps the achievable correlation, citing a
+**within-complex label sd of 1.104 kcal/mol**. That was a conflation, and this section
+corrects it.
+
+1.104 is the spread of *different mutations* within a complex. That is the **signal** a
+per-complex correlation is asked to rank — not noise. The noise is how far apart two
+measurements of *the same* mutation land, and SKEMPI lets us measure it directly.
+
+### Measuring it
+
+107 (complex, mutation) pairs are measured more than once — 226 measurements in total, the
+largest group four times. Pooled within-group variance:
+
+```
+measurement variance   0.0575        ->  sd 0.240 kcal/mol
+median |difference| between a repeated pair          0.206
+```
+
+**These are genuinely independent replicates**, not the same experiment listed twice: 43 of
+the 107 groups span *different publications*, and those give sd **0.227** — essentially
+identical to the 0.247 of same-publication repeats, and 42 groups span more than one
+temperature. Cross-laboratory agreement is, if anything, slightly tighter.
+
+### The ceiling that implies
+
+With `observed = signal + noise`, reliability is `var(signal)/var(observed)` and the maximum
+attainable correlation for a perfect predictor is `sqrt(reliability)`.
+
+| metric | label variance | reliability | **ceiling** | our best | % of ceiling |
+| --- | --- | --- | --- | --- | --- |
+| pooled Pearson | 2.388 | 0.976 | **0.988** | +0.509 | 52 % |
+| per-complex Pearson | 1.387 | 0.959 | **0.979** | +0.381 | 39 % |
+
+### What this changes
+
+**Label noise is not the binding constraint, and this project should stop saying it is.** At
+sd 0.240 against a within-complex signal sd of 1.178, the labels are reproducible enough to
+support a correlation near 0.98. We reach 0.381. **Roughly 60 % of the available signal is
+unclaimed**, and it is not being withheld by the assay.
+
+This *strengthens* the project's central argument rather than weakening it. The constraint is
+data volume — 752 training rows per fold, 32 scorable complexes, and a seed spread up to 0.117
+— together with the homology structure in §20–§22. Those are addressable; measurement noise
+would not have been.
+
+It also **weakens one argument made in `docs/JUSTIFICATIONS.md` §A1**: the case for an ordinal
+head partly rested on the labels being "only accurate to ~1 kcal/mol", so that a squared loss
+chases noise. At 0.240 that argument is much weaker than stated. The ordinal head's remaining
+justification is about the class imbalance and the thresholding behaviour in §14, not about
+measurement error, and A1 has been corrected to say so.
+
+**Caveats, all of which push the true ceiling down rather than up.** Repeats are not a random
+sample — a mutation gets re-measured when it is contested, which should if anything inflate
+their disagreement. Only 107 of 940 rows carry a repeat, so the noise estimate comes from 11 %
+of the data and is assumed homogeneous. And the bound assumes additive independent noise and a
+perfect predictor: it is an upper limit on what *any* model could reach, not a target.
+
+Regenerate with `python scripts/noise_ceiling.py`.
+
+## 24. Descriptors versus error, with the label controlled for
+
+§19 reported raw correlations between descriptors and error. They are **confounded**, and
+badly: |error| correlates with |ΔΔG| at ρ ≈ 0.5 and signed error with ΔΔG at ρ ≈ −0.8, so any
+descriptor that happens to track effect size appears to predict error whether or not it carries
+information the model failed to use.
+
+This partials the label out of both sides — on ranks, quadratically, because regression to the
+mean is not linear in the label — and the picture changes substantially. Regenerate with
+`python scripts/error_drivers_partial.py`.
+
+### Random forest: raw correlations mislead in both directions
+
+| descriptor | \|err\| raw | \|err\| **partial** | err raw | err **partial** |
+| --- | --- | --- | --- | --- |
+| distance to partner chain | −0.272 | **−0.027** | +0.005 | **−0.585** |
+| interface contacts | +0.354 | **+0.093** | −0.116 | **+0.496** |
+| rSASA bound | +0.008 | +0.147 | +0.018 | **−0.494** |
+| ΔrSASA on mutation | +0.360 | **+0.164** | −0.102 | +0.337 |
+| neighbour count | +0.330 | +0.251 | −0.088 | −0.162 |
+| number of mutations | +0.349 | +0.248 | −0.080 | −0.139 |
+| ProteinMPNN log P(wt) | −0.282 | −0.259 | +0.067 | +0.270 |
+
+**Two opposite failures of the raw view, and both matter.**
+
+**Correlations that evaporate.** Distance to the partner chain looked like a strong predictor of
+imprecision at −0.272; controlled, it is **−0.027** — it predicted nothing about error, only
+about effect size. Interface contacts go 0.354 → 0.093, ΔrSASA 0.360 → 0.164. Most of §19's
+"buried, highly-contacting sites are harder" is really just "buried sites have larger effects".
+
+**Correlations that appear.** The reverse is more interesting. Geometry has **almost no raw
+correlation with signed error** (+0.005, −0.116, +0.018) and a very strong one once the label is
+removed: **−0.585, +0.496, −0.494**. These were hidden because regression to the mean dominates
+the raw signal and cancels them.
+
+**What that says.** Take two mutations with the *same* true ΔΔG, one at a buried,
+highly-contacting site and one exposed and distant. The forest predicts the buried one
+**higher**. It is using burial as a proxy for effect size *beyond what the label justifies* —
+and it has these features, so this is not missing information but mis-weighted information.
+That is a concrete, addressable defect, and it is invisible without partialling.
+
+### The network fails on chemistry, not geometry
+
+| descriptor | \|err\| raw | \|err\| partial | err raw | err **partial** |
+| --- | --- | --- | --- | --- |
+| Δ molecular weight | −0.175 | +0.002 | −0.081 | **−0.603** |
+| substitutions to alanine | +0.055 | −0.087 | +0.180 | **+0.566** |
+| Δ volume | −0.133 | +0.034 | −0.034 | **−0.524** |
+| mutant residue identity | −0.166 | −0.076 | −0.139 | −0.355 |
+| Δ hydropathy | +0.144 | +0.081 | +0.120 | +0.337 |
+| BLOSUM of the substitution | −0.179 | −0.075 | −0.082 | −0.308 |
+| distance to partner chain | −0.301 | −0.054 | +0.251 | −0.179 |
+
+The submitted model's directional error is driven by **substitution chemistry**, not by
+geometry: it **over-predicts alanine substitutions** (+0.566) and **under-predicts large
+volume and mass changes** (−0.524, −0.603), at equal true ΔΔG. Geometry barely survives
+partialling for it (−0.179).
+
+**The two models fail on different axes** — the forest mis-weights burial, the network
+mis-weights the substitution itself. That is a mechanism for §19's finding that they agree only
+0.42–0.54 on which rows are hard, and therefore for why blending them beats either.
+
+It is also a pointed comment on the network's inputs. Those 26 chemistry columns are the single
+largest gain measured anywhere in this project (+0.191 → +0.266), and they are simultaneously
+where its directional error concentrates. It has the information and is using it wrongly, which
+is a better problem than not having it.
+
+### How much of the error is predictable at all
+
+A gradient-boosted model predicting **|error|** from these descriptors, cross-validated by
+complex so no complex informs its own prediction:
+
+| | all descriptors | excluding label proxies |
+| --- | --- | --- |
+| random forest | +0.505 | **+0.416** |
+| `cat128_reg2_l1` | +0.333 | **+0.157** |
+
+**The forest's own errors are predictable at ρ = 0.416 from features it already has.** That is
+unused signal by definition — a second model can see where the first will be wrong, using the
+same inputs. It is the strongest quantitative case in this document for the blend in §19, and
+it suggests something narrower would also work: a learned per-row weighting, or simply
+down-weighting burial in the forest's feature set.
+
+The network's errors are much less predictable (+0.157). Read charitably, it has already
+extracted what these descriptors offer; read plainly, its remaining error is noise or lies
+outside anything we measured — and given §23 puts the label-noise ceiling at 0.979, it is more
+likely the latter.
+
+## 25. Why every elaboration failed — the synthesis
+
+Forty-five configurations were measured. The submitted model is the **simplest fusion in the
+family**: two projections, concatenate, one hidden layer, 36,353 parameters. This section
+collects why the more inventive things lost, because the individual null results are more
+convincing together than separately.
+
+### Every elaboration, priced against the simpler thing it replaced
+
+| elaboration | params | per-cx r | against | verdict |
+| --- | --- | --- | --- | --- |
+| cross-attention, 5 variants | 77,441 | +0.172 … +0.241 | no-fusion control +0.212 | **4 of 5 at or below**, at 2× the parameters |
+| antibody↔antigen attention (v2/v3/v4) | 51k–811k | +0.112 … +0.200 | concatenation +0.293 | **below**, at up to 22× the parameters |
+| FiLM on the structure delta | 52,993 | +0.227 | concatenation +0.293 | below |
+| gated fusion | 48,001 | +0.300 | concatenation +0.293 | **+0.007 — inside the seed spread**, and it shared one projection across modalities |
+| learned block-diagonal reduction, no PCA | 61,057 | +0.236 (2 seeds) | PCA-128 +0.216 | inside the noise; its own two seeds differ by 0.075 |
+| structure pooled over the binding area | 36,353 | +0.227 | pooled at the mutated site +0.293 | **worse by 0.066** |
+| heavier regularisation | — | −0.037 … −0.043 | its own baseline | worse on two architectures |
+| a second head layer | +16,512 | no measurable change | one layer | free to delete |
+
+**Nothing in that table beats plain concatenation outside the seed spread.** The one apparent
+exception, gated fusion, is +0.007 and turned out to be sharing a projection between two
+encoders with unrelated output spaces.
+
+### A number that does *not* support the simple reading, stated anyway
+
+Across all 45 configurations, Spearman(parameter count, per-complex r) is **+0.276** —
+*positive*. Bigger models score slightly better on average.
+
+That is a real number and it is confounded: the small end of the range is full of deliberately
+crippled ablations. `mlp_chem_only` has 20,096 parameters and scores **−0.005**;
+`v5_simple_noseqstruct` has 6,464 and scores +0.146. Removing information makes a model both
+small and bad, which manufactures a positive correlation.
+
+**So the claim is not "smaller is better".** It is the narrower and better-supported one: *at
+equal information, added mechanism did not pay for itself.* Each row of the table above is a
+matched comparison where one thing changed.
+
+### Why, mechanistically — the error analysis already answers it
+
+Four findings from this document explain the pattern, and each was measured independently of
+the ladder:
+
+1. **There is no mutant structure** (§ model design). ProteinMPNN sees the wild-type backbone
+   only, so the structure term is **identical for every mutation of a complex**. A fusion
+   mechanism that learns to align sequence against structure is aligning a varying quantity
+   against a constant one. Attention has almost nothing to attend *to*.
+2. **ProteinMPNN's signal is local and washes out when pooled** (§A3, and the area-pool result
+   above). Its value is per-residue resolution; any mechanism that summarises it across the
+   interface destroys what it contributes.
+3. **Regression to the mean is the dominant error structure**, ρ ≈ −0.8 between signed error
+   and true ΔΔG *for every architecture tested* (§19, §24). A failure common to all of them is
+   not a failure of any one's fusion mechanism.
+4. **Capacity is not the constraint.** An 810,886-parameter model scores +0.200 and a
+   41,792-parameter one +0.205; removing an entire head layer costs nothing measurable. When
+   extra capacity is free to add and free to remove, the binding constraint is elsewhere —
+   §13 and §20–§23 locate it in data volume and homology structure.
+
+### The finding stated plainly
+
+**On 752 training rows per fold, the mechanism of fusion is not what separates models.** What
+separates them is which features reach the model at all — 26 chemistry columns moved the same
+network +0.191 → +0.266, larger than any architectural change measured anywhere in this
+project — and how close the test complex is to something seen in training (§21: proximity
+ρ +0.494, frequency ρ +0.142).
+
+The strongest version of the same point is that the **random forest on 49 handcrafted columns,
+with no learned representation at all, beats every one of the 45 networks** at +0.381. That is
+not a comfortable result to report, and it is the clearest evidence in the project that
+complexity was never the missing ingredient.

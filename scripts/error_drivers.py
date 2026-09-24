@@ -33,11 +33,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from src import paths                 # noqa: E402
 
 MUT = re.compile(r"^([A-Z])([A-Za-z0-9])(-?\d+[A-Za-z]?)([A-Z])$")
+#: "film_chem" is the SUBMITTED model (was cat128, superseded); the others are there to show
+#: which failures are shared rather than specific to one architecture.
 MODELS = {
-    # the forest is still the best overall model; struct_film_chem is the best NETWORK,
-    # the current submission for that role -- see README's results table
-    "forest":           ("reports", "E0a_rf_handcrafted_seed0"),
-    "struct_film_chem": ("oof", "struct_film_chem"),
+    "forest":    ("reports", "E0a_rf_handcrafted_seed0"),   # the baseline
+    "film_chem": ("oof", "struct_film_chem"),               # the submitted model
+    "cat128":    ("oof", "cat128_reg2_l1"),                 # the previous submission
+    "gated":     ("oof", "l1_gated"),
+    "nopca":     ("oof", "st64_nopca_grouped"),
 }
 MIN_ABS = 0.05          # ignore correlations smaller than this in the summary
 

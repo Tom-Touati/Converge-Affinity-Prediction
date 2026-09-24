@@ -1,5 +1,12 @@
 # Handoff — state of the project, and what a fresh session needs to know
 
+> **Historical snapshot, 2026-09-21. Superseded in one important respect.** This document
+> says "the random forest is the model". That was accurate when written, before the gated
+> fusion ladder was built. The submitted model is now `cat128_reg2_l1` ([MODEL.md](MODEL.md)) and the
+> forest is the **baseline** it is measured against — see [JUSTIFICATIONS.md §A5](JUSTIFICATIONS.md).
+> Its numbers here also predate the censored-affinity drop (997 rows, not 940). Kept as the
+> record of what was known at the time.
+
 Written 2026-09-21, after the session that removed residual learning. Read this before
 trusting any number in the older documents: several headline figures in `README.md`,
 `ARCHITECTURE.md` and `ERROR_ANALYSIS.md` predate the corrections below and are wrong.
@@ -35,6 +42,10 @@ Dropping is a holding policy, not the right answer. See §9.
 ## 1. The result
 
 **The random forest is the model. The neural network does not beat it, on either split.**
+
+> *Superseded — see the banner at the top.* The submitted model is `cat128_reg2_l1`; the forest
+> is the **baseline**. It is still the better ranker (+0.381 against +0.293), which is reported
+> as such in [MODEL.md](MODEL.md) and `ERROR_ANALYSIS.md`, not hidden.
 
 Cluster-grouped split (the reported one), all models scored on identical rows:
 

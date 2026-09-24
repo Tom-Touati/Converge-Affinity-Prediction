@@ -36,10 +36,14 @@ MIN_ROWS = 5
 
 #: label, and where the per-seed predictions come from
 FOREST = {"E0a_rf_handcrafted (chem+geom+MPNN)": "results/predictions/E0a_rf_handcrafted_seed{}.csv"}
-NETS = ["l1_gated", "cat128_reg2_l1", "gf_reg2", "st64_nopca_grouped", "area_concat",
-        "st64_noattn", "st64_xattn_rev_nopca", "st64_film_struct",
-        "struct_film_chem", "struct_film_site", "mut_pair_ffn_sub",
-        "gated_cg_clusterscale", "gated_cg_feats", "delta_xattn2"]
+#: The SUBMITTED model. Marked in the printed table so no reader has to be told separately.
+#: Was cat128_reg2_l1; superseded by struct_film_chem, which beats it on ensemble, per-seed
+#: mean and negative-complex count (only its seed spread is wider -- see the README caveat).
+SUBMITTED = "struct_film_chem"
+NETS = [SUBMITTED, "l1_gated", "cat128_reg2_l1", "gf_reg2", "st64_nopca_grouped", "area_concat",
+        "st64_noattn", "st64_xattn_rev", "st64_xattn_rev_nopca", "st64_film_struct",
+        "struct_film_site", "mut_pair_ffn_sub", "gated_cg_clusterscale",
+        "gated_cg_feats", "delta_xattn2"]
 
 
 def load_truth():
@@ -120,7 +124,8 @@ def main() -> None:
                      (max(singles) - min(singles)) if len(singles) > 1 else float("nan"),
                      len(ss), neg, bal, bal_c, rec[0]))
     for n, e, m, sp, k, neg, bal, balc, stab in sorted(rows, key=lambda r: -r[1]):
-        print(f"{n:<34}{e:>+7.3f}{m:>+10.3f}{sp:>8.3f}{k:>3}{neg:>5}"
+        label = f"{n}  <- the model" if n == SUBMITTED else n
+        print(f"{label:<34}{e:>+7.3f}{m:>+10.3f}{sp:>8.3f}{k:>3}{neg:>5}"
               f"{bal:>7.3f}{balc:>9.3f}{stab:>7.2f}")
 
     # the floor, which several of these metrics reward more than any model
@@ -138,6 +143,8 @@ def main() -> None:
     print("bal      = balanced 3-class accuracy at the label edges (-0.5, +0.5)")
     print("bal-cal  = the same after quantile calibration, which cannot change the ranking")
     print("stab     = recall on STABILISING mutations, the class design actually cares about")
+    print()
+    print(f"the submitted model is {SUBMITTED}; every other row is here to price it")
 
 
 if __name__ == "__main__":
