@@ -100,6 +100,38 @@ convincingly.
 genuine conditional fusion, is no worse, and is **twice as stable**: seed spread 0.028 against
 0.063, with its worst seed (+0.235) above concatenation's worst (+0.210).
 
+### The training objective — a within-complex ranking loss was tried and did not improve
+
+The headline metric is a *within-complex* correlation, so the obvious move is to optimise it
+directly: an AbRank-style pairwise logistic loss over pairs of mutations on the same complex
+(`src/fusion_v2.py::pairwise_rank_loss`). It cancels the per-complex offset exactly and is
+invariant to per-complex rescaling, which matters when 47.7 % of SKEMPI temperatures are
+assumed rather than measured.
+
+It does not help.
+
+| objective | per-complex ρ |
+| --- | --- |
+| no-rank control (regression only) | 0.420 |
+| best ranking config, full pair coverage | 0.421 |
+| ranking mixed at lower weight | 0.288 |
+| **pure ranking, no regression term** | **0.170** (RMSE 4.20) |
+
+*Measured on the pre-correction 997-row dataset, so these are not comparable to the table in
+§3 — the comparison against its own control is internal and valid.*
+
+At best it **ties** the control. Pure ranking collapses, and the mechanism is clear: the
+regression term is the only anchor on output scale, and without it the model is free to drift
+anywhere that preserves order — RMSE 4.20 against ~1.5.
+
+The deeper reason it cannot help is that **19,834 pairs from 997 rows is 19.9× the examples
+and zero new information.** Pairs are a re-expression of the same labels, not augmentation.
+
+**What survives.** A ranking loss is the only route to the **80 non-binders and 86 censored
+rows** — measurements with no usable ΔΔG but a known ordering, and the censored rows are
+exactly the ones the regression target forced this project to drop (997 → 940). It is deferred
+on a narrow trigger: build it for *data recovery*, not for a score gain.
+
 ## 3. Results
 
 Grouped 5-fold cross-validation, **no complex shared between folds**. `make report` and

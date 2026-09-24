@@ -42,6 +42,52 @@ incoherent for an ordered target. CORAL's shared direction makes
 ranking identical to the underlying scalar). **The runs did not complete** — this is a
 justified design, not a measured result, and is not claimed as one.
 
+## A1b. A within-complex ranking loss was built, measured, and rejected
+
+**Chosen.** Regression (MSE/Huber) as the training objective. A pairwise ranking loss exists
+in the codebase (`src/fusion_v2.py::pairwise_rank_loss`) and is not used.
+
+**Why it was the obvious thing to try.** The headline metric is a *within-complex*
+correlation, and a within-complex pairwise loss optimises it directly rather than through a
+proxy. It has three real merits, none of them aesthetic: it cancels the per-complex offset
+exactly (a constant-per-fold predictor scores global ρ −0.36, so that shortcut is live); it is
+invariant to per-complex monotone rescaling, which matters because **47.7 % of SKEMPI
+temperatures are assumed rather than measured**; and it is the only objective that can consume
+a measurement with an ordering but no usable value.
+
+**Why it was rejected.** Measured, AbRank-style, at several mixing weights:
+
+| objective | per-complex ρ | RMSE |
+| --- | --- | --- |
+| no-rank control (regression only) | 0.420 | ~1.5 |
+| best ranking config, full pair coverage | 0.421 | — |
+| ranking mixed at lower weight (`v2_h3_rankloss`) | 0.288 | 1.97 |
+| pure ranking, no regression term (`rk_rank_only`) | **0.170** | **4.20** |
+
+*n = 997, the pre-correction dataset — not comparable to the current 940-row tables, but the
+comparison against its own control is internal and valid.*
+
+At full pair coverage it **ties** the control, 0.421 against 0.420. Everything else is worse.
+
+**The mechanism of the collapse is worth stating**, because it is not a tuning failure: a
+ranking loss constrains only *order*, so the regression term is the only anchor on output
+scale. Remove it and the model drifts anywhere order-preserving — RMSE 4.20 against ~1.5, on a
+label whose own sd is 1.79.
+
+**And the reason it could not have helped much.** 19,834 pairs from 997 rows is **19.9× the
+examples and zero new information**. Pairs are a re-expression of the existing labels, not
+augmentation. The efficiency argument was tested and not supported.
+
+**What survives, and why it stays in the next steps.** The ranking loss is the only route to
+the **80 non-binders and 86 censored rows** — measurements with a known ordering but no usable
+ΔΔG. The censored rows are precisely the ones the regression target forced this project to drop
+(997 → 940, and the forest fell 0.388 → 0.239 on the cluster split when they went). So it is
+deferred on a narrow trigger: build it for **data recovery**, never for a score gain.
+
+Two cost notes recorded at the time, for whoever builds it: the top 3 complexes hold 43.2 % of
+pairs against 22.8 % of rows, so pairs need 1/C(n,2) weighting; and near-ties are noise, so
+filtering to |Δ| > 1 keeps 10,703 pairs (54 %).
+
 ## A2. Frozen encoders, small trained heads
 
 **Chosen.** ESM-2 and ProteinMPNN frozen; only heads of 15k–85k parameters train.
