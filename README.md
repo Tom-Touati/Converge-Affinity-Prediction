@@ -19,6 +19,7 @@ network.
 | AI prompt history | **[AI_PROMPTS.md](AI_PROMPTS.md)** |
 | Running it | [Setup](#setup-and-running) below |
 | Hardware and runtime | [Hardware](#hardware-and-runtime) below |
+| **Every architecture tried, with configs and results** | **[docs/ARCHITECTURES.md](docs/ARCHITECTURES.md)** |
 | Deeper background, encoders, split design | [docs/DETAILS.md](docs/DETAILS.md), [docs/PLAN.md](docs/PLAN.md) |
 
 ---
@@ -170,8 +171,10 @@ Against all of that, **the largest single gain came from features, not architect
 
 The practical conclusion is that on this dataset the fusion *mechanism* is not the binding
 constraint, and a project that spends its budget searching architectures is optimising the
-wrong thing. The evidence for that claim is in
-[ERROR_ANALYSIS.md §9–§10](ERROR_ANALYSIS.md).
+wrong thing. The evidence is in [ERROR_ANALYSIS.md §9–§10](ERROR_ANALYSIS.md); the full
+catalogue of **45 completed configurations** — every family, config, parameter count and
+result, including the two that are implemented but unmeasured — is
+[docs/ARCHITECTURES.md](docs/ARCHITECTURES.md).
 
 ---
 
