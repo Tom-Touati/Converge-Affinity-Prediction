@@ -68,10 +68,30 @@ BATCH, LR, WD, PATIENCE, VAL_FRACTION = 32, 3e-4, 1e-2, 10, 0.20
 #: inject more noise, clip more often, and were being compared against configs that
 #: clipped far less. Set it well above the norm to turn clipping off.
 GRAD_CLIP = 5.0
+#: Epochs over which the antibody-antigen share of a batch rises from 50% to
+#: 100%. 0 disables the curriculum and samples uniformly.
+CURRICULUM = 0
+#: Which training rows the fold-local PCA is FITTED on. "all" uses everything in the
+#: training folds; "abag" fits on the antibody-antigen rows alone and then applies that
+#: basis to every row.
+#:
+#: This matters more than it looks. Fitted on all 343 complexes, PCA-128 retains 69.6% of
+#: the sequence variance against 89.1% when fitted on the 53 antibody complexes, and the
+#: two bases share only 39% of their span -- the third component is nearly orthogonal
+#: between them. A full-corpus run would then differ from its control in BOTH the data and
+#: the representation, and a drop could not be attributed to either. Fitting on AB/AG alone
+#: holds the representation fixed so the extra data is the only variable.
+PCA_ROWS = "all"
 #: Class boundaries for the ordinal head, matching src/evaluate.py so the three classes mean
 #: the same thing everywhere: stabilising < -0.5 <= neutral <= +0.5 < destabilising.
 #: On the 940 rows that is 13% / 34% / 53%.
 CLASS_EDGES = (-0.5, 0.5)
+#: How the chem block is standardised, and the cluster map it needs. "fold" is one mean and
+#: sd over the training folds; "cluster" is one per homology cluster, from that cluster's
+#: training rows.
+CHEM_SCALE = "fold"
+CLUSTER_OF = None
+MIN_CLUSTER_ROWS = 8
 
 
 def class_metrics(pred, true, edges=CLASS_EDGES):
@@ -123,8 +143,17 @@ class Cache:
         self._mpnn = {}
         # The project's handcrafted columns, if they were shipped. Standardisation is
         # fold-local and happens in run_fold, not here.
-        f = ROOT / "chem_perturb.parquet"
+        base = os.environ.get("CHEM_TABLE", "chem_perturb")
+        f = ROOT / f"{base}.parquet"
         self.chem = pd.read_parquet(f).set_index("row_id") if f.exists() else None
+        # The reverse-mutation augmentation flips the label, so it needs a chem vector for
+        # the backwards mutation too: a log-odds ratio run backwards is its own negation,
+        # and n_to_pro becomes n_from_pro. Without this the strongest columns in the block
+        # are shown one value against both signs of the label. Built by
+        # scripts/build_perturb_features.py; absent for the older tables, and then the
+        # augmentation falls back to reusing the forward vector as it always did.
+        g = ROOT / f"{base}_rev.parquet"
+        self.chem_rev = pd.read_parquet(g).set_index("row_id") if g.exists() else None
 
     def tokens(self, s):
         k = self.tok(s, return_tensors="np")["input_ids"][0].astype(np.int32).tobytes()
@@ -218,11 +247,15 @@ def fold_pca(rows, fold, cache, dim, seed=0):
               flush=True)
         return Identity(w_ab), Identity(w_ag), Identity(w_st)
     PCA_DIR.mkdir(parents=True, exist_ok=True)
-    f = PCA_DIR / f"fold{fold}_pca{dim}_{SEQ_AB}.joblib"
+    f = PCA_DIR / f"fold{fold}_pca{dim}_{SEQ_AB}_{PCA_ROWS}.joblib"
     if f.exists():
         return joblib.load(f)
     from sklearn.decomposition import PCA
     tr = rows[rows.fold != fold]
+    if PCA_ROWS == "abag" and "is_abag" in tr.columns:
+        tr = tr[tr.is_abag]
+        print(f"  fold {fold}: PCA fitted on the {len(tr)} AB/AG training rows only",
+              flush=True)
     rng = np.random.default_rng(seed)
     per_side, str_rows = {"ab": [], "ag": []}, []
     for r in tr.itertuples():
@@ -256,7 +289,8 @@ def fold_pca(rows, fold, cache, dim, seed=0):
 
 
 class DS(Dataset):
-    def __init__(self, frame, pcas, cache, cfg, augment, seed, memo=None, chem=None):
+    def __init__(self, frame, pcas, cache, cfg, augment, seed, memo=None, chem=None,
+                 chem_rev=None):
         self.f = frame.reset_index(drop=True)
         self.p_ab, self.p_ag, self.p_str = pcas
         self.c, self.cfg = cache, cfg
@@ -264,6 +298,7 @@ class DS(Dataset):
         self.bl = blosum62()
         self.memo = memo if memo is not None else {}
         self.chem = chem          # already standardised, indexed by row_id
+        self.chem_rev = chem_rev  # the same rows written for the backwards mutation
 
     def seq_at(self, s, idx, side="ab"):
         # memoised per (sequence, side): the same string could in principle appear on both
@@ -319,8 +354,9 @@ class DS(Dataset):
 
         b_ab_wt, b_ab_mt = blos(c["ab_site"], len(c["ab_idx"]), c["ab_wt_aa"], c["ab_mt_aa"])
         b_ag_wt, b_ag_mt = blos(c["ag_site"], len(c["ag_idx"]), c["ag_wt_aa"], c["ag_mt_aa"])
-        chem = (self.chem.loc[r.row_id].values.astype(np.float32)
-                if self.chem is not None else np.zeros(0, np.float32))
+        src = self.chem_rev if (swap and self.chem_rev is not None) else self.chem
+        chem = (src.loc[r.row_id].values.astype(np.float32)
+                if src is not None else np.zeros(0, np.float32))
         return dict(chem=chem,
                     seq_ab_wt=s_ab_wt, seq_ab_mt=s_ab_mt, seq_ag_wt=s_ag_wt, seq_ag_mt=s_ag_mt,
                     struct_ab=t_ab, struct_ag=t_ag,
@@ -485,7 +521,19 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
     cx = sorted(tr_all.complex_key.unique())
     rng = np.random.default_rng(seed); rng.shuffle(cx)
     sizes = tr_all.complex_key.value_counts()
-    target, taken, val_cx = VAL_FRACTION * len(tr_all), 0, set()
+    # Validation must come from the SAME population as the test set. Training on all of
+    # SKEMPI makes the training pool 86% non-antibody, so a split drawn from all of it is
+    # 92% protein-protein: the reported per-complex score would describe a different
+    # population, and -- the part that actually breaks the run -- early stopping would pick
+    # the checkpoint that is best on protein-protein complexes and then test it on
+    # antibodies. Candidates are restricted to AB/AG whenever the corpus has any.
+    cand = tr_all[tr_all.is_abag] if "is_abag" in tr_all.columns else tr_all
+    if len(cand) and cand.complex_key.nunique() > 1:
+        sizes = cand.complex_key.value_counts()
+        cx = list(sizes.index)
+        rng_v = np.random.default_rng(seed)
+        rng_v.shuffle(cx)
+    target, taken, val_cx = VAL_FRACTION * len(cand), 0, set()
     for c in cx:
         if taken >= target or len(val_cx) >= len(cx) - 1:
             break
@@ -494,7 +542,7 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
     val = tr_all[tr_all.complex_key.isin(val_cx)]
 
     memo = {}                                  # one PCA cache shared by all three splits
-    chem = None
+    chem = chem_rev = None
     if getattr(cfg, "chem_dim", 0) and cache.chem is not None:
         # Mean and sd from the TRAINING folds only. Standardising over everything would let
         # the held-out complexes set the scale the model is trained on -- small, silent, and
@@ -502,11 +550,83 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
         c_all = cache.chem
         mu = c_all.loc[tr_all.row_id].mean()
         sd = c_all.loc[tr_all.row_id].std().replace(0.0, 1.0)
-        chem = ((c_all - mu) / sd).astype(np.float32)
-    mk = lambda f, a: DataLoader(DS(f, pcas, cache, cfg, a, seed, memo, chem),
-                                 batch_size=BATCH, shuffle=a, collate_fn=collate,
-                                 num_workers=0)
-    tr, va, te = mk(train, augment), mk(val, False), mk(test, False)
+
+        def scale(frame):
+            return ((frame - mu) / sd).astype(np.float32)
+
+        if CHEM_SCALE == "cluster" and CLUSTER_OF is not None:
+            # Standardise WITHIN each homology cluster instead of once over everything.
+            #
+            # The metric is per-complex, so between-complex and between-cluster variation in
+            # a feature is variation the model is never rewarded for using -- and it is
+            # variation that lets a model identify the complex, which scores +0.672 pooled
+            # and +0.000 per complex. Removing each cluster's own offset and spread leaves
+            # the within-cluster signal, which is the part the metric actually measures.
+            #
+            # The leakage boundary does not move: a cluster's mean and sd come from its
+            # TRAINING rows only. A cluster with too few training rows keeps the fold-global
+            # statistics rather than being scaled by a handful of points -- and under the
+            # cluster split a held-out cluster has no training rows at all, so that fallback
+            # is the normal case there, not an edge case.
+            cl = CLUSTER_OF.reindex(c_all.index)
+            tr = set(tr_all.row_id)
+            groups = cl.groupby(cl).groups
+            stats, n_cl, n_fb = {}, 0, 0
+            for name, idx in groups.items():
+                trn = [i for i in idx if i in tr]
+                if len(trn) >= MIN_CLUSTER_ROWS:
+                    sub = c_all.loc[trn]
+                    stats[name] = (sub.mean(), sub.std().replace(0.0, 1.0))
+                    n_cl += 1
+                else:
+                    stats[name] = (mu, sd)
+                    n_fb += 1
+
+            def scale(frame, groups=groups, stats=stats):
+                out = [(frame.loc[idx] - stats[name][0]) / stats[name][1]
+                       for name, idx in groups.items()]
+                return pd.concat(out).reindex(frame.index).astype(np.float32)
+            print(f"  chem scaled per cluster: {n_cl} clusters from their own training "
+                  f"rows, {n_fb} fell back to fold-global", flush=True)
+
+        chem = scale(c_all)
+        if cache.chem_rev is not None:
+            # Scaled by the FORWARD statistics on purpose. Giving the reversed rows their
+            # own mean would undo the negation: a column centred separately in each
+            # orientation carries no sign, and sign is the whole content of a log-odds
+            # ratio. The standardiser is a fixed map learned on training rows and applied
+            # to whatever is fed through it, exactly as the fold's PCA is.
+            chem_rev = scale(cache.chem_rev.reindex(c_all.index))
+    def mk(f, a, sampler=None):
+        return DataLoader(DS(f, pcas, cache, cfg, a, seed, memo, chem, chem_rev),
+                          batch_size=BATCH, shuffle=(a and sampler is None),
+                          sampler=sampler, collate_fn=collate, num_workers=0)
+
+    def curriculum_loader(frame, epoch):
+        """Draw a batch that is `p` antibody-antigen, with p rising 0.5 -> 1.0.
+
+        Training on all of SKEMPI means 84% of the rows are not antibody complexes, so a
+        uniform sampler spends most of its gradient on a different problem. Starting at half
+        and annealing to all of it lets the model learn general binding physics first and
+        specialise onto antibodies, rather than having to do both at once from a corpus
+        whose majority is the wrong domain.
+
+        Implemented as per-row weights rather than by truncating the non-antibody rows, so
+        every row stays reachable at every epoch and only its probability changes.
+        """
+        if CURRICULUM <= 0:
+            return mk(frame, True)
+        p = min(1.0, 0.5 + 0.5 * epoch / max(CURRICULUM, 1))
+        is_ab = frame["is_abag"].to_numpy() if "is_abag" in frame.columns             else np.ones(len(frame), bool)
+        n_ab, n_other = int(is_ab.sum()), int((~is_ab).sum())
+        if n_ab == 0 or n_other == 0:
+            return mk(frame, True)
+        w = np.where(is_ab, p / n_ab, (1.0 - p) / n_other)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            torch.as_tensor(w, dtype=torch.double), num_samples=len(frame), replacement=True)
+        return mk(frame, True, sampler)
+
+    tr, va, te = curriculum_loader(train, 0), mk(val, False), mk(test, False)
 
     if getattr(cfg, "group_reduce", 0) and not cfg.in_seq:
         # the model cannot know these; they come from the cache the DS reads
@@ -539,6 +659,8 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
 
     best, state, bad, t0 = -np.inf, None, 0, time.time()
     for ep in range(max_epochs):
+        if CURRICULUM > 0:
+            tr = curriculum_loader(train, ep)
         model.train(); tot, ns = 0.0, 0
         gstat = {}
         for b in tr:
@@ -621,6 +743,14 @@ def main():
     ap.add_argument("--no-pca", action="store_true",
                     help="skip the fold-local PCA and hand the model raw embeddings; the "
                          "model must then reduce them itself")
+    ap.add_argument("--pca-rows", default="all", choices=["all", "abag"],
+                    help="fit the fold-local PCA on all training rows, or AB/AG only")
+    ap.add_argument("--curriculum", type=int, default=0,
+                    help="epochs to anneal the AB/AG batch share 50%% -> 100%%")
+    ap.add_argument("--chem-scale", default="fold", choices=["fold", "cluster"],
+                    help="standardise the chem block globally or within homology cluster")
+    ap.add_argument("--clusters", default=None,
+                    help="csv with row_id,cluster; required by --chem-scale cluster")
     ap.add_argument("--grad-clip", type=float, default=None,
                     help="gradient-norm clip; 20 is effectively off here")
     ap.add_argument("--wd", type=float, default=None,
@@ -664,7 +794,7 @@ def main():
         rows["ddg"] = rows.ddg.clip(-a.clip, a.clip)
         print(f"clipped |ddG| to {a.clip}: {n} of {len(rows)} rows "
               f"({100 * n / len(rows):.1f}%)", flush=True)
-    global LR, WD, PATIENCE, GRAD_CLIP
+    global LR, WD, PATIENCE, GRAD_CLIP, CHEM_SCALE, CLUSTER_OF, CURRICULUM, PCA_ROWS
     if a.wd is not None:
         WD = a.wd
     if a.lr is not None:
@@ -673,6 +803,15 @@ def main():
         PATIENCE = a.patience
     if a.grad_clip is not None:
         GRAD_CLIP = a.grad_clip
+    CHEM_SCALE = a.chem_scale
+    if CHEM_SCALE == "cluster":
+        if not a.clusters:
+            raise SystemExit("--chem-scale cluster needs --clusters <csv>")
+        cl = pd.read_csv(a.clusters)
+        CLUSTER_OF = cl.set_index("row_id")["cluster"]
+        print(f"  clusters: {CLUSTER_OF.nunique()} over {len(CLUSTER_OF)} rows", flush=True)
+    CURRICULUM = a.curriculum
+    PCA_ROWS = a.pca_rows
     print(f"  optim: lr {LR}, weight_decay {WD}, patience {PATIENCE}, "
           f"grad_clip {GRAD_CLIP}", flush=True)
 
