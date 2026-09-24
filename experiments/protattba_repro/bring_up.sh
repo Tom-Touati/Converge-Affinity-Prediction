@@ -29,7 +29,13 @@ echo "== creating session $S =="
 # A session that never came up must stop the script. Without this it pushed 21 files into
 # nothing, reported "launched" and started a collector against a session that did not
 # exist -- every step after the failure "succeeded" while doing nothing at all.
-if ! wsl -e bash -lc "timeout 500 colab new -s $S --gpu T4" 2>&1 | tail -2; then
+# GPU=none falls back to a CPU session. Worth having: the T4 quota runs out after a
+# dozen sessions in a day, and these models sat at 0-4% GPU utilisation -- they are
+# loader-bound, so the training itself loses little. The ESM bootstrap is the part
+# that does not survive CPU well, at about 160 minutes against three on a T4.
+GPU=${GPU:-T4}
+NEWFLAGS=""; [ "$GPU" != "none" ] && NEWFLAGS="--gpu $GPU"
+if ! wsl -e bash -lc "timeout 500 colab new -s $S $NEWFLAGS" 2>&1 | tail -2; then
   echo "FATAL: could not create session $S"; exit 1
 fi
 cat > /tmp/_mkdirs.py <<'PY'
