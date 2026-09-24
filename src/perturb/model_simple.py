@@ -665,6 +665,22 @@ class SiteTokenConfig:
     #:         sign, or one near zero) -- the mirror of ab_ag_nn's default: here the
     #:         mul/sub roles of the two combine points are swapped.
     ab_ag_nn_across: str = "sub"
+    #: Another self-contained reference check, two terms concatenated into one mlp:
+    #:
+    #: SEQUENCE term: mt * wt, elementwise (edit_op="mul", independently of that flag),
+    #: at every crop residue, then site_mean -- pooled at the mutated positions only.
+    #:
+    #: STRUCTURE term: the wild-type structure's OWN mean over the BINDING SITE -- the
+    #: whole crop, site_mean pooled by the mask rather than by the mutated-residue site --
+    #: becomes a length-1 QUERY that cross-attends to the full per-residue structure of
+    #: that same crop, WITH NO RESIDUAL -- the return is the attention answer alone, the
+    #: query itself is discarded rather than added back. Only a side entirely absent from
+    #: the crop is masked to zero; every side with any interface residues at all gets a
+    #: real, non-degenerate query, unlike the sequence term below.
+    #:
+    #: Both terms are summed over ab and ag separately, then CONCATENATED (not added --
+    #: they answer different questions) and passed to the mlp alone. No chem, no geom.
+    seq_mul_struct_attn: bool = False
     #: Give each input its OWN first linear layer instead of one shared map.
     #:
     #: A shared projection forces the antibody, the antigen and ProteinMPNN into a single
@@ -806,6 +822,21 @@ class PerturbSiteToken(nn.Module):
             blocks += [nn.Linear(d, 1)]
             self.mlp = nn.Sequential(*blocks)
             return
+        if c.seq_mul_struct_attn:
+            # its own structure projection and its own no-residual attention -- res_pre is
+            # an instance constant on CrossAttn, and the main self.attn (built below, if
+            # this were combined with delta_xattn) keeps the ordinary residual, so this
+            # cannot reuse it.
+            self.mpnn_proj = nn.Linear(seq_in, w, bias=False)
+            self.struct_attn = CrossAttn(w, c.n_heads, c.dropout, res_pre=0.0, res_post=1.0)
+            blocks: list[nn.Module] = []
+            d = w * 2                          # sequence term (w) concat structure term (w)
+            for _ in range(c.layers):
+                blocks += [nn.Linear(d, c.hidden), nn.GELU(), nn.Dropout(c.dropout)]
+                d = c.hidden
+            blocks += [nn.Linear(d, 1)]
+            self.mlp = nn.Sequential(*blocks)
+            return
         pw = c.pool_proj or w
         self.pool_proj = (nn.Linear(seq_in, c.pool_proj, bias=False)
                           if c.pool_proj and c.use_site_pool else None)
@@ -895,6 +926,37 @@ class PerturbSiteToken(nn.Module):
             self.ord_b0 = nn.Parameter(torch.zeros(1))
             self.ord_gap = nn.Parameter(torch.full((c.ordinal - 1,), 0.5))
 
+    def _seq_mul_struct_attn(self, batch, px, tok_proj) -> torch.Tensor:
+        """mt*wt sequence term (pooled at the mutated site) concat a no-residual structure
+        query pooled over the BINDING SITE -- the whole crop, not just the mutated
+        residues. "wild type" and "site" both single out the structure term: only the
+        wild-type structure exists, and here it means the crop, the way ``mask`` already
+        does in ``_struct_vec``'s ``struct_area_pool`` -- NOT ``site_mean``'s usual meaning
+        of "the mutated residues", which the sequence term below keeps.
+
+        With res_pre=0 on struct_attn the query itself never reaches the output; only
+        what it read from the crop does.
+        """
+        c = self.cfg
+        acc_sim = 0
+        acc_struct = 0
+        for side in ("ab", "ag"):
+            site, mask = batch[f"site_{side}"], batch[f"mask_{side}"]
+            p_mt = tok_proj(px(batch[f"seq_{side}_mt"]), side)
+            p_wt = tok_proj(px(batch[f"seq_{side}_wt"]), side)
+            acc_sim = acc_sim + site_mean(p_mt * p_wt, site)
+
+            st = px(batch[f"struct_{side}"])
+            stp = self.mpnn_proj(st)
+            q = site_mean(stp, mask).unsqueeze(1)                      # (B, 1, w)
+            out = self.struct_attn(q, stp, mask.bool()).squeeze(1)
+            # a side can still be entirely absent from the crop (no interface residues
+            # modelled there at all); that is the one case left worth zeroing explicitly
+            has = (mask.sum(1, keepdim=True) > 0).float()
+            acc_struct = acc_struct + out * has
+
+        return torch.cat([acc_sim, acc_struct], dim=-1)
+
     def _ab_ag_nn(self, batch, px, tok_proj) -> torch.Tensor:
         """Per-ag-residue: combine with its nearest ab residue, combine wt against mt, pool.
 
@@ -968,11 +1030,12 @@ class PerturbSiteToken(nn.Module):
 
     def forward(self, batch) -> torch.Tensor:
         c = self.cfg
-        if c.ab_ag_interaction or c.ab_ag_nn:
+        if c.ab_ag_interaction or c.ab_ag_nn or c.seq_mul_struct_attn:
             def px0(x): return x               # no noise/dropout in this reference check
             def tp0(x, side="ab"):
                 return self.proj_side[side](x) if self.proj_side is not None else x
-            fn = self._ab_ag_nn if c.ab_ag_nn else self._ab_ag_interaction
+            fn = (self._seq_mul_struct_attn if c.seq_mul_struct_attn
+                 else self._ab_ag_nn if c.ab_ag_nn else self._ab_ag_interaction)
             return self.mlp(fn(batch, px0, tp0)).squeeze(-1)
         # The scale and the dropout mask are per WIDTH. They used to be taken once from
         # seq_ab_wt and applied to everything, which held only while the PCA made the
