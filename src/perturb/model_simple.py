@@ -578,6 +578,30 @@ class SiteTokenConfig:
     #: as it does under site_mean; without that the softmax would see every key masked and
     #: return NaN, which is the usual way this kind of mask fails.
     chem_query_site: bool = False
+    #: Rotary position encoding on the cross-attention, keyed on residue index.
+    #:
+    #: Every attention block here has so far been permutation invariant: the crop arrives
+    #: as an unordered bag of residues, so "the residue two along the chain" and "the
+    #: residue at the far end of the domain" are indistinguishable to it. Contact geometry
+    #: is largely local, and the mutated site's immediate neighbours are the residues whose
+    #: packing it disturbs, so sequence separation is information the block is currently
+    #: throwing away.
+    #:
+    #: Rotation is applied to the residue INDEX, not the crop slot -- see rotary(). It is
+    #: also skipped wherever the query has no position of its own (the chem/geometry token)
+    #: or lives in a different molecule from the keys (antibody attending to antigen, where
+    #: a difference of residue indices means nothing).
+    rope: bool = False
+    rope_base: float = 10000.0
+    #: How far apart to place consecutive chains along the rotary axis.
+    #:
+    #: The residue index restarts at 0 in every chain, so an antibody crop holds an H30 and
+    #: an L30 -- 94 slots apart in the crop -- that would otherwise be handed the SAME
+    #: phase, an encoding claiming zero separation between residues in different molecules.
+    #: Each chain is pushed a fixed distance along the axis: longer than any chain here, and
+    #: far short of the slowest component's ~47,000-residue wavelength, so cross-chain pairs
+    #: land at a large consistent separation rather than a false zero.
+    rope_chain_span: int = 1024
     #: Give each input its OWN first linear layer instead of one shared map.
     #:
     #: A shared projection forces the antibody, the antigen and ProteinMPNN into a single
@@ -627,13 +651,38 @@ class GroupedReduce(nn.Module):
                             x.view(b, l, self.n, self.group), self.w).reshape(b, l, -1)
 
 
+def rotary(x: torch.Tensor, pos: torch.Tensor, base: float) -> torch.Tensor:
+    """Rotate each head's channel pairs by an angle proportional to residue index.
+
+    ``x`` is (batch, heads, length, head_dim) and ``pos`` is (batch, length). The dot
+    product of a rotated query and a rotated key depends only on the DIFFERENCE of their
+    positions, which is the property worth having here: what should matter is how far
+    apart two residues are in the chain, not where the crop happened to start.
+
+    ``pos`` must be the true residue index, never the crop slot. The crop is a selection
+    -- interface, site neighbourhood, mutated +/-2 -- so consecutive slots are routinely
+    tens of residues apart, and rotating by slot would encode a spacing that does not
+    exist.
+    """
+    b, h, l, d = x.shape
+    half = d // 2
+    inv = base ** (-torch.arange(half, device=x.device, dtype=torch.float32) / half)
+    ang = pos.float().unsqueeze(-1) * inv                    # (b, l, half)
+    cos, sin = ang.cos().unsqueeze(1), ang.sin().unsqueeze(1)
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).to(x.dtype)
+
+
 class CrossAttn(nn.Module):
     """One cross-attention layer, pre-LN, residual. Queries from seq, keys/values from MPNN."""
 
     def __init__(self, w: int, n_heads: int, dropout: float,
-                 res_pre: float = 1.0, res_post: float = 1.0):
+                 res_pre: float = 1.0, res_post: float = 1.0,
+                 rope: bool = False, rope_base: float = 10000.0):
         super().__init__()
         assert w % n_heads == 0, f"width {w} must divide by {n_heads} heads"
+        self.rope, self.rope_base = rope, rope_base
+        assert not rope or (w // n_heads) % 2 == 0, "rope needs an even head dimension"
         self.h, self.hd = n_heads, w // n_heads
         self.ln_q = nn.LayerNorm(w, elementwise_affine=False)
         self.ln_kv = nn.LayerNorm(w, elementwise_affine=False)
@@ -641,12 +690,17 @@ class CrossAttn(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.res_pre, self.res_post = res_pre, res_post
 
-    def forward(self, q_in, kv_in, kv_mask):
+    def forward(self, q_in, kv_in, kv_mask, q_pos=None, kv_pos=None):
         b, lq, w = q_in.shape
         qh = self.q(self.ln_q(q_in)).view(b, lq, self.h, self.hd).transpose(1, 2)
         kv = self.ln_kv(kv_in)
         kh = self.k(kv).view(b, kv.shape[1], self.h, self.hd).transpose(1, 2)
         vh = self.v(kv).view(b, kv.shape[1], self.h, self.hd).transpose(1, 2)
+        # Both sides must carry a position or neither does: rotating only the keys leaves
+        # a query with no phase to be measured against, which is not a relative encoding.
+        if self.rope and q_pos is not None and kv_pos is not None:
+            qh = rotary(qh, q_pos, self.rope_base)
+            kh = rotary(kh, kv_pos, self.rope_base)
         logits = (qh @ kh.transpose(-2, -1)) / (self.hd ** 0.5)
         # -inf, never a small finite number: a padded key must carry no softmax mass, or
         # the answer depends on how wide the batch happened to be padded.
@@ -683,7 +737,8 @@ class PerturbSiteToken(nn.Module):
                           if c.pool_proj and c.use_site_pool else None)
         # ProteinMPNN's PCA output is 128-d like the sequence's, so `proj` maps both into
         # one space and no separate input layer is needed before the dot product.
-        self.attn = (CrossAttn(w, c.n_heads, c.dropout, c.res_pre, c.res_post)
+        self.attn = (CrossAttn(w, c.n_heads, c.dropout, c.res_pre, c.res_post,
+                               rope=c.rope, rope_base=c.rope_base)
                      if (c.cross_attn or c.ab_ag_attn or c.delta_xattn) else None)
         if c.film_struct:
             self.g_str, self.b_str = nn.Linear(w, w), nn.Linear(w, w)
@@ -735,7 +790,7 @@ class PerturbSiteToken(nn.Module):
                 self.post_attn = nn.Linear(w, w)              # the GELU layer of step 2
                 self.chem_tok = nn.Linear(c.chem_dim, w)      # columns -> one query token
                 self.attn2 = CrossAttn(w, c.n_heads, c.dropout,
-                                       c.res_pre, c.res_post)
+                                       c.res_pre, c.res_post)   # query has no position
         if c.concat_struct:
             # its own norm, for the same reason the other blocks have one: the edit is
             # a difference of two token vectors and is small, the structure pool is an
@@ -784,6 +839,12 @@ class PerturbSiteToken(nn.Module):
             stp = self.mpnn_proj(st) if self.mpnn_proj is not None else tok_proj(st, side)
             z = z + site_mean(stp, batch[f"{key}_{side}"])
         return z
+
+    def rope_pos(self, batch, side):
+        """Residue index, offset per chain so two chains cannot share a phase."""
+        r = batch[f"res_{side}"]
+        ch = batch.get(f"chain_{side}")
+        return r if ch is None else r + ch * self.cfg.rope_chain_span
 
     def forward(self, batch) -> torch.Tensor:
         c = self.cfg
@@ -867,9 +928,11 @@ class PerturbSiteToken(nn.Module):
             if c.attn_direction == "struct_to_seq":
                 # the structure asks; the sequence answers, and it is the answer that the
                 # mutation changes
-                x = self.attn(stp, seq, batch[f"mask_{side}"])
+                x = self.attn(stp, seq, batch[f"mask_{side}"],
+                              self.rope_pos(batch, side), self.rope_pos(batch, side))
             else:
-                x = self.attn(seq, stp, batch[f"mask_{side}"])
+                x = self.attn(seq, stp, batch[f"mask_{side}"],
+                              self.rope_pos(batch, side), self.rope_pos(batch, side))
             return site_mean(x, batch[f"site_{side}"])
 
         if c.delta_xattn:
@@ -898,7 +961,8 @@ class PerturbSiteToken(nn.Module):
                     ch_q = self.chem_tok(batch["chem"]).unsqueeze(1)      # (B, 1, w)
                     for k in which:
                         seq = tok_proj(px(batch[f"seq_{side}_{k}"]), side)
-                        a1 = self.attn(kv, seq, batch[f"mask_{side}"])    # struct asks
+                        a1 = self.attn(kv, seq, batch[f"mask_{side}"],
+                                       self.rope_pos(batch, side), self.rope_pos(batch, side))
                         a1 = torch.nn.functional.gelu(self.post_attn(a1))
                         km = batch[f"mask_{side}"].bool()
                         if c.chem_query_site:
@@ -924,9 +988,11 @@ class PerturbSiteToken(nn.Module):
                         # the mutated positions, which is legitimate because the query and
                         # the keys share one crop -- position j means the same residue in
                         # both.
-                        out = self.attn(kv, seq, batch[f"mask_{side}"])
+                        out = self.attn(kv, seq, batch[f"mask_{side}"],
+                                        self.rope_pos(batch, side), self.rope_pos(batch, side))
                     else:
-                        out = self.attn(seq, kv, batch[f"mask_{side}"])
+                        out = self.attn(seq, kv, batch[f"mask_{side}"],
+                                        self.rope_pos(batch, side), self.rope_pos(batch, side))
                     acc[k] = acc[k] + (out * site).sum(1)
                 n_sites = n_sites + site.sum(1)
             if not c.two_branch:
