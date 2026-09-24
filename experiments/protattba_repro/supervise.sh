@@ -28,10 +28,16 @@ cd "$HERE"
 
 say() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
-alive() {   # is the session still there?
-  printf 'print("ok")\n' > "$HERE/experiments/protattba_repro/_ping.py"
-  wsl -e bash -lc "cd '$WSLROOT' && timeout 150 colab exec -s $SESSION \
-    -f experiments/protattba_repro/_ping.py 2>&1" | grep -q '^ok'
+# "Alive" has to mean PROVISIONED, not merely responding. A fresh session answers exec
+# immediately while holding none of the caches, and a supervisor that accepted that would see
+# "alive but not training" forever, re-upload five code files every cycle, and never
+# bootstrap. The rows table is the cheapest thing that exists only after bring_up has run.
+alive() {
+  cat > "$HERE/experiments/protattba_repro/_ping.py" <<'PY'
+from pathlib import Path
+print("ok" if (Path("/content/perturb") / "perturb_rows.parquet").exists() else "bare")
+PY
+  wsl -e bash -lc "cd '$WSLROOT' && timeout 150 colab exec -s $SESSION     -f experiments/protattba_repro/_ping.py 2>&1" | grep -q '^ok'
 }
 
 training() {  # is anything actually on the GPU?
