@@ -34,10 +34,17 @@ from src import paths                 # noqa: E402
 
 MUT = re.compile(r"^([A-Z])([A-Za-z0-9])(-?\d+[A-Za-z]?)([A-Z])$")
 MODELS = {
-    "forest": ("reports", "E0a_rf_handcrafted_seed0"),
-    "gated":  ("oof", "l1_gated"),
-    "concat": ("oof", "cat128_reg2_l1"),
-    "nopca":  ("oof", "st64_nopca_grouped"),
+    # the forest is the model; the rest are the classification ladder, all five folds and
+    # two seeds each, trained with the ordinal head on EC2. They are seed-ensembled by
+    # `predictions`, which is why the numbers here are a little better than per-seed means.
+    "forest":    ("reports", "E0a_rf_handcrafted_seed0"),
+    "abag_xat":  ("oof", "ec2_cls_abag_xattn"),
+    "xattn":     ("oof", "ec2_cls_xattn"),
+    "film":      ("oof", "ec2_cls_film"),
+    "areapool":  ("oof", "ec2_cls_areapool"),
+    "sitepool":  ("oof", "ec2_cls_sitepool"),
+    "xattn_rev": ("oof", "ec2_cls_xattn_rev"),
+    "l1_gated":  ("oof", "l1_gated"),
 }
 MIN_ABS = 0.05          # ignore correlations smaller than this in the summary
 

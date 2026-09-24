@@ -489,6 +489,18 @@ class SiteTokenConfig:
     #: one arrangement in the family that lets a mutation's representation depend on what
     #: it is binding to. Uses the same CrossAttn block; set cross_attn as well.
     ab_ag_attn: bool = False
+    #: Give each input its OWN first linear layer instead of one shared map.
+    #:
+    #: A shared projection forces the antibody, the antigen and ProteinMPNN into a single
+    #: basis before anything is compared, which is a strong assumption to make for free:
+    #: an antibody variable domain, an antigen and an inverse-folding encoding are not the
+    #: same distribution, and the first layer is exactly where that should be learned
+    #: rather than imposed. Sharing it also means a gradient from one modality moves the
+    #: representation of the other.
+    #:
+    #: Structure additionally used to FALL BACK to the sequence projection whenever
+    #: mpnn_proj was unset, which is the same violation by another route.
+    split_proj: bool = True
     input_noise: float = 0.0
     feature_dropout: float = 0.0
 
@@ -569,7 +581,14 @@ class PerturbSiteToken(nn.Module):
             self.gr_str = GroupedReduce(c.in_str or c.pca_dim, c.group_reduce, c.group_out)
             seq_in = self.gr_seq.out_dim
         w = c.proj or seq_in
-        self.proj = nn.Linear(seq_in, c.proj, bias=False) if c.proj else None
+        if c.proj and c.split_proj:
+            # one per side: the antibody and the antigen get their own first layer
+            self.proj = None
+            self.proj_side = nn.ModuleDict(
+                {k: nn.Linear(seq_in, c.proj, bias=False) for k in ("ab", "ag")})
+        else:
+            self.proj = nn.Linear(seq_in, c.proj, bias=False) if c.proj else None
+            self.proj_side = None
         pw = c.pool_proj or w
         self.pool_proj = (nn.Linear(seq_in, c.pool_proj, bias=False)
                           if c.pool_proj and c.use_site_pool else None)
@@ -585,9 +604,11 @@ class PerturbSiteToken(nn.Module):
         # K and V must arrive at the attention's width, so this maps to w, not to a free
         # choice -- mpnn_proj is a flag for WHETHER it is separate, not for how wide.
         str_in = self.gr_str.out_dim if self.gr_str is not None else c.pca_dim
+        # Always separate when structure is read at all: falling back to the sequence
+        # projection is exactly the weight sharing this is meant to avoid.
+        uses_struct = c.cross_attn or c.film_struct or c.concat_struct
         self.mpnn_proj = (nn.Linear(str_in, w, bias=False)
-                          if (c.cross_attn or c.film_struct or c.concat_struct)
-                          and c.mpnn_proj else None)
+                          if uses_struct and (c.mpnn_proj or c.split_proj) else None)
 
         # Each block is normalised on its OWN, then concatenated. A single LayerNorm over
         # the concatenation would normalise across blocks that are not the same kind of
@@ -642,7 +663,7 @@ class PerturbSiteToken(nn.Module):
             st = px(batch[f"struct_{side}"])
             if self.gr_str is not None:
                 st = self.gr_str(st)
-            stp = self.mpnn_proj(st) if self.mpnn_proj is not None else tok_proj(st)
+            stp = self.mpnn_proj(st) if self.mpnn_proj is not None else tok_proj(st, side)
             z = z + site_mean(stp, batch[f"{key}_{side}"])
         return z
 
@@ -678,26 +699,28 @@ class PerturbSiteToken(nn.Module):
                 x = x * m
             return x
 
-        def tok_proj(x):
+        def tok_proj(x, side="ab"):
             if self.gr_seq is not None:
                 x = self.gr_seq(x)
+            if self.proj_side is not None:
+                return self.proj_side[side](x)
             return self.proj(x) if self.proj is not None else x
 
-        def pool_map(x):
+        def pool_map(x, side="ab"):
             # its own map when pool_proj is set, otherwise the same one the tokens use
             if self.pool_proj is not None:
                 return self.pool_proj(x)
-            return tok_proj(x)
+            return tok_proj(x, side)
 
         # Exactly one side carries the mutation, so the other contributes zeros and the
         # sum picks out the mutated token without needing to know which side it was on.
         def tokens(which: str, side: str):
-            seq = tok_proj(px(batch[f"seq_{side}_{which}"]))
+            seq = tok_proj(px(batch[f"seq_{side}_{which}"]), side)
             if c.film_struct:
                 st = px(batch[f"struct_{side}"])
                 if self.gr_str is not None:
                     st = self.gr_str(st)
-                stp = (self.mpnn_proj(st) if self.mpnn_proj is not None else tok_proj(st))
+                stp = (self.mpnn_proj(st) if self.mpnn_proj is not None else tok_proj(st, side))
                 if c.struct_area_pool:
                     # Modulate every sequence token by ONE summary of the binding area,
                     # broadcast over the crop. Without this the FiLM only ever sees the
@@ -713,7 +736,7 @@ class PerturbSiteToken(nn.Module):
                 # Both branches use the SAME `which`, so a mutation changes the query on the
                 # mutated side and the keys on the other -- which is the point.
                 other = "ag" if side == "ab" else "ab"
-                seq_o = tok_proj(px(batch[f"seq_{other}_{which}"]))
+                seq_o = tok_proj(px(batch[f"seq_{other}_{which}"]), other)
                 x = self.attn(seq, seq_o, batch[f"mask_{other}"])
                 return site_mean(x, batch[f"site_{side}"])
             if self.attn is None:
@@ -722,7 +745,7 @@ class PerturbSiteToken(nn.Module):
             if self.gr_str is not None:
                 st = self.gr_str(st)
             stp = (self.mpnn_proj(st) if self.mpnn_proj is not None
-                   else tok_proj(st))                  # wild-type structure, both branches
+                   else tok_proj(st, side))            # wild-type structure, both branches
             if c.attn_direction == "struct_to_seq":
                 # the structure asks; the sequence answers, and it is the answer that the
                 # mutation changes
@@ -748,7 +771,7 @@ class PerturbSiteToken(nn.Module):
         if c.use_site_pool:
             for i, s in enumerate(("ab", "ag")):
                 m = batch[f"mask_{s}"].unsqueeze(-1)
-                x = pool_map(px(batch[f"seq_{s}_wt"]))
+                x = pool_map(px(batch[f"seq_{s}_wt"]), s)
                 pooled = (x * m).sum(1) / m.sum(1).clamp(min=1.0)
                 parts.append(self.norm_pool[i](pooled))
         if c.concat_struct:
