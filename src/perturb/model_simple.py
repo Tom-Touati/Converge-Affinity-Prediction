@@ -514,6 +514,70 @@ class SiteTokenConfig:
     #: this only decides where it starts, and starting a block 3.7x too quiet means its
     #: gradient is small exactly when it most needs to learn.
     pool_alpha_init: float = -1.56
+    #: Two branches instead of one difference.
+    #:
+    #: delta_xattn makes `proj(mut) - proj(wt)` the query, which forces subtraction before
+    #: the structure is ever consulted. Here the wild-type and the mutant each get their own
+    #: pass -- same projection, same attention, same keys -- and a linear layer combines the
+    #: two pooled vectors. Subtraction is a special case of that map, so this is strictly
+    #: more general, and the network decides whether the difference is the right summary
+    #: rather than being told.
+    #:
+    #: The two branches SHARE their weights on purpose. They are the same modality, and a
+    #: siamese pair is what makes their outputs comparable; giving each its own projection
+    #: would let them drift into different spaces and make the combination meaningless.
+    #: This is a different question from keeping sequence and structure apart, which they
+    #: still are.
+    two_branch: bool = False
+    #: Drop the sequence entirely: no ESM, no attention, no edit. The head sees only the
+    #: ProteinMPNN pool at the mutated residues plus the chem and geometry columns.
+    #:
+    #: This is the reference every sequence-based number here should be read against. The
+    #: project has repeatedly found that 26 hand-computed columns beat 1280-dimensional
+    #: embeddings, and six probes across three protein language models failed to clear
+    #: zero -- but "the sequence arm adds little" has never been priced directly, with
+    #: everything else held fixed. This prices it.
+    drop_seq: bool = False
+    #: How the two branches are combined: "mix" is a learned Linear over their
+    #: concatenation, "sub" is the plain difference of the two pooled vectors.
+    #:
+    #: Three points on one axis, and they are not the same experiment. delta_xattn subtracts
+    #: BEFORE the structure is consulted, so the attention only ever sees an edit. "sub"
+    #: subtracts AFTER, so each branch reads the structure in its own context and only then
+    #: are they differenced. "mix" does neither and lets a linear layer decide -- subtraction
+    #: is [I, -I] and therefore reachable, so "sub" is the constrained version of "mix" and
+    #: the comparison prices what that freedom is worth.
+    branch_combine: str = "mix"
+    #: Two stacked attentions, with the chem/geometry columns as the QUERY of the second.
+    #:
+    #:   1. structure attends to sequence, per token
+    #:   2. one GELU layer over that
+    #:   3. a single token, projected from the chem and geometry columns, attends to the
+    #:      result -- so the question asked of the structure is "given THIS kind of edit,
+    #:      what here matters", and the answer is one vector
+    #:
+    #: The second attention also does the pooling: there is one query, so its output is
+    #: already one vector per row and no site_mean is needed. That is a real difference from
+    #: every other path here, where pooling is a fixed mean the network cannot shape.
+    #:
+    #: The columns stop being a block bolted onto the head and become the thing that decides
+    #: what to read. Whether that is better is the point of running it.
+    chem_query: bool = False
+    #: Restrict the chem/geometry query to the MUTATED residues instead of the whole crop.
+    #:
+    #: The first version of chem_query masked its attention with the crop mask, so the
+    #: query pooled over all ~85 cropped residues of which 1-5 are mutated. That scored
+    #: +0.168 per complex against the gated fusion's +0.344, and the reason was visible in
+    #: the predictions: within a complex they moved with sd 0.410 against the truth's 1.359,
+    #: the least of any model that could still see the sequence, and next door to the
+    #: no-sequence reference's 0.069. Attention over a crop is a pool, and a pool over 85
+    #: tokens cannot say much about the three that changed.
+    #:
+    #: Restricting the keys keeps the idea -- the columns decide what to read -- and puts it
+    #: back where site_mean was reading. A side with no mutated residue contributes nothing,
+    #: as it does under site_mean; without that the softmax would see every key masked and
+    #: return NaN, which is the usual way this kind of mask fails.
+    chem_query_site: bool = False
     #: Give each input its OWN first linear layer instead of one shared map.
     #:
     #: A shared projection forces the antibody, the antigen and ProteinMPNN into a single
@@ -656,15 +720,33 @@ class PerturbSiteToken(nn.Module):
         d = w * n_tok + (pw * 2 if c.use_site_pool else 0) + c.chem_dim
         if c.delta_xattn:
             d = w + c.chem_dim
+            if c.chem_query:
+                # the columns enter as the second attention's query, so they are
+                # NOT concatenated again -- doing both would feed them twice
+                d = w
             # softplus keeps the denominator positive: a learned scalar free to cross
             # zero would flip the sign of this whole block part-way through training
             self.pool_alpha = nn.Parameter(torch.full((1,), c.pool_alpha_init))
+            if c.two_branch and c.branch_combine == "mix":
+                # combines the wild-type and mutant pooled vectors; a subtraction is
+                # [I, -I] and therefore reachable, but not imposed
+                self.branch_mix = nn.Linear(w * 2, w, bias=False)
+            if c.chem_query:
+                self.post_attn = nn.Linear(w, w)              # the GELU layer of step 2
+                self.chem_tok = nn.Linear(c.chem_dim, w)      # columns -> one query token
+                self.attn2 = CrossAttn(w, c.n_heads, c.dropout,
+                                       c.res_pre, c.res_post)
         if c.concat_struct:
             # its own norm, for the same reason the other blocks have one: the edit is
             # a difference of two token vectors and is small, the structure pool is an
             # absolute vector and is not
             self.norm_str = nn.LayerNorm(w, elementwise_affine=False)
             d += w
+        if c.drop_seq:
+            # the last word on the width: every block above has already added its own
+            # contribution, and an earlier override was silently undone by concat_struct's
+            # `d += w`. Only the structure pool and the columns survive here.
+            d = (w if c.concat_struct else 0) + c.chem_dim
         if c.gated_fusion:
             # both modalities pooled, plus chem, all seen by the gate
             zs = w
@@ -795,26 +877,80 @@ class PerturbSiteToken(nn.Module):
             # batch stays rectangular, then restricted to the mutated positions after the
             # attention -- gathering variable-length queries per row would need ragged
             # tensors for no gain.
-            pooled, n_sites = 0, 0
+            # `which` is the list of branches: one pass over the difference, or two passes
+            # over the wild-type and the mutant separately, combined afterwards.
+            which = ("wt", "mt") if c.two_branch else ("delta",)
+            acc = {k: 0 for k in which}
+            n_sites = 0
             for side in ("ab", "ag"):
-                d_tok = (tok_proj(px(batch[f"seq_{side}_mt"]), side)
-                         - tok_proj(px(batch[f"seq_{side}_wt"]), side))
                 st = px(batch[f"struct_{side}"])
                 if self.gr_str is not None:
                     st = self.gr_str(st)
+                # one set of keys and values per side, shared by both branches, so the two
+                # passes differ only in what they ask
                 kv = self.mpnn_proj(st) if self.mpnn_proj is not None else tok_proj(st, side)
-                # keys and values are the ProteinMPNN tokens over the binding site: the crop
-                # mask, not the mutated positions
-                out = self.attn(d_tok, kv, batch[f"mask_{side}"])
                 site = batch[f"site_{side}"].unsqueeze(-1)
-                pooled = pooled + (out * site).sum(1)
+                if c.chem_query:
+                    # 1. structure attends to sequence, per token
+                    # 2. one GELU layer over the result
+                    # 3. a single token from the chem/geometry columns attends to THAT,
+                    #    which both asks the question and does the pooling
+                    ch_q = self.chem_tok(batch["chem"]).unsqueeze(1)      # (B, 1, w)
+                    for k in which:
+                        seq = tok_proj(px(batch[f"seq_{side}_{k}"]), side)
+                        a1 = self.attn(kv, seq, batch[f"mask_{side}"])    # struct asks
+                        a1 = torch.nn.functional.gelu(self.post_attn(a1))
+                        km = batch[f"mask_{side}"].bool()
+                        if c.chem_query_site:
+                            km = km & site.squeeze(-1).bool()
+                        # A row mutated only on the other side has no key left here. Feeding
+                        # an all-masked softmax returns NaN, so those rows attend over the
+                        # crop and their output is then zeroed: the side contributed nothing,
+                        # which is exactly what site_mean does with an empty site mask.
+                        has = km.any(-1, keepdim=True)
+                        a2 = self.attn2(ch_q, a1, km | ~has)              # columns ask
+                        acc[k] = acc[k] + a2.squeeze(1) * has
+                    continue
+                for k in which:
+                    if k == "delta":
+                        seq = (tok_proj(px(batch[f"seq_{side}_mt"]), side)
+                               - tok_proj(px(batch[f"seq_{side}_wt"]), side))
+                    else:
+                        seq = tok_proj(px(batch[f"seq_{side}_{k}"]), side)
+                    if c.attn_direction == "struct_to_seq":
+                        # the structure asks and the sequence answers. The two branches then
+                        # differ only in what is being ANSWERED with, since the query is the
+                        # same wild-type structure either way. Both directions are pooled at
+                        # the mutated positions, which is legitimate because the query and
+                        # the keys share one crop -- position j means the same residue in
+                        # both.
+                        out = self.attn(kv, seq, batch[f"mask_{side}"])
+                    else:
+                        out = self.attn(seq, kv, batch[f"mask_{side}"])
+                    acc[k] = acc[k] + (out * site).sum(1)
                 n_sites = n_sites + site.sum(1)
+            if not c.two_branch:
+                pooled = acc["delta"]
+            elif c.branch_combine == "sub":
+                # differenced after each branch has read the structure, so the subtraction
+                # happens in a space the attention has already shaped
+                pooled = acc["mt"] - acc["wt"]
+            else:
+                pooled = torch.cat([acc["wt"], acc["mt"]], dim=-1)
             # sum over the mutated positions, divided by their count and by a learned
             # positive scalar. The count makes a 6-point row comparable to a 1-point row;
             # alpha sets how loudly this speaks next to the chem columns.
-            z = pooled / (n_sites.clamp(min=1.0)
-                          * torch.nn.functional.softplus(self.pool_alpha))
-            if c.chem_dim:
+            if c.chem_query:
+                # the second attention emitted exactly one vector per row, so there is
+                # nothing to average over -- dividing by a site count here would only
+                # rescale by how many residues the mutation happened to touch
+                z = pooled / torch.nn.functional.softplus(self.pool_alpha)
+            else:
+                z = pooled / (n_sites.clamp(min=1.0)
+                              * torch.nn.functional.softplus(self.pool_alpha))
+            if c.two_branch and c.branch_combine == "mix":
+                z = self.branch_mix(z)
+            if c.chem_dim and not c.chem_query:
                 z = torch.cat([z, batch["chem"]], dim=-1)
             return self.mlp(z).squeeze(-1)
 
@@ -829,8 +965,11 @@ class PerturbSiteToken(nn.Module):
             z = torch.cat([g[:, :zs] * z_seq, g[:, zs:] * z_str, ch], dim=-1)
             return self.mlp(z).squeeze(-1)
 
-        raw = [tok_mt - tok_wt] if c.subtract else [tok_wt, tok_mt]
-        parts = [n(x) for n, x in zip(self.norm_tok, raw)]
+        if c.drop_seq:
+            parts = []          # no ESM, no edit -- the reference case
+        else:
+            raw = [tok_mt - tok_wt] if c.subtract else [tok_wt, tok_mt]
+            parts = [n(x) for n, x in zip(self.norm_tok, raw)]
 
         if c.use_site_pool:
             for i, s in enumerate(("ab", "ag")):
