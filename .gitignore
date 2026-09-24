@@ -63,3 +63,7 @@ reports_colab/
 data/features/mpnn_per_residue/
 runs/tb/
 .perturb_local/
+
+# supervisor liveness probes, rewritten every cycle
+experiments/protattba_repro/_ping.py
+experiments/protattba_repro/_ping_train.py
