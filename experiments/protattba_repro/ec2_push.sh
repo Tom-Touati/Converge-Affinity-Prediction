@@ -79,6 +79,14 @@ else
   [ "$got" = "$WANT" ] && say "  size verified: $got bytes"                        || say "  SIZE MISMATCH want=$WANT got=${got:-none}"
 fi
 
+# Git on Windows checks these out with CRLF, and scp copies the bytes verbatim. Linux bash
+# then reports "set: pipefail: invalid option name" and python fails on the trailing  --
+# both of which look like anything except a line-ending problem. Strip them at the far end
+# rather than relying on a .gitattributes nobody will remember.
+say "normalising line endings"
+$SSH ubuntu@"$IP" 'cd /home/ubuntu/perturb && for f in *.py *.sh; do
+    [ -f "$f" ] && sed -i "s/$//" "$f"; done' 2>/dev/null   && say "  ok" || say "  FAILED"
+
 say "verifying"
 $SSH ubuntu@"$IP" 'cd /home/ubuntu/perturb && du -sh . && ls | tr "\n" " "' 2>/dev/null
 say "PUSH DONE"
