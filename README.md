@@ -232,7 +232,14 @@ fold landed. Both are recorded in [AI_PROMPTS.md](AI_PROMPTS.md) rather than qui
    cannot contradict each other. Two extra parameters.
 5. **Three seeds minimum for any future claim**, and report the spread. Half the comparisons
    in the published ΔΔG literature would not survive this.
-6. **More data before more architecture.** Everything above says the constraint is 752 rows,
+6. **Blend the forest with a network.** They agree only 0.42–0.54 on which rows are hard, and
+   a fixed 25 % blend lifts per-complex r from +0.397 to +0.418–0.424 across two different
+   networks. The weight was not tuned on held-out data, so validate it properly — but this is
+   better evidenced than any architecture change in the fusion ladder.
+7. **Correct the shrinkage.** Signed error correlates with true ΔΔG at ρ ≈ −0.8 for every
+   model, and with deviation from the complex's own mean at ρ ≈ −0.58. A monotone
+   recalibration fitted on validation folds addresses information that is present and unused.
+8. **More data before more architecture.** Everything above says the constraint is 752 rows,
    not the model. AB645/AB1101 rows are built and cached (`src/perturb/extra_rows.py`) with
    homology-model leakage removed; they have never been trained on.
 

@@ -542,3 +542,95 @@ rows), and a feature set built per-residue has no way to represent epistasis.
    as good.
 5. **Valine and multi-point rows are the two concrete targets** for the next modelling
    iteration, ahead of any architecture change.
+
+## 19. Which descriptors predict the error — systematically
+
+§14–§17 found failures by hand. This is the same question asked of every available descriptor
+against every model at once, so that a defect belonging to the *task* can be told from one
+belonging to an architecture. Spearman throughout; regenerate with
+`python scripts/error_drivers.py`.
+
+### Signed error — where the models are biased
+
+Correlation between a descriptor and `y_pred − y_true`. Negative means the model
+under-predicts as the descriptor grows.
+
+| descriptor | forest | gated | concat | nopca |
+| --- | --- | --- | --- | --- |
+| **true ΔΔG** | **−0.792** | **−0.775** | **−0.842** | **−0.705** |
+| **deviation from the complex's own mean** | −0.592 | −0.576 | −0.599 | −0.573 |
+| \|ΔΔG\| | −0.477 | −0.521 | −0.560 | −0.508 |
+| the complex's mean ΔΔG | −0.459 | −0.487 | −0.547 | −0.416 |
+| **rows the complex has** | −0.329 | −0.314 | −0.366 | −0.310 |
+| interface contacts | −0.116 | −0.323 | −0.349 | −0.292 |
+| the complex's label spread | −0.116 | −0.307 | −0.289 | −0.165 |
+| substitutions to alanine | +0.070 | +0.210 | +0.180 | +0.224 |
+
+Three things, and they are the same for every architecture:
+
+**Regression to the mean is the dominant error structure, at ρ ≈ −0.8.** Not a tendency — the
+single largest relationship in the data. Every model shrinks toward the training mean, and
+that one fact explains §14's class bias, §16's valine under-prediction and the compressed
+output range together.
+
+**It persists *within* a complex** (ρ ≈ −0.58 against deviation from the complex mean). That
+is the quantity per-complex correlation is built from, so the shrinkage is not just a
+between-complex offset a per-complex metric would cancel — it is eating the signal the metric
+measures.
+
+**Rows in larger complexes are systematically under-predicted** (ρ ≈ −0.33, all four models).
+This is a representation bias in the plain sense: how often a complex appears in training
+changes the direction of the error on it, not merely its size.
+
+Alanine substitutions are *over*-predicted (+0.18 to +0.22 on the networks) — the opposite
+sign to everything else, consistent with §16's finding that X→A is the over-represented type.
+
+### Absolute error — where the models are imprecise
+
+| descriptor | forest | gated | concat | nopca |
+| --- | --- | --- | --- | --- |
+| \|ΔΔG\| | 0.535 | 0.489 | 0.586 | 0.446 |
+| deviation from the complex mean | 0.188 | 0.326 | 0.315 | 0.327 |
+| interface contacts | 0.354 | 0.209 | 0.317 | 0.230 |
+| ΔrSASA on mutation | 0.360 | 0.173 | 0.283 | 0.187 |
+| distance to the partner chain | −0.272 | −0.230 | −0.301 | −0.195 |
+| BLOSUM of the substitution | −0.274 | −0.209 | −0.200 | −0.174 |
+| number of mutations | 0.349 | 0.116 | 0.189 | 0.124 |
+
+Large effects, buried and highly-contacting sites, and radical substitutions (low BLOSUM) are
+harder for everything. The forest is markedly more sensitive to the geometric descriptors and
+to multi-point rows than the networks are, which is what one would expect from a model whose
+features *are* the geometry.
+
+### The models do not fail on the same rows
+
+Spearman between per-row \|error\|:
+
+```
+         forest  gated  concat  nopca
+forest    1.000  0.464   0.542  0.422
+gated     0.464  1.000   0.866  0.611
+concat    0.542  0.866   1.000  0.630
+nopca     0.422  0.611   0.630  1.000
+```
+
+The two networks in the same family agree at 0.866 — near-duplicates, which is why the fusion
+ladder in Part II went nowhere. But **the forest agrees with the networks only 0.42–0.54**, so
+they are carrying partly independent information.
+
+Testing that directly, z-scoring each model within complex and blending:
+
+| | per-complex r |
+| --- | --- |
+| forest alone | +0.397 |
+| `l1_gated` alone | +0.300 |
+| `st64_nopca_grouped` alone | +0.274 |
+| forest + `l1_gated`, 25 % net | **+0.418** |
+| forest + `st64_nopca_grouped`, 25 % net | **+0.424** |
+| forest + `st64_nopca_grouped`, 50 % net | +0.414 |
+
+**Four of four blends beat the forest**, by up to +0.027. Read that as a demonstration that
+complementary signal exists rather than as a validated model: the blend weight was not chosen
+on held-out data, and +0.027 sits just inside the forest's own 0.032 seed spread. The
+robustness across two different networks and two weights is what makes it worth pursuing —
+and it is a cheaper, better-evidenced next step than any architecture in Part II.
