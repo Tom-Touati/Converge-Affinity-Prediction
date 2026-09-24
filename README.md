@@ -17,6 +17,7 @@ the work.
 | --- | --- |
 | **The model, specified in full** | [docs/MODEL.md](docs/MODEL.md) |
 | **Why each choice was made** | [docs/JUSTIFICATIONS.md](docs/JUSTIFICATIONS.md) |
+| **What I would do next, and why** | [docs/FUTURE_WORK.md](docs/FUTURE_WORK.md) |
 | **Every architecture tried (45 runs)** | [docs/ARCHITECTURES.md](docs/ARCHITECTURES.md) |
 | **Error analysis** | [ERROR_ANALYSIS.md](ERROR_ANALYSIS.md) |
 | **AI prompt history** | [AI_PROMPTS.md](AI_PROMPTS.md) |
@@ -365,8 +366,17 @@ fold landed. Both are recorded in [AI_PROMPTS.md](AI_PROMPTS.md).
    measurements disagree by ~1.1 kcal/mol. A CORAL head is implemented (`ordinal=2`) and
    verified; it never completed a run.
 6. **Three seeds minimum for any future claim**, and report the spread.
-7. **More data before more architecture.** 261 AB645/AB1101 rows are built, cached and
+7. **More data — but new *structure space*, not new measurements.** How often a complex
+   appears barely predicts performance (Spearman +0.04 / +0.09); how structurally close it is
+   to training does (+0.17 / +0.37). 261 AB645/AB1101 rows are built, cached and
    leakage-filtered, and have never been trained on.
+
+**Beyond these, the principled answer to a 752-row constraint is to stop spending labels on
+representation learning.** [docs/FUTURE_WORK.md](docs/FUTURE_WORK.md) develops two pretraining
+routes on *unlabelled* structure — CLIP-style contrastive alignment of the two encoders, and
+bidirectional cross-modality prediction whose *residual* isolates what structure adds beyond
+sequence. Both attack the measured defect that our two encoders occupy unrelated spaces joined
+only by a pair of `Linear(128 → 64)` maps trained on 752 labels.
 
 ## 7. Setup and running
 
