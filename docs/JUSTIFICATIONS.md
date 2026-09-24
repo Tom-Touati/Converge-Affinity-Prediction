@@ -17,11 +17,24 @@ with no evidence behind them, which are marked as such.
 **Chosen.** Regression on clipped ΔΔG as the primary target, with a CORAL ordinal head
 implemented as an alternative.
 
-**Why.** The argument for binning is real and is recorded in `thoughts.md`: classification
-*neutralises measurement error*, because a label that is only accurate to ~1 kcal/mol does not
-support a squared loss that tries to reproduce it exactly. Our own data agrees — within-complex
-label sd has a median of **1.104 kcal/mol**, and SKEMPI's repeated `(complex, mutation)` pairs
-(123 groups, 258 rows) disagree at a scale that caps any achievable correlation.
+**Why binning was considered.** `thoughts.md` argues that classification *neutralises
+measurement error*. The mechanism is really that a binned loss becomes insensitive to noise
+*inside* a bin rather than removing noise — but the instinct is sound wherever labels are
+imprecise.
+
+**A correction, because this argument is weaker than it was stated to be.** An earlier version
+of this section cited a within-complex label sd of 1.104 kcal/mol as evidence that labels are
+"only accurate to ~1 kcal/mol". That was a conflation: 1.104 is the spread of *different*
+mutations within a complex, which is the signal. Measured properly from SKEMPI's 107 repeated
+`(complex, mutation)` pairs, the measurement sd is **0.240 kcal/mol** and the implied ceiling
+on per-complex Pearson is **0.979** (ERROR_ANALYSIS §23). The labels are far more reproducible
+than claimed, so "MSE chases noise" is not a strong argument here.
+
+**What still justifies the ordinal head** is a different argument: the thresholding behaviour
+in ERROR_ANALYSIS §14. The model compresses into half the label's range, predicts the average
+stabilising mutation as destabilising, and scores r = 0.007 within the stabilising class. An
+objective defined by which side of −0.5 and +0.5 a mutation falls on targets that failure
+directly. That is about class structure, not measurement error.
 
 Regression stayed primary for one reason: **the evaluation is a ranking**. Per-complex
 correlation and concordance need a continuous score, and binning to three classes discards the
@@ -463,10 +476,10 @@ blending the forest with a network beats both.
 
 ## C8. What `thoughts.md` asked for that is still open
 
-- **Test-retest error as an explicit ceiling.** The ingredients exist (123 repeated
-  `(complex, mutation)` groups, 258 rows; within-complex label sd median 1.104) but the
-  implied ceiling on achievable correlation is not computed and reported as a line on every
-  chart. It should be.
+- **Test-retest error as an explicit ceiling — done.** `scripts/noise_ceiling.py`,
+  ERROR_ANALYSIS §23. Measurement sd 0.240 kcal/mol from 107 repeated groups; ceiling 0.979 on
+  per-complex Pearson against our 0.381. It corrected a claim this project had been making:
+  label noise is *not* the binding constraint.
 - **Difficulty scored by similarity to training points.** Per-complex size and label spread are
   analysed; nearest-neighbour distance in feature space to the training fold is not.
 - **Train vs validation vs test loss curves.** Logged per epoch into `history.csv` and mirrored

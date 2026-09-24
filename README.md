@@ -319,8 +319,14 @@ fold landed. Both are recorded in [AI_PROMPTS.md](AI_PROMPTS.md).
 5. **There is no mutant structure.** ProteinMPNN sees the wild-type backbone only, so the
    structure term is identical for every mutation of a complex. The sharpest structural
    limitation of the design.
-6. **Label noise caps the achievable correlation** — within-complex label sd has a median of
-   1.104 kcal/mol.
+6. **Label noise is NOT the binding constraint — measured, and this corrects an earlier claim
+   in this repository.** SKEMPI measures 107 (complex, mutation) pairs more than once; pooled
+   within-group sd is **0.240 kcal/mol**, and 43 of those groups span different publications at
+   sd 0.227, so the estimate reflects genuine independent replication. Against a within-complex
+   signal sd of 1.178 that implies a ceiling of **0.979** on per-complex Pearson. We reach
+   0.381 — **39 % of what is achievable**. Earlier text cited a within-complex label sd of
+   1.104 as the noise floor; that figure is the spread of *different* mutations, which is
+   signal, not noise. See [ERROR_ANALYSIS §23](ERROR_ANALYSIS.md).
 7. **Three complexes hold 24 % of the rows**, so any pooled statistic is partly about them.
 8. **Only 8 of 45 configurations have three complete seeds.** The rest are single-seed and
    their individual numbers are not interpretable at the resolution the tables print them.

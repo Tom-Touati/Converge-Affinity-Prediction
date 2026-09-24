@@ -379,9 +379,11 @@ The ceiling is the model and the task, not the pipeline.
    seed spread in §9 is what that looks like from the inside. No regularisation setting
    removed it: raising dropout 75%, noise 150% and weight decay tenfold cost 0.037–0.043 on
    two different architectures and reduced variance on neither.
-2. **Label noise.** Within-complex label standard deviation has a median of 1.104 kcal/mol,
-   and repeated (complex, mutation) measurements in SKEMPI disagree at a scale that caps any
-   achievable correlation.
+2. **~~Label noise.~~ Measured, and it is NOT a limit — see §23.** Repeated (complex,
+   mutation) measurements disagree at sd **0.240 kcal/mol**, implying a ceiling of **0.979** on
+   per-complex Pearson. We reach 0.381. This item previously cited a within-complex label sd of
+   1.104 as the noise floor; that is the spread of *different* mutations, which is signal. The
+   assay is not what is holding this back.
 3. **Between-complex variance swamping within-complex signal**, which is §8 — it makes the
    obvious metric the wrong one and rewards the wrong features.
 4. **Representation, last.** Six probes, three protein language models, two structure
@@ -496,10 +498,12 @@ it has.** The five worst complexes are mostly low-spread ones:
 | 2B2X_HL_A | 70 | −0.179 | 1.038 |
 | 1MLC_AB_E | 24 | −0.164 | 1.062 |
 
-A complex whose mutations all land within ~0.4 kcal/mol of each other is being asked to be
-ranked at a resolution finer than the assay's own reproducibility (within-complex label sd
-has a median of 1.104). A negative correlation there is close to meaningless, yet it enters
-the mean with equal weight — and 2B2X, at 70 rows, is not a small-sample artifact.
+A complex whose mutations all land within ~0.4 kcal/mol of each other is being ranked at a
+resolution close to the assay's reproducibility. With measurement sd **0.240** (§23), a complex
+whose labels span 0.416 has reliability ≈ 0.67 and a ceiling near **0.82** — so those complexes
+are *harder*, not impossible, and a correlation of −0.433 is a real failure rather than an
+artifact of the measurement. They nonetheless enter the mean with the same weight as an 87-row
+complex spanning 2 kcal/mol, and 2B2X at 70 rows is not a small-sample case.
 
 **Implication for the metric.** An unweighted mean over per-complex correlations treats a
 7-row complex with 0.78 spread the same as an 87-row one. Weighting by rows, or excluding
@@ -804,3 +808,64 @@ number that matters — and it is 0.224 for the baseline and 0.084 for the netwo
 The by-complex split is still reported because it is the field's de facto protocol
 (RDE-Network, DiffAffinity) and dropping it would make this work incomparable to published
 results. It is reported *alongside*, never instead.
+
+## 23. The label-noise ceiling — and a correction to what this project claimed
+
+Several documents here asserted that label noise caps the achievable correlation, citing a
+**within-complex label sd of 1.104 kcal/mol**. That was a conflation, and this section
+corrects it.
+
+1.104 is the spread of *different mutations* within a complex. That is the **signal** a
+per-complex correlation is asked to rank — not noise. The noise is how far apart two
+measurements of *the same* mutation land, and SKEMPI lets us measure it directly.
+
+### Measuring it
+
+107 (complex, mutation) pairs are measured more than once — 226 measurements in total, the
+largest group four times. Pooled within-group variance:
+
+```
+measurement variance   0.0575        ->  sd 0.240 kcal/mol
+median |difference| between a repeated pair          0.206
+```
+
+**These are genuinely independent replicates**, not the same experiment listed twice: 43 of
+the 107 groups span *different publications*, and those give sd **0.227** — essentially
+identical to the 0.247 of same-publication repeats, and 42 groups span more than one
+temperature. Cross-laboratory agreement is, if anything, slightly tighter.
+
+### The ceiling that implies
+
+With `observed = signal + noise`, reliability is `var(signal)/var(observed)` and the maximum
+attainable correlation for a perfect predictor is `sqrt(reliability)`.
+
+| metric | label variance | reliability | **ceiling** | our best | % of ceiling |
+| --- | --- | --- | --- | --- | --- |
+| pooled Pearson | 2.388 | 0.976 | **0.988** | +0.509 | 52 % |
+| per-complex Pearson | 1.387 | 0.959 | **0.979** | +0.381 | 39 % |
+
+### What this changes
+
+**Label noise is not the binding constraint, and this project should stop saying it is.** At
+sd 0.240 against a within-complex signal sd of 1.178, the labels are reproducible enough to
+support a correlation near 0.98. We reach 0.381. **Roughly 60 % of the available signal is
+unclaimed**, and it is not being withheld by the assay.
+
+This *strengthens* the project's central argument rather than weakening it. The constraint is
+data volume — 752 training rows per fold, 32 scorable complexes, and a seed spread up to 0.117
+— together with the homology structure in §20–§22. Those are addressable; measurement noise
+would not have been.
+
+It also **weakens one argument made in `docs/JUSTIFICATIONS.md` §A1**: the case for an ordinal
+head partly rested on the labels being "only accurate to ~1 kcal/mol", so that a squared loss
+chases noise. At 0.240 that argument is much weaker than stated. The ordinal head's remaining
+justification is about the class imbalance and the thresholding behaviour in §14, not about
+measurement error, and A1 has been corrected to say so.
+
+**Caveats, all of which push the true ceiling down rather than up.** Repeats are not a random
+sample — a mutation gets re-measured when it is contested, which should if anything inflate
+their disagreement. Only 107 of 940 rows carry a repeat, so the noise estimate comes from 11 %
+of the data and is assumed homogeneous. And the bound assumes additive independent noise and a
+perfect predictor: it is an upper limit on what *any* model could reach, not a target.
+
+Regenerate with `python scripts/noise_ceiling.py`.
