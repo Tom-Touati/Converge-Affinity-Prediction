@@ -37,7 +37,9 @@ MIN_ROWS = 5
 #: label, and where the per-seed predictions come from
 FOREST = {"E0a_rf_handcrafted (chem+geom+MPNN)": "results/predictions/E0a_rf_handcrafted_seed{}.csv"}
 NETS = ["l1_gated", "cat128_reg2_l1", "gf_reg2", "st64_nopca_grouped", "area_concat",
-        "st64_noattn", "st64_xattn_rev_nopca", "st64_film_struct"]
+        "st64_noattn", "st64_xattn_rev_nopca", "st64_film_struct",
+        "struct_film_chem", "struct_film_site", "mut_pair_ffn_sub",
+        "gated_cg_clusterscale", "gated_cg_feats", "delta_xattn2"]
 
 
 def load_truth():

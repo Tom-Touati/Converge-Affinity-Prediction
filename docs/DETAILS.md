@@ -475,3 +475,48 @@ Open defects, quantified, with the fix each one needs. Detail and decisions in
    additivity on the double-mutant cycles, and ten hand-inspected worst residuals.
 4. The learning curve, early — the literature's verdict is that data volume, not architecture, is
    the binding constraint at this sample size.
+
+## struct_film_chem
+
+The best neural network in the project as of this update (+0.369 per-complex Pearson,
+3-seed ensemble; +0.314 mean per seed, spread 0.092). Found via a sweep of 11 ways to
+inject structure into a sequence-only backbone that had already reached +0.262 alone.
+
+**Sequence term** (unchanged from the sequence-only backbone, `mut_pair_ffn` with
+`mut_pair_op="sub"`). Per side (antibody, antigen), at every residue in the crop:
+project with that side's OWN first linear layer (no weights shared between ab/ag/
+structure), GELU, LayerNorm the mutant and wild-type projections separately, subtract
+(`LN(mt) − LN(wt)`), one shared linear layer (shared because it operates on an
+already-fused difference, not a raw single-modality input), GELU, then **sum over the
+mutated residues only**. Summed across both sides into one 64-d vector, `z_seq`.
+
+**Structure term (FiLM).** Per side: project the wild-type ProteinMPNN embedding with
+its own linear layer, GELU, LayerNorm, then mean-pool at the **mutated** residues
+(tight site pool, not the whole crop). Summed across sides into one 64-d vector,
+`z_st`. `z_st` is fed through one `Linear(64 → 128)`, split into two 64-d halves
+`gamma, beta`, and modulates the sequence term:
+
+```
+z = (1 + gamma) * z_seq + beta
+```
+
+This is the one mechanism, out of eleven tried (plain concatenation at two pooling
+granularities, a learned gate, four flavours of cross-attention — including the
+ag-residue's nearest ab neighbour by wild-type Cα distance, RoPE'd on both sides — and
+raw scalar concatenation of geometry or zero-shot ProteinMPNN scores) that beat every
+attention variant and every plain concatenation. Attention was consistently the worst
+mechanism in the sweep, matching the pattern found everywhere else in this project.
+
+**Fusion with the tabular block.** The full 39-column chem+geometry+ESM+ProteinMPNN
+zero-shot block is concatenated onto the FiLM output (not gated) before the head.
+Without it (`struct_film_site`, structure-FiLM alone, no chem) the ensemble is +0.340 —
+still second-best net in the project, ahead of `gated_cg_feats` on ensemble and tied
+on the seed mean. The 39 columns add +0.029 on top.
+
+**Head.** `Linear(103 → 128) → GELU → Dropout(0.35) → Linear(128 → 1)`. 50,497
+parameters total. No attention, no RoPE, no cross-molecule pairing.
+
+**What has not yet been done for this model**, honestly listed rather than implied:
+the homology-cluster-split retention number (§ the earlier section on the cluster
+split), and the full bias/error-analysis battery in `ERROR_ANALYSIS.md` — both still
+describe `cat128_reg2_l1`, the previously-best net.

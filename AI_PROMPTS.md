@@ -359,3 +359,101 @@ differences the ladder had been reading were larger than the noise.
   suspect" on data that is clean. Fixed to judge on top-k.
 - Killed the collector during a cleanup and launched four configurations with nothing
   collecting them; all four were lost to a reclaim.
+
+## Session, 2026-09-24/25 — EC2 fleet, structural-injection sweep, and a new best net
+
+### What was asked for
+
+Migrate training off Colab onto two persistent EC2 g4dn.xlarge boxes, then iteratively
+design and run fusion architectures at the user's direction: reversed-attention variants,
+a chem/geometry query token, rotary position encoding, a nearest-neighbour ab-ag
+structural pairing, several reference checks with no structure at all (to establish a
+floor), and finally a systematic sweep of ways to inject structure into whichever
+sequence-only design won. Ended with "get everything ready for submission on main
+branch": update the docs to name the new best model and merge.
+
+### What it produced
+
+- Migration off Colab (session caps made hour-long runs impossible) onto two EC2 boxes,
+  with push/collect/reconcile tooling for a live fleet instead of a Colab collector.
+- A corrected reverse-mutation augmentation: the chem/geometry block was not being
+  flipped when the label was, so the strongest single correlate in it (ProteinMPNN's
+  llr_delta) was shown one value against both signs of the target.
+- Rotary position encoding on the cross-attention, retuned from the language-model
+  default (base 10000) to base 200 after measuring that 7 of 16 frequency channels were
+  turning less than half a radian across this dataset's actual residue separations —
+  present in the model and three-quarters idle.
+- A structure-free, chem-free reference family (`ab_ag_interaction`, `ab_ag_nn`,
+  `seq_mul_struct_attn`, `mut_pair_ffn`) that established the floor: naive ab-ag
+  interaction checks land at -0.09 to +0.07 per complex, confirming the fusion
+  mechanisms elsewhere in the project are doing real work.
+- The multiplication-vs-subtraction finding, confirmed independently six times: every
+  architecture with a `mul`-flavoured combine somewhere in its pipeline landed near zero
+  with 6-7x the seed spread of the `sub`-based version of the SAME architecture. Traced
+  to two mechanisms, not just intuition: elementwise product conflates "both channels
+  silent" with "one channel active, one silent" (same near-zero output, opposite
+  meaning), and its gradient in each direction is the OTHER side's value, so a near-zero
+  channel on one side kills the gradient reaching the other.
+- `mut_pair_ffn_sub` — LayerNorm, subtract mutant from wild-type at the mutated residue,
+  one linear layer, sum, MLP, sequence only — reached +0.262 per-complex ensemble with
+  no structural input at all, third in the project at the time.
+- An 11-way sweep of how to inject structure into that backbone (concat at two pooling
+  granularities, FiLM, a learned gate, four cross-attention variants including a
+  wild-type nearest-neighbour ab-ag pairing, and raw scalar concatenation of geometry or
+  ProteinMPNN zero-shot scores). FiLM won outright: `struct_film_chem` (FiLM structure
+  gate + the full chem/geometry block concatenated on top) reached +0.369 ensemble,
+  becoming the new best neural network in the project, ahead of every gated-fusion and
+  every attention variant tried anywhere in the project's history.
+- A 20-item and then a 200-item queue runner (bash, polling two EC2 boxes with a
+  concurrency cap) to sweep seed counts, regularisation, and untested combinations of
+  already-separately-proven pieces without hand-launching each one.
+
+### Findings worth keeping
+
+- Attention lost to gating and plain concatenation in every head-to-head test run this
+  session, on every backbone tried. The project's best network has no attention in it.
+- The random forest (49 handcrafted columns) still wins overall at +0.381 -- unchanged
+  by anything this session found. `struct_film_chem` is the best NETWORK, not the best
+  model; the README's existing framing (forest for ranking accuracy, a network if
+  stabilising-mutation recall matters more) is unchanged in kind, only the recommended
+  network changed.
+- Nearest-neighbour ab-ag structural pairing (by wild-type Cα distance) is a real,
+  cheap mechanism but a blunt one -- it underperformed FiLM and plain concatenation
+  every time it was tried, including with RoPE and with a symmetric (both-directions)
+  construction.
+
+### Assistant errors and corrections during the session
+
+- **Quoted `twobranch_cg_rev`'s in-training print as "the best fold-1 results in the
+  project."** Those were pooled validation Pearson from a training log, not per-complex;
+  complete at 15/15 the model finished 8th of 10 two-branch variants tried, and fold 1
+  was its worst fold. The same pattern repeated with `seq_mul_struct_attn` (+0.109 on a
+  2-fold partial read, +0.109 became -0.009 complete) -- partial reads from this
+  project's own training logs have now been wrong in the promising direction twice.
+- **Claimed a `res_pre=0.1` change (forcing more raw gradient into an attention block)
+  would help, based on a gradient-norm diagnostic alone.** It made both architectures it
+  was tried on worse, not better -- confirms gradient magnitude under AdamW is a weaker
+  predictor of usefulness than the diagnostic implied, and the correction is on record
+  as a retraction rather than reasoned around after the fact.
+- **A rank-mismatch bug in `nn_diff_concat`'s symmetric construction** (`dist.argmin
+  (dim=2, keepdim=True)` is already the right shape; an extra `.unsqueeze(-1)` would
+  have broken `.expand()`) was caught by inspection before the verification pass ran,
+  not by the verification itself -- recorded because the verification's silence was not
+  proof of correctness there.
+- **The ordinal head was never built on any of the constructor's four early-return
+  branches** (`ab_ag_interaction`/`ab_ag_nn`, `seq_mul_struct_attn`, `mut_pair_ffn`), so
+  `ordinal=3` combined with any of them crashed at the first training step, not at
+  construction. Duplicated the two-line fix into each branch rather than restructuring
+  control flow this late in the file.
+- **In a 20-item launch queue, two configuration bugs were caught by dry-running every
+  generated command before launch rather than trusting the template**: one item's
+  `chem_dim` override was silently shadowed by an earlier default in the same JSON
+  object (fixed after confirming `json.loads` keeps the LAST of a duplicate key, not
+  assumed); another had no `CHEM_TABLE` set while its model config hard-coded a 39-column
+  width, which would have been a silent dimension mismatch against the 33-column default
+  table.
+- **Named two queue items "cluster_split" that did not run on a cluster split.** The
+  trainer has no fold-partition mechanism keyed on homology cluster, only a chem-
+  *scaling* option of the same name; both items silently ran the standard 5-fold
+  complex split. Caught before reporting the numbers as evidence of anything, and
+  retracted rather than left ambiguous.
