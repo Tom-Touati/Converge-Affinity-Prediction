@@ -669,6 +669,14 @@ class PerturbSiteToken(nn.Module):
                 if self.gr_str is not None:
                     st = self.gr_str(st)
                 stp = (self.mpnn_proj(st) if self.mpnn_proj is not None else tok_proj(st))
+                if c.struct_area_pool:
+                    # Modulate every sequence token by ONE summary of the binding area,
+                    # broadcast over the crop. Without this the FiLM only ever sees the
+                    # structure at the mutated residue -- everything else is discarded by
+                    # the site_mean below, so the area flag reached this branch and did
+                    # nothing at all.
+                    m = batch[f"mask_{side}"].unsqueeze(-1)
+                    stp = ((stp * m).sum(1) / m.sum(1).clamp(min=1.0)).unsqueeze(1)
                 seq = (1 + self.g_str(stp)) * seq + self.b_str(stp)
                 return site_mean(seq, batch[f"site_{side}"])
             if self.attn is None:

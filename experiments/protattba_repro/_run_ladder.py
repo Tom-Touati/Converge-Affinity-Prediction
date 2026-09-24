@@ -86,8 +86,13 @@ LADDER = [
     # is the only one that ever cleared its control, FiLM was second, attention never did.
     ("area_gated", dict(AREA, gated_fusion=True)),
     ("area_film", dict(AREA, film_struct=True)),
+    # seq_to_struct, NOT the reversed direction. With structure as the query, site_mean
+    # keeps only the mutated position and the rest of the area is thrown away -- the
+    # verification showed that variant reading nothing outside the site. With sequence as
+    # the query, the token at the mutation attends over structure across the whole area,
+    # which is the arrangement this queue is testing.
     ("area_xattn", dict(AREA, cross_attn=True, n_heads=4,
-                        attn_direction="struct_to_seq")),
+                        attn_direction="seq_to_struct")),
 ]
 
 
