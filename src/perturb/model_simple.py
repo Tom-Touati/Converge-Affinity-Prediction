@@ -907,6 +907,12 @@ class PerturbSiteToken(nn.Module):
                 d = c.hidden
             blocks += [nn.Linear(d, 1)]
             self.mlp = nn.Sequential(*blocks)
+            if c.ordinal:
+                # duplicated from the fall-through path below: every early-return branch
+                # in this constructor used to skip this, so mps_ord crashed at the first
+                # training step with "no attribute ord_b0" -- the head was never built
+                self.ord_b0 = nn.Parameter(torch.zeros(1))
+                self.ord_gap = nn.Parameter(torch.full((c.ordinal - 1,), 0.5))
             return
         if c.seq_mul_struct_attn:
             # its own structure projection and its own no-residual attention -- res_pre is
@@ -922,6 +928,12 @@ class PerturbSiteToken(nn.Module):
                 d = c.hidden
             blocks += [nn.Linear(d, 1)]
             self.mlp = nn.Sequential(*blocks)
+            if c.ordinal:
+                # duplicated from the fall-through path below: every early-return branch
+                # in this constructor used to skip this, so mps_ord crashed at the first
+                # training step with "no attribute ord_b0" -- the head was never built
+                self.ord_b0 = nn.Parameter(torch.zeros(1))
+                self.ord_gap = nn.Parameter(torch.full((c.ordinal - 1,), 0.5))
             return
         if c.mut_pair_ffn:
             self.pair_ln = nn.LayerNorm(w, elementwise_affine=False)  # no params, so one
@@ -963,6 +975,12 @@ class PerturbSiteToken(nn.Module):
                 d = c.hidden
             blocks += [nn.Linear(d, 1)]
             self.mlp = nn.Sequential(*blocks)
+            if c.ordinal:
+                # duplicated from the fall-through path below: every early-return branch
+                # in this constructor used to skip this, so mps_ord crashed at the first
+                # training step with "no attribute ord_b0" -- the head was never built
+                self.ord_b0 = nn.Parameter(torch.zeros(1))
+                self.ord_gap = nn.Parameter(torch.full((c.ordinal - 1,), 0.5))
             return
         pw = c.pool_proj or w
         self.pool_proj = (nn.Linear(seq_in, c.pool_proj, bias=False)
