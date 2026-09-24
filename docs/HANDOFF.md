@@ -2,7 +2,7 @@
 
 > **Historical snapshot, 2026-09-21. Superseded in one important respect.** This document
 > says "the random forest is the model". That was accurate when written, before the gated
-> fusion ladder was built. The submitted model is now `l1_gated` ([MODEL.md](MODEL.md)) and the
+> fusion ladder was built. The submitted model is now `cat128_reg2_l1` ([MODEL.md](MODEL.md)) and the
 > forest is the **baseline** it is measured against — see [JUSTIFICATIONS.md §A5](JUSTIFICATIONS.md).
 > Its numbers here also predate the censored-affinity drop (997 rows, not 940). Kept as the
 > record of what was known at the time.
