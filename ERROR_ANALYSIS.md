@@ -1,8 +1,9 @@
 # Error analysis
 
 Part I is the error analysis of the random forest, which is the model.
-Part II is the error analysis of the *evaluation*, and is where this project's
-most consequential findings sit.
+Part II is the error analysis of the *evaluation*.
+Part III is bias from imbalance -- labels, complexes and mutation types -- and is
+where the aggregate metric is shown to conceal the failures that matter most.
 
 > **Superseded in places — see [HANDOFF.md](docs/HANDOFF.md).** Numbers here predate two
 > corrections: the per-complex threshold moved from 10 mutations to 5 (the model to beat
@@ -391,3 +392,153 @@ The ceiling is the model and the task, not the pipeline.
 32k to 82k parameters gained 0.032; removing an entire head layer — 16,512 parameters, 31% of
 the model — cost nothing measurable. A model that is insensitive to a third of its parameters
 is not capacity-limited.
+
+---
+
+# Part III — bias from imbalance: labels, complexes, mutations
+
+The dataset is unbalanced in three independent ways, and each hides a different failure. The
+question in each section is not whether the imbalance exists but whether **error depends on
+it**. Regenerate with `python scripts/bias_analysis.py`.
+
+## 14. Label imbalance — the model cannot rank the class design cares about
+
+Error by true class, `E0a_rf_handcrafted`, 940 rows:
+
+| true class | n | mean true | mean pred | bias | MAE | within-class r |
+| --- | --- | --- | --- | --- | --- | --- |
+| stabilising | 126 | −1.429 | **+0.280** | **+1.709** | 1.710 | **0.007** |
+| neutral | 315 | +0.046 | +0.465 | +0.419 | 0.558 | 0.093 |
+| destabilising | 499 | +2.161 | +1.194 | −0.968 | 1.279 | 0.406 |
+
+Two things here are worse than the headline +0.381 suggests.
+
+**The average stabilising mutation is predicted to be destabilising.** True mean −1.429,
+predicted mean +0.280 — the sign is wrong, not just the magnitude.
+
+**Within stabilising mutations the model has no ranking ability at all: r = 0.007.** All of
+the +0.381 comes from the destabilising class (r 0.406) and from separating destabilising
+from the rest. For affinity maturation, where the task is to rank candidate *improving*
+mutations against each other, this model is a coin flip.
+
+The mechanism is compression:
+
+```
+predicted sd    0.897   vs true sd    1.793   (50%)
+predicted range 6.68    vs true range 12.85   (52%)
+```
+
+The forest predicts into half the label's dynamic range. That is ordinary regression toward
+the mean under a squared loss with 752 training rows — and it is exactly why cutting at the
+**label** edges (−0.5, +0.5) starves the minority class: the predictions never reach out that
+far. §"the defect and the fix" in the README shows quantile calibration recovering stabilising
+recall 0.06 → 0.29 at zero cost to ranking, which treats the symptom. The absence of *ranking*
+signal inside the class (r = 0.007) is not fixable by calibration and is the real limitation.
+
+## 15. Complex imbalance — 40% of complexes are invisible to the headline metric
+
+```
+rows per complex: median 9, min 1, max 87; the top 3 hold 24% of all rows
+32 of 53 complexes have the >=5 rows needed to score a within-complex correlation
+21 do not, and never enter the headline number
+```
+
+That last line matters for how every table in this repository should be read: **per-complex
+correlation is computed over 60% of the complexes**, systematically the larger ones.
+
+Binned by size:
+
+| complexes | count | rows | mean r | mean MAE | mean label spread |
+| --- | --- | --- | --- | --- | --- |
+| small | 11 | 98 | **0.210** | 1.207 | 0.998 |
+| medium | 10 | 227 | 0.499 | 0.849 | 1.161 |
+| large | 11 | 564 | 0.496 | 1.048 | 1.281 |
+
+Small complexes score less than half as well. But the cause is not sample size:
+
+```
+corr(rows per complex,  per-complex r) = +0.109
+corr(label spread,      per-complex r) = +0.225
+```
+
+**It is twice as much about how much variation a complex has to rank as about how many rows
+it has.** The five worst complexes are mostly low-spread ones:
+
+| complex | n | r | label spread |
+| --- | --- | --- | --- |
+| 3G6D_LH_A | 7 | −0.857 | 0.783 |
+| 2NY7_HL_G | 11 | −0.433 | 0.416 |
+| 1AHW_AB_C | 11 | −0.204 | 1.104 |
+| 2B2X_HL_A | 70 | −0.179 | 1.038 |
+| 1MLC_AB_E | 24 | −0.164 | 1.062 |
+
+A complex whose mutations all land within ~0.4 kcal/mol of each other is being asked to be
+ranked at a resolution finer than the assay's own reproducibility (within-complex label sd
+has a median of 1.104). A negative correlation there is close to meaningless, yet it enters
+the mean with equal weight — and 2B2X, at 70 rows, is not a small-sample artifact.
+
+**Implication for the metric.** An unweighted mean over per-complex correlations treats a
+7-row complex with 0.78 spread the same as an 87-row one. Weighting by rows, or excluding
+complexes whose label spread is below the measurement noise, would both be defensible; the
+current number does neither and should be read with that in mind.
+
+## 16. Mutation imbalance — the model is good at alanine scanning
+
+**X→A is 46% of all rows.** SKEMPI is dominated by alanine scans, and performance follows:
+
+| mutation | n | mean true | bias | MAE | r |
+| --- | --- | --- | --- | --- | --- |
+| X→A | 429 | +1.336 | −0.106 | 1.038 | **0.630** |
+| everything else | 511 | +0.665 | −0.176 | 1.143 | **0.363** |
+
+The model is **nearly twice as good on the over-represented mutation type**. Reported
+performance is therefore substantially a statement about alanine scanning, and a design
+campaign proposing non-alanine substitutions should expect roughly the "everything else" row.
+
+By wild-type residue, the largest groups:
+
+| wt | n | mean true | mean pred | bias | r |
+| --- | --- | --- | --- | --- | --- |
+| Y | 121 | +2.015 | +1.726 | −0.289 | 0.546 |
+| N | 104 | +0.320 | +0.677 | +0.358 | 0.568 |
+| D | 87 | +0.999 | +0.945 | −0.055 | **0.735** |
+| **V** | **84** | **+1.485** | **+0.094** | **−1.392** | **−0.284** |
+| T | 75 | +0.435 | +0.448 | +0.012 | 0.289 |
+| W | 55 | +1.879 | +1.629 | −0.250 | 0.514 |
+
+**Valine is a systematic failure.** 84 rows, mutations that genuinely cost +1.49 kcal/mol on
+average, predicted at +0.09 — under-predicted by **1.4 kcal/mol** — and ranked *backwards*
+(r = −0.284). This is the single largest residue-level defect in the model and it is not
+visible anywhere in the aggregate metrics. Valine is small, β-branched and buried; the
+features may be describing its environment as tolerant when removing it actually collapses
+packing. Worth a targeted look before any deployment.
+
+Two mutant-side classes are also inverted on smaller samples: proline (n=19, r −0.130) and
+cysteine (n=13, r −0.336) — both residues with backbone or disulfide effects that a per-residue
+feature set is unlikely to capture.
+
+## 17. Multi-point mutations — calibrated but imprecise
+
+| | n | mean true | bias | MAE | r |
+| --- | --- | --- | --- | --- | --- |
+| single-point | 668 | +0.964 | −0.047 | **0.889** | 0.541 |
+| multi-point | 272 | +0.988 | −0.382 | **1.601** | 0.530 |
+
+Multi-point rows are **80% worse on MAE** while holding almost the same correlation. So the
+model still *orders* them about as well; it cannot get their *magnitude* right, and it
+under-predicts them by 0.38 on average. That is the additivity assumption showing: ΔΔG is not
+additive in the number of mutations (corr(k, ΔΔG) = −0.151 overall, −0.292 among multi-point
+rows), and a feature set built per-residue has no way to represent epistasis.
+
+## 18. What this changes
+
+1. **Report per-class and per-mutation-type performance, not just the aggregate.** The
+   headline +0.381 conceals r = 0.007 on stabilising mutations and r = −0.284 on valine.
+2. **Calibrate before thresholding** — free, and recovers most of the class balance.
+3. **The per-complex mean is computed over 32 of 53 complexes** and weights a 7-row complex
+   like an 87-row one. Row-weighting, or a minimum label-spread filter, would both be more
+   honest; both should be stated rather than silently chosen.
+4. **Do not generalise from alanine.** Half the data is X→A and performance on it is twice
+   as good.
+5. **Valine and multi-point rows are the two concrete targets** for the next modelling
+   iteration, ahead of any architecture change.
