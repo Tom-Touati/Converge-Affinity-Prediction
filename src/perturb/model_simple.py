@@ -650,6 +650,21 @@ class SiteTokenConfig:
     #: still no chem and no structure EMBEDDING (the distance MATRIX is geometry, but it
     #: only selects which pair to multiply -- it never enters the multiply itself).
     ab_ag_nn: bool = False
+    #: How the ag residue and its nearest ab residue combine, WITHIN one branch.
+    #: ``mul`` ag_i * ab_nn_i  -- a per-channel similarity to that one ab residue.
+    #: ``sub`` ag_i - ab_nn_i  -- a per-channel MISMATCH: near zero on a channel where the
+    #:         two residues agree, large where they do not. Point-like, unlike the pooled
+    #:         subtraction used elsewhere in this file (site_mean(mt) - site_mean(wt)),
+    #:         because it never pools -- it is one residue against its one nearest partner.
+    ab_ag_nn_within: str = "mul"
+    #: How the wild-type and mutant per-residue vectors combine, ACROSS branches, before
+    #: the mean-pool. ``sub`` mt - wt (what ab_ag_nn=True, ab_ag_nn_within="mul" does).
+    #: ``mul`` mt * wt -- do the mismatch analysis SEPARATELY at each branch, then ask
+    #:         where a mismatch that existed in the wild type is STILL present in the
+    #:         mutant (both large, same sign) versus one the mutation fixed (opposite
+    #:         sign, or one near zero) -- the mirror of ab_ag_nn's default: here the
+    #:         mul/sub roles of the two combine points are swapped.
+    ab_ag_nn_across: str = "sub"
     #: Give each input its OWN first linear layer instead of one shared map.
     #:
     #: A shared projection forces the antibody, the antigen and ProteinMPNN into a single
@@ -881,26 +896,31 @@ class PerturbSiteToken(nn.Module):
             self.ord_gap = nn.Parameter(torch.full((c.ordinal - 1,), 0.5))
 
     def _ab_ag_nn(self, batch, px, tok_proj) -> torch.Tensor:
-        """Per-ag-residue: multiply with the wild-type-nearest ab residue, then mean-pool.
+        """Per-ag-residue: combine with its nearest ab residue, combine wt against mt, pool.
 
         dist is (B, Lab, Lag) and padded with 99.0 -- far past any real interface contact
         -- so argmin over the ab axis never lands on a padding row without needing a
-        separate mask there. Pooling afterward DOES need the ag mask, or padded ag rows
-        (product of two zero vectors, i.e. legitimately zero) would still count toward the
-        denominator and dilute rows shorter than the batch's longest crop.
+        separate mask there.
+
+        Pooling happens LAST, after both combine steps, not after the wt/mt combine.
+        ab_ag_nn_across="sub" would give the same answer either way -- mean is linear, so
+        mean(mt)-mean(wt) equals mean(mt-wt) -- but "mul" would not: mean(mt)*mean(wt) is a
+        different number from mean(mt*wt), and pooling first is not what was asked for.
+        Keeping one order for both keeps the two settings comparable to each other.
         """
         c = self.cfg
-        dist = batch["dist"]                                    # (B, Lab, Lag)
-        nn_idx = dist.argmin(dim=1, keepdim=True)                # (B, 1, Lag)
-        m_ag = batch["mask_ag"].unsqueeze(-1)                    # (B, Lag, 1)
-        out = {}
+        dist = batch["dist"]                                     # (B, Lab, Lag)
+        nn_idx = dist.argmin(dim=1, keepdim=True).squeeze(1).unsqueeze(-1)  # (B, Lag, 1)
+        m_ag = batch["mask_ag"].unsqueeze(-1)                     # (B, Lag, 1)
+        per = {}
         for k in ("wt", "mt"):
-            ab = tok_proj(px(batch[f"seq_ab_{k}"]), "ab")        # (B, Lab, w)
-            ag = tok_proj(px(batch[f"seq_ag_{k}"]), "ag")        # (B, Lag, w)
-            nn = torch.gather(ab, 1, nn_idx.squeeze(1).unsqueeze(-1).expand(-1, -1, ab.shape[-1]))
-            prod = (ag * nn) * m_ag
-            out[k] = prod.sum(1) / m_ag.sum(1).clamp(min=1.0)
-        return out["mt"] - out["wt"]
+            ab = tok_proj(px(batch[f"seq_ab_{k}"]), "ab")         # (B, Lab, w)
+            ag = tok_proj(px(batch[f"seq_ag_{k}"]), "ag")         # (B, Lag, w)
+            nn = torch.gather(ab, 1, nn_idx.expand(-1, -1, ab.shape[-1]))
+            per[k] = (ag - nn) if c.ab_ag_nn_within == "sub" else (ag * nn)
+        combined = (per["mt"] * per["wt"] if c.ab_ag_nn_across == "mul"
+                   else per["mt"] - per["wt"]) * m_ag
+        return combined.sum(1) / m_ag.sum(1).clamp(min=1.0)
 
     def _ab_ag_interaction(self, batch, px, tok_proj) -> torch.Tensor:
         """v_mt = pool(ab,mt) * pool(ag,mt);  v_wt = pool(ab,wt) * pool(ag,wt);  v_mt-v_wt.
