@@ -68,6 +68,10 @@ BATCH, LR, WD, PATIENCE, VAL_FRACTION = 32, 3e-4, 1e-2, 10, 0.20
 #: inject more noise, clip more often, and were being compared against configs that
 #: clipped far less. Set it well above the norm to turn clipping off.
 GRAD_CLIP = 5.0
+#: Class boundaries for the ordinal head, matching src/evaluate.py so the three classes mean
+#: the same thing everywhere: stabilising < -0.5 <= neutral <= +0.5 < destabilising.
+#: On the 940 rows that is 13% / 34% / 53%.
+CLASS_EDGES = (-0.5, 0.5)
 
 
 def blosum62():
@@ -487,7 +491,21 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
     model = make_model(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)  # WD/LR set from argv
-    lf = torch.nn.MSELoss()
+    if getattr(cfg, "ordinal", 0):
+        # Ordinal loss. MSE asks the model to reproduce a number whose own repeat
+        # measurements disagree by a median of 1.1 kcal/mol within a complex, so a large
+        # part of what it chases is noise. This asks a weaker and better-posed question --
+        # which side of -0.5 and of +0.5 does this mutation fall on -- and gets ORDER for
+        # free, because one shared scalar drives both thresholds.
+        from model_simple import ordinal_logits
+        edges = torch.tensor(CLASS_EDGES, dtype=torch.float32, device=device)
+        bce = torch.nn.BCEWithLogitsLoss()
+
+        def lf(z, y):
+            t = (y.unsqueeze(-1) > edges).float()     # (B, K) cumulative targets
+            return bce(ordinal_logits(z, model.ord_b0, model.ord_gap), t)
+    else:
+        lf = torch.nn.MSELoss()
     sweep_row(exp, f"fold {fold} seed {seed} running", n_params)
 
     best, state, bad, t0 = -np.inf, None, 0, time.time()

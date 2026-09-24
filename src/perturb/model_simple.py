@@ -73,6 +73,16 @@ class Project(nn.Module):
         return self.lin(self.norm(x))
 
 
+def ordinal_logits(z: torch.Tensor, b0: torch.Tensor, gap: torch.Tensor) -> torch.Tensor:
+    """(B,) scores -> (B, K) threshold logits with monotone thresholds.
+
+    logit_k = z + b_k where b_0 = b0 and each later b is strictly smaller, so the implied
+    probabilities are non-increasing in k by construction.
+    """
+    b = torch.cat([b0, b0 - torch.cumsum(torch.nn.functional.softplus(gap), 0)])
+    return z.unsqueeze(-1) + b
+
+
 def site_mean(x: torch.Tensor, site: torch.Tensor) -> torch.Tensor:
     """Mean over the mutated residues. A side with none contributes exactly zeros."""
     w = site.unsqueeze(-1)
@@ -466,6 +476,14 @@ class SiteTokenConfig:
     #: identifies the complex scores +0.672 pooled and +0.000 per complex (ERROR_ANALYSIS
     #: section 8). Expect pooled r to rise; per-complex r is the number that matters.
     struct_area_pool: bool = False
+    #: Number of ORDERED thresholds for an ordinal head; 0 keeps plain regression.
+    #: With CLASS_EDGES = (-0.5, +0.5) this is 2: stabilising / neutral / destabilising.
+    #:
+    #: The head stays a single scalar and the thresholds are biases on top of it (CORAL).
+    #: That is the point: one shared direction means the predicted ORDER cannot contradict
+    #: itself between thresholds, which a 3-way softmax can do freely -- a softmax is happy
+    #: to call something both stabilising and destabilising before neutral.
+    ordinal: int = 0
     input_noise: float = 0.0
     feature_dropout: float = 0.0
 
@@ -597,6 +615,12 @@ class PerturbSiteToken(nn.Module):
             d = c.hidden
         blocks += [nn.Linear(d, 1)]
         self.mlp = nn.Sequential(*blocks)
+        if c.ordinal:
+            # One free bias and then strictly decreasing steps, so
+            # P(y > edge_0) >= P(y > edge_1) holds for EVERY input rather than being
+            # something the optimiser is merely encouraged to discover.
+            self.ord_b0 = nn.Parameter(torch.zeros(1))
+            self.ord_gap = nn.Parameter(torch.full((c.ordinal - 1,), 0.5))
 
     def _struct_vec(self, batch, px, tok_proj) -> torch.Tensor:
         """One vector per row describing the wild-type structure at the mutation.

@@ -90,6 +90,17 @@ LADDER = [
     ("l1_gated", dict(L1, gated_fusion=True)),
     ("l1_film", dict(L1, film_struct=True)),
     ("l1_xattn", dict(L1, cross_attn=True, n_heads=4, attn_direction="seq_to_struct")),
+
+    # Ordinal head instead of regression. MSE asks the model to reproduce a number whose
+    # own repeat measurements disagree by a median of 1.1 kcal/mol within a complex, so a
+    # large share of what it chases is noise. These ask the better-posed question -- which
+    # side of -0.5 and of +0.5 does this mutation fall on -- and keep the ordering, because
+    # one shared scalar drives both thresholds (CORAL). Two extra parameters.
+    #
+    # RMSE is not comparable for these: the head emits a score, not kcal/mol. Read them on
+    # per-complex correlation and concordance only.
+    ("l1_gated_ord", dict(L1, gated_fusion=True, ordinal=2)),
+    ("l1_concat_ord", dict(L1, concat_struct=True, ordinal=2)),
 ]
 
 
