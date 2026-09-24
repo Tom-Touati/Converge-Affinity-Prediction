@@ -71,28 +71,25 @@ CLIP10 = {"grad_clip": 10.0}
 AREA = dict(ST, use_site_pool=False, chem_dim=26, mpnn_proj=64, layers=1,
             struct_area_pool=True, seeds=[0, 1, 2], **REG2, **CLIP10)
 
+#: The best three-seed configuration we have: one hidden layer in the head, structure pooled
+#: at the MUTATED RESIDUES, chem columns, reg2, clip 10. +0.239 over three seeds.
+#: area_concat pooled the structure over the whole binding area instead and scored +0.189 --
+#: worse on per-complex AND on pooled r -- so the fusion mechanisms below are built on the
+#: site-pooled representation rather than the area one. ProteinMPNN's signal here is local;
+#: averaged over ~85 interface residues it washes out and adds a near-constant per complex.
+L1 = dict(ST, use_site_pool=False, chem_dim=26, mpnn_proj=64, layers=1,
+          seeds=[0, 1, 2], **REG2, **CLIP10)
+
 LADDER = [
-    # finish what is already part-run, at the old clip, so they stay comparable
-    ("cat128_reg2_l1", dict(ST, use_site_pool=False, chem_dim=26, concat_struct=True,
-                            mpnn_proj=64, layers=1, seeds=[0, 1, 2], **REG2)),
+    ("area_gated", dict(AREA, gated_fusion=True)),          # already part-run; finish it
     ("cat128_reg2_l1_noclip", dict(ST, use_site_pool=False, chem_dim=26, concat_struct=True,
                                    mpnn_proj=64, layers=1, seeds=[0, 1, 2],
                                    grad_clip=20.0, **REG2)),
 
-    # 1. the new representation, plainly concatenated -- the control for everything below
-    ("area_concat", dict(AREA, concat_struct=True)),
-
-    # 2-4. the three fusion mechanisms on top of it, in the order they earned: gated fusion
-    # is the only one that ever cleared its control, FiLM was second, attention never did.
-    ("area_gated", dict(AREA, gated_fusion=True)),
-    ("area_film", dict(AREA, film_struct=True)),
-    # seq_to_struct, NOT the reversed direction. With structure as the query, site_mean
-    # keeps only the mutated position and the rest of the area is thrown away -- the
-    # verification showed that variant reading nothing outside the site. With sequence as
-    # the query, the token at the mutation attends over structure across the whole area,
-    # which is the arrangement this queue is testing.
-    ("area_xattn", dict(AREA, cross_attn=True, n_heads=4,
-                        attn_direction="seq_to_struct")),
+    # the three fusion mechanisms on the configuration that is actually ahead
+    ("l1_gated", dict(L1, gated_fusion=True)),
+    ("l1_film", dict(L1, film_struct=True)),
+    ("l1_xattn", dict(L1, cross_attn=True, n_heads=4, attn_direction="seq_to_struct")),
 ]
 
 
