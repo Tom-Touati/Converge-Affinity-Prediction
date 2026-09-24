@@ -1,0 +1,330 @@
+# Why each choice was made
+
+The assignment grades *justifiable choices* above everything else. This document states, for
+each modelling, augmentation and evaluation decision: **what was chosen, what else was
+available, why, and what evidence supports it** — including the decisions taken on judgment
+with no evidence behind them, which are marked as such.
+
+`docs/decisions.md` is the chronological log of decisions as they were taken.
+`docs/ARCHITECTURES.md` is what was built and what it scored. This is the reasoning.
+
+---
+
+# A. Modelling
+
+## A1. Predict ΔΔG by regression; build an ordinal head; do not use a 3-way softmax
+
+**Chosen.** Regression on clipped ΔΔG as the primary target, with a CORAL ordinal head
+implemented as an alternative.
+
+**Why.** The argument for binning is real and is recorded in `thoughts.md`: classification
+*neutralises measurement error*, because a label that is only accurate to ~1 kcal/mol does not
+support a squared loss that tries to reproduce it exactly. Our own data agrees — within-complex
+label sd has a median of **1.104 kcal/mol**, and SKEMPI's repeated `(complex, mutation)` pairs
+(123 groups, 258 rows) disagree at a scale that caps any achievable correlation.
+
+Regression stayed primary for one reason: **the evaluation is a ranking**. Per-complex
+correlation and concordance need a continuous score, and binning to three classes discards the
+ordering inside each bin — exactly the information the metric rewards. Binning would improve
+the loss's robustness while degrading the thing being measured.
+
+The ordinal head is the resolution rather than a compromise: it trains on which side of −0.5
+and +0.5 a mutation falls (the robustness argument) while **one shared scalar drives both
+thresholds**, so the output is still a continuous ranking (the metric argument). Two extra
+parameters.
+
+**Why not a 3-way softmax.** A softmax over three ordered classes is free to assign a mutation
+high probability of *stabilising* and *destabilising* simultaneously, with neutral in between —
+incoherent for an ordered target. CORAL's shared direction makes
+`P(y > −0.5) ≥ P(y > +0.5)` hold for every input by construction, verified on every row.
+
+**Evidence.** Head implemented and verified (ordered thresholds, monotonicity on all rows,
+ranking identical to the underlying scalar). **The runs did not complete** — this is a
+justified design, not a measured result, and is not claimed as one.
+
+## A2. Frozen encoders, small trained heads
+
+**Chosen.** ESM-2 and ProteinMPNN frozen; only heads of 15k–85k parameters train.
+
+**Why.** 752 training rows per fold. Fine-tuning a 650M-parameter encoder on that is not a
+risk judgment, it is arithmetic.
+
+**Evidence.** The whole capacity ladder: an 810,886-parameter model scores **+0.200** and a
+41,792-parameter one scores **+0.205**. Removing an entire head layer (31 % of a model) cost
+nothing measurable. Capacity was never the binding constraint, so spending it on the encoder
+would not have helped either.
+
+## A3. ESM-2 650M for sequence, ProteinMPNN for structure
+
+**Chosen.** As above. Alternatives considered: ESM-2 35M/150M, AntiBERTy, CurrAb, ESM-IF1,
+SaProt.
+
+**Why ProteinMPNN.** An inverse-folding model scores *this residue in this pocket*, which is
+the conditional the mutation question asks. It is also cheap and runs on CPU.
+
+**Why ESM-2 rather than an antibody-specific model.** Measured, not assumed:
+**AntiBERTy lost to ESM-2 by 0.046** on a matched control (`st64_nopool_chem_abty` +0.166 vs
+`st64_nopool_chem_esm` +0.212). CurrAb and ESM-2 35M also failed to clear zero as additions to
+the forest. `thoughts.md` asks "how many of the proteins and antigens did the model actually
+previously see?" — a fair worry, and the homology-split result is the closest answer available:
+networks built on these embeddings retain **34 %** of their score when homologues are withheld
+against the forest's **54 %**, so a substantial part of what the embeddings contribute *is*
+recognition rather than physics.
+
+## A4. Represent the mutation as a difference of embeddings at the mutated residues
+
+**Chosen.** `site_mean(mutant) − site_mean(wild-type)` over the mutated residues, with the
+mutant sequence **re-embedded** rather than edited in latent space.
+
+**Why.** ΔΔG is a contrast between two states, so the representation should be a contrast too.
+Re-embedding is the honest version: an edited latent vector assumes the encoder is linear in
+the substitution, which it is not.
+
+**Why pool at the mutated residues rather than over the interface.** Measured:
+`area_concat` (+0.227) against `cat128_reg2_l1` (+0.293) — pooling structure over the whole
+binding area costs ~0.05. ProteinMPNN's signal is local; averaged over ~85 residues it washes
+out and what survives is nearly constant per complex.
+
+**Why multi-point rows average their k tokens rather than being dropped.** 272 rows, 29 % of
+the data, and 7 complexes have no single-point row at all. Averaging is a choice and not
+obviously the right one — ΔΔG is not additive in the mutation count
+(corr(k, ΔΔG) = −0.151 overall, −0.292 among multi-point rows) — but dropping them would remove
+seven complexes entirely. **Evidence it is imperfect:** multi-point rows are 80 % worse on MAE
+than single-point at the same correlation (ERROR_ANALYSIS §17).
+
+## A5. A random forest is the submitted model, not the neural fusion network
+
+**Chosen.** `E0a_rf_handcrafted` — chemistry + interface geometry + ProteinMPNN.
+
+**Why.** +0.381 against the best network's +0.300, which is ~2.5× the seed spread and one of
+the few differences in this project that clears the noise. It also retains 54 % under the
+homology split where the network retains 34 %.
+
+**Why this is still a multimodal answer.** Chemistry describes the substitution (sequence);
+geometry and ProteinMPNN describe the site (structure). Pooled ESM alone reaches 0.273; adding
+ProteinMPNN takes it to 0.366; handcrafted columns take it to 0.418. The modalities are
+combined at the feature level and the combination beats either alone.
+
+**The honest caveat.** The forest has the *worst* stabilising recall in the table (0.06), and a
+network reaches 0.48. If the downstream task is finding affinity-improving mutations rather
+than ranking known ones, the network is the better choice — stated in the README rather than
+buried.
+
+## A6. Fusion by feature concatenation, after measuring five alternatives
+
+**Chosen.** Gating or plain concatenation.
+
+**Why.** Not aesthetics — the control. `st64_noattn` (+0.212) is the same network with fusion
+deleted, and **four of five cross-attention variants score at or below it** while costing twice
+the parameters. Gating (+0.300) and concatenation (+0.293) are the two cheapest mechanisms and
+the only two that clear the control convincingly.
+
+Antibody↔antigen cross-attention — the mechanism `thoughts.md` proposed and ProtAttBA's own —
+was measured as family A and reaches +0.112 to +0.200, below the simpler families.
+
+---
+
+# B. Augmentation and regularisation
+
+## B1. Reverse-mutation augmentation, p = 0.5
+
+**Chosen.** With probability 0.5 per row per epoch, swap wild-type and mutant and negate the
+label.
+
+**Why.** ΔΔG is antisymmetric by definition: reversing a mutation negates its free-energy
+change. This is free, exactly correct label information — not a heuristic — and it attacks the
+class imbalance at its root. **70 % of rows are destabilising**, so a model can profit from
+guessing "destabilising"; augmentation removes that incentive.
+
+**Evidence it does what it claims** (`audit_augmentation.py`, measured not assumed): the
+realised rate is 51 %, and the training label mean moves from **+0.720 to −0.031**. Every row
+is seen both ways — the chance a row is never reversed across 25 epochs is 3×10⁻⁸. Applied to
+training only; validation and test loaders are built with `augment=False`.
+
+**Its known cost.** Earlier measurement: per-complex ρ 0.487 → 0.416, but *balanced* sign
+accuracy 0.512 → 0.681. It trades ranking for balance. Given §14 — the model predicts the
+average stabilising mutation as destabilising — that is the right trade for this task, but it
+is a trade and is recorded as one.
+
+## B2. Input noise and feature dropout, shared mask
+
+**Chosen.** Gaussian noise at 0.10–0.40 × per-feature sd; feature dropout 0.20–0.50, mask drawn
+once per width and **shared between the wild-type and mutant branches**.
+
+**Why shared.** The model consumes `mutant − wild-type`. A mask applied to both gives
+`mask·(mt − wt)` — it zeroes features *of the difference* rather than corrupting it.
+
+**Evidence, and a defect found by measuring it.** The mask behaves as intended. **The noise
+does not.** It is drawn fresh on each branch, so it does not cancel — it compounds by √2 and
+reaches **0.8× the delta's own standard deviation** at the default setting, and would exceed
+the signal at the heaviest setting tried. The code comment claimed both were shared; it was
+true of the mask and false of the noise.
+
+This is the most likely explanation for why heavier regularisation kept *costing* accuracy
+(−0.037 and −0.043 on two architectures) without reducing seed variance. **Sharing the noise
+draw is the top untried lever** and is a two-line change.
+
+## B3. Gradient clipping at 5.0, later made configurable
+
+**Chosen.** Global-norm clip, threshold now a flag.
+
+**Why it became a problem.** The threshold sat at 5.0 while the measured gradient norm was
+5.0–5.3, so roughly half of all steps were rescaled and half were not — the most intermittent
+setting available, and one that differed systematically between arms, since heavier
+regularisation produces noisier gradients and clips more often.
+
+**Evidence, which contradicted the expectation.** Turning clipping off (threshold 20) *cost*
+0.028 (`cat128_reg2_l1` +0.293 → `cat128_reg2_l1_noclip` +0.265). Clipping was helping. The
+confound was real, the direction was the opposite of the one assumed, and it is now a flag so
+the question can be asked rather than inherited.
+
+## B4. Labels clipped to ±4 kcal/mol
+
+**Chosen.** Clip in training *and* in scoring, so every model is compared on one truth.
+
+**Why.** `thoughts.md` flags "extreme values in positive ddG". The tail is real and the model
+cannot reach it — §7 shows the ten worst residuals are dominated by +7.2 to +7.9 hotspots
+predicted at +1.5 to +2.4. Clipping stops a handful of unreachable rows dominating a squared
+loss.
+
+**Why it must also apply to scoring.** It caught a real error: the forest was being compared at
+RMSE 1.532 against networks at 1.5–1.6 while being scored on *unclipped* labels. On the common
+truth it is 1.335. `report_runs.py` now enforces one truth for every run.
+
+## B5. Augmentations considered and not done
+
+- **Rotating the 3D structure** (`thoughts.md`). ProteinMPNN's `encoder_h_V` is computed from
+  distances and relative geometry and is already rotation-invariant, so rotation augmentation
+  would produce identical features. Correctly motivated for a coordinate-consuming model; a
+  no-op for this one.
+- **Predicting the mutant structure and using it as a feature** (`thoughts.md`). This is the
+  right instinct — §"the mutant has no structure" in `docs/ARCHITECTURE.md` identifies it as
+  the sharpest limitation, since the structure branch is *identical* for every mutation of a
+  complex. Not done: folding 940 mutants was outside the compute budget, and a predicted
+  structure's error would be correlated with exactly the buried, tightly-packed sites the model
+  already fails on (§16, valine). Listed as a next step rather than attempted badly.
+- **FoldX pseudo-labels.** Deferred behind a trigger: only worth it if a learning curve shows
+  data volume is the constraint. Everything in Part III says it is, so this is now live.
+
+---
+
+# C. Evaluation and error analysis
+
+## C1. Per-complex correlation is the headline, not pooled
+
+**Chosen.** Mean within-complex Pearson/Spearman over complexes with ≥5 rows.
+
+**Why.** Measured, and it is the single most important methodological finding here: predicting
+**each complex's own mean** — a model that never looks at the mutation — scores **+0.672 pooled
+Pearson, 1.144 RMSE, 0.580 balanced accuracy**, beating every model in the project on all
+three, while scoring **+0.000** per complex. Between-complex variance dominates, so pooled
+metrics largely measure whether a model can identify the complex.
+
+**Consequence.** Every table leads with per-complex, and `report_runs.py` prints that floor
+beneath every comparison so a reader can see what the pooled column is worth.
+
+**The cost of this choice, stated.** Only **32 of 53 complexes** have ≥5 rows, so the headline
+is computed over 60 % of complexes, systematically the larger ones, and it weights a 7-row
+complex the same as an 87-row one. Row-weighting or a minimum-spread filter would both be
+defensible; neither is applied, and that is a judgment call rather than an evidenced one.
+
+## C2. Splits: by complex, and by homology cluster
+
+**Chosen.** Report both. `frozen5` withholds whole complexes; `cluster` withholds homology
+clusters.
+
+**Why both.** `thoughts.md` asks for "5 fold based on homology clusters, very tough standard".
+It is the right standard and the project measured why: 42 of 54 complexes gain a TM > 0.8
+training twin under complex grouping, against 0 of 54 under cluster grouping. But the cluster
+split yields only 4 usable folds and much smaller test sets, so the two are not directly
+comparable and both are reported with that stated.
+
+**What it bought.** The clearest architectural finding in the project: the forest retains
+**54 %** under the homology split, the networks **34 %**. Without the harder split, the
+networks look merely worse; with it, they are revealed to be leaning on homology.
+
+## C3. Three seeds minimum, and report the spread
+
+**Chosen.** Report ensemble-of-seeds *and* per-seed mean with max − min.
+
+**Why.** Measured: seed spread reaches **0.117** per complex and **0.376** pooled within a
+single fold. The entire architectural ladder fits inside that. Two conclusions in this project
+were drawn from partial folds and **reversed** when the last fold arrived.
+
+**The honest state.** Only **8 of 45** configurations have three complete seeds; **37 have
+one**. Their individual numbers are not interpretable at the resolution the tables print them,
+which is why `ARCHITECTURES.md` opens with that warning rather than burying it.
+
+## C4. Metrics beyond correlation
+
+**Chosen.** Report per-complex r and ρ, count of complexes with *negative* within-complex
+correlation, pooled r, RMSE raw and debiased, sign accuracy raw and **class-balanced**,
+within-complex pairwise concordance, and 3-class balanced accuracy with per-class recall.
+
+**Why so many.** Each hides a different failure. Accuracy rewards guessing the majority
+(classes are 13/34/53). Correlation hides the forest finding 7 of 126 stabilising mutations.
+RMSE is dominated by between-complex structure. Concordance — "of two mutations on this
+complex, does the model order them correctly" — is the question a designer actually asks, and
+no single number substitutes for it.
+
+## C5. Calibrate before thresholding
+
+**Chosen.** Cut the score at its own quantiles, matched to training class frequencies, rather
+than at the label edges.
+
+**Why.** The forest compresses into 50 % of the label's sd, so its predictions rarely reach
+below −0.5 and cutting at the label edges starves the minority class. Calibration is
+**monotone**, so per-complex correlation is provably unchanged.
+
+**Evidence.** Stabilising recall **0.06 → 0.29**, balanced accuracy **0.439 → 0.500**,
+per-complex Spearman +0.3613 → +0.3613. Free.
+
+## C6. Verify the pipeline before believing the ceiling
+
+**Chosen.** Check alignment before attributing a ~0.3 ceiling to the model.
+
+**Why.** Three different bugs — an off-by-one from an insertion code, a chain mix-up, and
+applying the substitution to SEQRES instead of the ATOM-derived sequence — all look identical
+from a loss curve, and all would mean the model was learning from noise.
+
+**Evidence.** Across all 940 rows and 1,726 mutated sites: **zero** residue mismatches, WT and
+MT sequences differ only at the recorded sites, and `‖t_mut − t_wt‖` puts the mutated sites in
+the top-k on **97 %** of sides at a median of **22×** the median residue. `make align`.
+
+A real defect was found and fixed by this class of check: `Row.wt_aa` was indexed by
+rank-within-a-side, so 82 of 940 rows carried another mutation's residue in their BLOSUM
+features.
+
+## C7. Slice the errors by every descriptor, not just the ones that occurred to us
+
+**Chosen.** Correlate every available descriptor against every model's signed and absolute
+error (`scripts/error_drivers.py`).
+
+**Why.** Hand-picked slices find what the analyst already suspects. `thoughts.md` lists four
+worries — unbalanced labels, extreme positive ΔΔG, multi-point vs single, antibody-side vs
+antigen-side — and a systematic sweep can confirm those *and* surface what was not on the list.
+
+**What it surfaced that hand-picking did not.** Signed error correlates with true ΔΔG at
+**ρ ≈ −0.8 for every architecture**, and with deviation from the complex's own mean at
+**ρ ≈ −0.58**. Regression to the mean is not one failure among several — it is the dominant
+error structure, and it explains the class bias, the valine failure and the compressed output
+range as one phenomenon. Rows in larger complexes are systematically under-predicted
+(ρ ≈ −0.33, all four models), which is representation bias changing the *direction* of error.
+
+It also showed the two networks agree on which rows are hard at **0.866** while the forest
+agrees with them only **0.42–0.54** — which is why the fusion ladder went nowhere and why
+blending the forest with a network beats both.
+
+## C8. What `thoughts.md` asked for that is still open
+
+- **Test-retest error as an explicit ceiling.** The ingredients exist (123 repeated
+  `(complex, mutation)` groups, 258 rows; within-complex label sd median 1.104) but the
+  implied ceiling on achievable correlation is not computed and reported as a line on every
+  chart. It should be.
+- **Difficulty scored by similarity to training points.** Per-complex size and label spread are
+  analysed; nearest-neighbour distance in feature space to the training fold is not.
+- **Train vs validation vs test loss curves.** Logged per epoch into `history.csv` and mirrored
+  to TensorBoard, but not presented as a figure in any document.
+- **Generalisation check on another dataset.** AB645/AB1101 rows are built, cached and
+  leakage-filtered (`src/perturb/extra_rows.py`, homology models of our own complexes removed)
+  but have never been trained or tested on.

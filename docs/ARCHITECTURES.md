@@ -31,9 +31,14 @@ The largest model in the project (810k parameters) scores **+0.200**. The best n
 
 ## A. The full attention model — v2, v3, v4
 
-Cross-attention over the cropped interface with rotary position embedding, a distance bias on
-the attention logits, a chain-identity embedding, and BLOSUM features on the mutated residues.
-This is the architecture the plan proposed before any of it was measured.
+**Antibody↔antigen cross-attention** over the cropped interface (`cross_chain=True`,
+`attn(h_ab, h_ag, ...)`), with rotary position embedding, a distance bias on the attention
+logits, a chain-identity embedding, and BLOSUM features on the mutated residues. This is the
+architecture the plan proposed, and it is the mechanism `thoughts.md` asked for — "encode the
+ab binding site sequence and the ag too, then run cross attention between ag to ab, for both
+mutated and not". It is also ProtAttBA's mechanism.
+
+**So antibody↔antigen attention is measured, and this family is the measurement.**
 
 | run | params | per-cx r | what it changed |
 | --- | --- | --- | --- |
@@ -153,9 +158,12 @@ two architectures and reduces seed variance on neither.
 
 ### C5. Implemented, not yet measured at three seeds
 
-- **Antibody↔antigen cross-attention** (`ab_ag_attn`) — the ProtAttBA mechanism, where the
-  mutated side attends across the interface rather than to structure. Built and forward-tested;
-  the runs did not complete before the Colab session budget ran out.
+- **Antibody↔antigen cross-attention inside the cheap family** (`ab_ag_attn` in
+  `model_simple`). The mechanism itself is *not* untested — family A above is exactly that, at
+  +0.112 to +0.200. What is untested is whether it does better inside the 36-48k site-token
+  model than it did inside the 51-810k v2 model, with the components that family A was
+  carrying (RoPE, distance bias, chain embedding, BLOSUM) removed. Built and forward-tested;
+  the runs did not complete before the session budget ran out.
 - **Ordinal head** (`ordinal=2`, CORAL) — two thresholds driven by one shared scalar so they
   cannot contradict each other, with three-class metrics logged per epoch. Verified to train
   and to keep its thresholds ordered; the runs did not complete.

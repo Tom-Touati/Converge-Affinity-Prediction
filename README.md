@@ -19,6 +19,7 @@ network.
 | AI prompt history | **[AI_PROMPTS.md](AI_PROMPTS.md)** |
 | Running it | [Setup](#setup-and-running) below |
 | Hardware and runtime | [Hardware](#hardware-and-runtime) below |
+| **Why each choice was made** — modelling, augmentation, evaluation | **[docs/JUSTIFICATIONS.md](docs/JUSTIFICATIONS.md)** |
 | **Every architecture tried, with configs and results** | **[docs/ARCHITECTURES.md](docs/ARCHITECTURES.md)** |
 | Deeper background, encoders, split design | [docs/DETAILS.md](docs/DETAILS.md), [docs/PLAN.md](docs/PLAN.md) |
 
