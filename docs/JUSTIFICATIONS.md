@@ -269,11 +269,26 @@ reading.
 the project. Quantile calibration lifts it 0.06 → 0.29 at zero cost to ranking (§C5), so the
 version anyone should actually use is the calibrated one.
 
-## A6. Fusion by feature concatenation, after measuring five alternatives
+## A6. Fusion by concatenation — the simplest mechanism, after measuring eight alternatives
 
 **Chosen.** Plain concatenation, with **a separate projection per modality**.
 
-**Why.** Not aesthetics — the control. `st64_noattn` (+0.212) is the same network with fusion
+**Why, and it is not a preference for simplicity.** Simplicity was the *outcome*, not the
+criterion. Every elaboration was built and priced against the simpler thing it replaced, and
+each either lost or landed inside the seed spread: cross-attention five ways (four at or below
+the no-fusion control, at 2× the parameters), antibody↔antigen attention (+0.112…+0.200, up to
+22× the parameters), FiLM (+0.227), gated fusion (+0.007 and sharing a projection across two
+unrelated encoder spaces), a learned reduction replacing the PCA (inside the noise, its own two
+seeds 0.075 apart), area pooling (−0.066), heavier regularisation (−0.037…−0.043), a second
+head layer (no measurable change). `ERROR_ANALYSIS.md §25` collects the mechanism.
+
+One honest caveat against the easy reading: across all 45 configurations
+Spearman(parameters, score) is **+0.276** — bigger models score slightly *better* on average,
+because the small end is full of deliberately crippled ablations (`mlp_chem_only`, 20,096
+parameters, scores −0.005). The claim is therefore not "smaller is better" but the narrower
+*at equal information, added mechanism did not pay for itself*.
+
+**The measurement that makes any of this readable is the control.** `st64_noattn` (+0.212) is the same network with fusion
 deleted, and **four of five cross-attention variants score at or below it** while costing twice
 the parameters. Gating (+0.300) and concatenation (+0.293) are the two cheapest mechanisms and
 the only two that clear the control convincingly.

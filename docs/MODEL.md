@@ -7,6 +7,20 @@ measured to arrive at it; this is the one that is submitted.
 residues, concatenated with substitution chemistry into a single-hidden-layer head. 36,353
 trainable parameters, both encoders frozen.**
 
+**It is the simplest fusion in the family, and it won.** Forty-five configurations were
+measured — cross-attention in five variants, antibody↔antigen attention across the interface,
+FiLM, gated fusion, a two-tower model, a learned block-diagonal reduction replacing the PCA,
+binding-area pooling, an ordinal head. Not one of them beats plain concatenation outside the
+seed spread, and several lose to a model with the fusion **deleted**. The largest model built
+in this project has 810,886 parameters and scores +0.200 against this model's +0.293.
+
+That is the result, not an apology for it. `ERROR_ANALYSIS.md §25` collects why: there is no
+mutant structure, so the structure term is identical for every mutation of a complex and
+attention has little to attend to; ProteinMPNN's signal is local and washes out when pooled;
+regression to the mean dominates the error of *every* architecture equally; and capacity is
+free to add and free to remove. On 752 training rows per fold, the mechanism of fusion is not
+what separates models.
+
 > **Why not the gated model.** An earlier draft submitted `l1_gated`, which scores +0.300
 > against this model's +0.293. That model turned out to share **one** `Linear(128 → 64)`
 > between ESM-2 and ProteinMPNN — a bug, not a design: its config set `mpnn_proj=64` and the

@@ -197,6 +197,20 @@ pooled embeddings with handcrafted columns is worth a further **+0.052**.
 
 ## What the whole ladder says
 
+**The simplest fusion won, and it was not chosen for being simple.** Every elaboration here was
+built first and priced afterwards against the thing it replaced. Concatenation survived because
+nothing beat it outside the seed spread — not five cross-attention variants, not
+antibody↔antigen attention at up to 22× the parameters, not FiLM, not gating, not a learned
+reduction replacing the PCA. `ERROR_ANALYSIS.md §25` collects the mechanism.
+
+One number is worth stating because it cuts against the easy reading: across all 45
+configurations Spearman(parameter count, per-complex r) is **+0.276**, so bigger models score
+slightly *better* on average. That correlation is manufactured by the deliberately crippled
+ablations at the small end — `mlp_chem_only` has 20,096 parameters and scores −0.005. The
+claim is not "smaller is better"; it is that **at equal information, added mechanism did not
+pay for itself**.
+
+
 1. **Capacity is not the constraint.** 810k parameters and 42k score the same; removing an
    entire head layer (31 % of a model) cost nothing measurable.
 2. **Fusion mechanism is not the constraint.** Four of six mechanisms sit at or below the

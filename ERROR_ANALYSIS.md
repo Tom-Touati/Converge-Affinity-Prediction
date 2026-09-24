@@ -1035,3 +1035,74 @@ The network's errors are much less predictable (+0.157). Read charitably, it has
 extracted what these descriptors offer; read plainly, its remaining error is noise or lies
 outside anything we measured — and given §23 puts the label-noise ceiling at 0.979, it is more
 likely the latter.
+
+## 25. Why every elaboration failed — the synthesis
+
+Forty-five configurations were measured. The submitted model is the **simplest fusion in the
+family**: two projections, concatenate, one hidden layer, 36,353 parameters. This section
+collects why the more inventive things lost, because the individual null results are more
+convincing together than separately.
+
+### Every elaboration, priced against the simpler thing it replaced
+
+| elaboration | params | per-cx r | against | verdict |
+| --- | --- | --- | --- | --- |
+| cross-attention, 5 variants | 77,441 | +0.172 … +0.241 | no-fusion control +0.212 | **4 of 5 at or below**, at 2× the parameters |
+| antibody↔antigen attention (v2/v3/v4) | 51k–811k | +0.112 … +0.200 | concatenation +0.293 | **below**, at up to 22× the parameters |
+| FiLM on the structure delta | 52,993 | +0.227 | concatenation +0.293 | below |
+| gated fusion | 48,001 | +0.300 | concatenation +0.293 | **+0.007 — inside the seed spread**, and it shared one projection across modalities |
+| learned block-diagonal reduction, no PCA | 61,057 | +0.236 (2 seeds) | PCA-128 +0.216 | inside the noise; its own two seeds differ by 0.075 |
+| structure pooled over the binding area | 36,353 | +0.227 | pooled at the mutated site +0.293 | **worse by 0.066** |
+| heavier regularisation | — | −0.037 … −0.043 | its own baseline | worse on two architectures |
+| a second head layer | +16,512 | no measurable change | one layer | free to delete |
+
+**Nothing in that table beats plain concatenation outside the seed spread.** The one apparent
+exception, gated fusion, is +0.007 and turned out to be sharing a projection between two
+encoders with unrelated output spaces.
+
+### A number that does *not* support the simple reading, stated anyway
+
+Across all 45 configurations, Spearman(parameter count, per-complex r) is **+0.276** —
+*positive*. Bigger models score slightly better on average.
+
+That is a real number and it is confounded: the small end of the range is full of deliberately
+crippled ablations. `mlp_chem_only` has 20,096 parameters and scores **−0.005**;
+`v5_simple_noseqstruct` has 6,464 and scores +0.146. Removing information makes a model both
+small and bad, which manufactures a positive correlation.
+
+**So the claim is not "smaller is better".** It is the narrower and better-supported one: *at
+equal information, added mechanism did not pay for itself.* Each row of the table above is a
+matched comparison where one thing changed.
+
+### Why, mechanistically — the error analysis already answers it
+
+Four findings from this document explain the pattern, and each was measured independently of
+the ladder:
+
+1. **There is no mutant structure** (§ model design). ProteinMPNN sees the wild-type backbone
+   only, so the structure term is **identical for every mutation of a complex**. A fusion
+   mechanism that learns to align sequence against structure is aligning a varying quantity
+   against a constant one. Attention has almost nothing to attend *to*.
+2. **ProteinMPNN's signal is local and washes out when pooled** (§A3, and the area-pool result
+   above). Its value is per-residue resolution; any mechanism that summarises it across the
+   interface destroys what it contributes.
+3. **Regression to the mean is the dominant error structure**, ρ ≈ −0.8 between signed error
+   and true ΔΔG *for every architecture tested* (§19, §24). A failure common to all of them is
+   not a failure of any one's fusion mechanism.
+4. **Capacity is not the constraint.** An 810,886-parameter model scores +0.200 and a
+   41,792-parameter one +0.205; removing an entire head layer costs nothing measurable. When
+   extra capacity is free to add and free to remove, the binding constraint is elsewhere —
+   §13 and §20–§23 locate it in data volume and homology structure.
+
+### The finding stated plainly
+
+**On 752 training rows per fold, the mechanism of fusion is not what separates models.** What
+separates them is which features reach the model at all — 26 chemistry columns moved the same
+network +0.191 → +0.266, larger than any architectural change measured anywhere in this
+project — and how close the test complex is to something seen in training (§21: proximity
+ρ +0.494, frequency ρ +0.142).
+
+The strongest version of the same point is that the **random forest on 49 handcrafted columns,
+with no learned representation at all, beats every one of the 45 networks** at +0.381. That is
+not a comfortable result to report, and it is the clearest evidence in the project that
+complexity was never the missing ingredient.

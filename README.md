@@ -7,11 +7,17 @@ Predicting how a mutation changes antibody–antigen binding free energy, from *
 at the mutated residues, concatenated with substitution chemistry into a single-hidden-layer
 head. 36,353 trainable parameters, both encoders frozen.**
 
-It was chosen over cross-attention, FiLM and gated fusion — and *how* it was chosen is why
-this README is organised the way it is. On **940 rows across 53 complexes**, with a
-measured seed-to-seed spread of 0.028–0.117, most architectural differences in this problem
-are smaller than the noise. Establishing which differences are real became the substance of
-the work.
+**It is the simplest fusion that was tried, and it won.** Forty-five configurations were
+measured — cross-attention in five variants, antibody↔antigen attention across the interface,
+FiLM, gated fusion, a two-tower model, a learned reduction replacing the PCA, binding-area
+pooling, an ordinal head. **Not one beats plain concatenation outside the seed spread**, and
+four of five cross-attention variants score at or below a model with the fusion *deleted*, at
+twice the parameters. The largest model here has 810,886 parameters and scores +0.200.
+
+On **940 rows across 53 complexes**, with a measured seed spread of 0.028–0.117, most
+architectural differences in this problem are smaller than the noise. Establishing which
+differences are real — and which of this project's own earlier claims did not survive that
+test — became the substance of the work.
 
 | | |
 | --- | --- |
