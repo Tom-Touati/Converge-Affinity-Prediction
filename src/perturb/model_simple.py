@@ -696,6 +696,23 @@ class SiteTokenConfig:
     #: made ab_ag_nn_across="mul" unstable (seed spread 0.224, the widest in the project);
     #: worth watching for here too rather than assuming it away.
     mut_pair_ffn: bool = False
+    #: ``mul``  LN(mt) * LN(wt), elementwise -- and elementwise product conflates two
+    #:          different situations into the same near-zero output: "both channels are
+    #:          genuinely silent" and "one channel is active, the other isn't" (a real
+    #:          mismatch). It also has a dead-gradient problem to match: d(uv)/du = v, so
+    #:          a channel near zero on ONE side gets almost no gradient on the OTHER,
+    #:          regardless of how wrong it is. Measured consequence in this file: every
+    #:          mul-outer-combine check landed near zero with a seed spread 6-7x wider
+    #:          than the sub-based ones (ab_ag_nn_across="mul" 0.224, this design's mul
+    #:          variant TBD -- both symptoms of the same missing zero invariant, since
+    #:          mt==wt gives LN(wt)^2 here, not zero).
+    #: ``sub``  LN(mt) - LN(wt). Restores the zero invariant (mt==wt -> exactly zero) and
+    #:          has no dead-gradient direction -- d(u-v)/du = 1 everywhere, independent of
+    #:          the other side's value.
+    mut_pair_op: str = "mul"
+    #: GELU on pair_ffn's OWN output, before the sum -- off by default (the mul variant
+    #: was asked to stay linear there), on for the sub variant by request.
+    mut_pair_act: bool = False
     #: Give each input its OWN first linear layer instead of one shared map.
     #:
     #: A shared projection forces the antibody, the antigen and ProteinMPNN into a single
@@ -953,7 +970,8 @@ class PerturbSiteToken(nn.Module):
             self.ord_gap = nn.Parameter(torch.full((c.ordinal - 1,), 0.5))
 
     def _mut_pair_ffn(self, batch, px, tok_proj) -> torch.Tensor:
-        """At each mutated residue: GELU(proj) -> LN(mt)*LN(wt) -> Linear, summed raw."""
+        """At each mutated residue: GELU(proj) -> LN(mt) combine LN(wt) -> Linear, summed."""
+        c = self.cfg
         acc = 0
         for side in ("ab", "ag"):
             site = batch[f"site_{side}"].unsqueeze(-1)
@@ -962,8 +980,11 @@ class PerturbSiteToken(nn.Module):
             # in this file reads unactivated
             p_mt = torch.nn.functional.gelu(tok_proj(px(batch[f"seq_{side}_mt"]), side))
             p_wt = torch.nn.functional.gelu(tok_proj(px(batch[f"seq_{side}_wt"]), side))
-            prod = self.pair_ln(p_mt) * self.pair_ln(p_wt)
-            h = self.pair_ffn(prod)             # still no activation before the sum
+            n_mt, n_wt = self.pair_ln(p_mt), self.pair_ln(p_wt)
+            comb = (n_mt - n_wt) if c.mut_pair_op == "sub" else (n_mt * n_wt)
+            h = self.pair_ffn(comb)
+            if c.mut_pair_act:
+                h = torch.nn.functional.gelu(h)
             acc = acc + (h * site).sum(1)
         return acc
 
