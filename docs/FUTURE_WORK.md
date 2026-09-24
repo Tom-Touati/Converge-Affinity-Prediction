@@ -53,6 +53,34 @@ The largest single gain measured anywhere here was adding 26 chemistry columns t
 (+0.191 → +0.266). The forest's other block — rSASA, burial, contact counts — has never been
 given to the network. It is the untried half of the one intervention that demonstrably worked.
 
+## 5. Normalise the target within cluster — measured, and it moved
+
+**Reported result: gated `chem+geom`, cluster-scaled, +0.241 → +0.299.** Standardising the
+regression target within homology cluster rather than globally, so the model is asked for the
+*within-cluster* ranking directly instead of having to learn each cluster's offset and spread
+on the way there.
+
+That it helps is consistent with the largest effect in `ERROR_ANALYSIS.md`. Regression to the
+mean is the dominant error structure at **ρ ≈ −0.8** against the label, and it survives
+*within* a complex at **ρ ≈ −0.58** against deviation from the complex mean — so it is eating
+the very quantity the headline metric is built from. The complex's own mean ΔΔG correlates
+with signed error at **−0.547** for the submitted model. A model spending capacity on
+reproducing between-cluster location and scale is spending it on the part of the problem that
+the complex-mean floor already solves for free (+0.672 pooled, §8 of the error analysis).
+
+**The caution is specific, and it is the reason this is not yet a headline number.** The
+scaling statistics must be fitted on **training folds only**, exactly as the PCA bases and the
+chemistry standardisation already are. Fit them on all rows and each test complex contributes
+its own mean and spread to its own normalisation — which is the complex-mean floor smuggled in
+as preprocessing, and that floor scores **+0.672 pooled Pearson** while never looking at the
+mutation. A leak here would look like a large, clean gain. Before this is reported as a
+result it needs: the statistics demonstrably fold-local, three seeds, and the standard table
+from `scripts/final_table.py`.
+
+**Status.** The +0.241 → +0.299 pair is from a run that is not in `results/oof/`, on one
+configuration. By this project's own rule — established after two conclusions drawn from
+partial folds were both wrong — that makes it a lead worth an evening, not a claim.
+
 ---
 
 # Tier 2 — an antibody–antigen-specific joint pretraining
@@ -72,7 +100,7 @@ alignment problem, and the consequence is visible: the model's performance track
 proximity to training at Spearman **+0.494**, and collapses to **+0.060** on complexes with no
 structural relative. It has learned to recognise, not to generalise.
 
-## 5. Why it must be antibody–antigen-specific, not generic protein
+## 6. Why it must be antibody–antigen-specific, not generic protein
 
 A generic sequence–structure alignment — over the whole PDB — would be dominated by globular
 protein cores, which is the wrong regime three times over:
@@ -95,7 +123,7 @@ shared projection served both sides*, so an antibody-specific prior was being as
 a space fitted to a general one. That comparison should be re-run after the alignment below
 exists, not before.
 
-## 6. The pretraining task
+## 7. The pretraining task
 
 **Data.** SAbDab (~7,000 antibody structures, continuously updated), restricted to those with a
 bound antigen; AbDb for cleaned, numbered Fv pairs; and the antibody–antigen subset of the PDB
@@ -143,7 +171,7 @@ is the relation ΔΔG actually depends on.
 projections currently fitted to 752 labels. Everything downstream is unchanged, so the
 comparison is clean.
 
-## 7. How to tell whether it worked
+## 8. How to tell whether it worked
 
 The lesson of this project is that a mechanism means nothing without a control, so:
 
@@ -170,20 +198,83 @@ were.
 
 # Tier 3 — more data, which everything else points at
 
-## 8. FoldX pseudo-labels
+## 9. Synthetic mutations — FoldX as a mutant-structure generator, and as a labeller
 
 Deferred earlier behind a trigger: *build it only if a learning curve shows data volume is the
-constraint*. Everything in `ERROR_ANALYSIS.md` Part III says it is. `skempi-foldx` ships
-precomputed values, so FoldX never has to run. It gives a graded, structure-aware signal across
-the whole label range — strictly more informative than the distal-neutral augmentation it was
-weighed against, which only ever adds a point mass at zero.
+constraint*. Everything in `ERROR_ANALYSIS.md` Part III says it is. This is the item that
+turns that finding into training rows, and it has three distinct uses that are worth separating
+because they fix different things and cost different amounts.
 
-## 9. The AB645 / AB1101 rows already built
+### 9a. FoldX ΔΔG as one input column — the cheapest, do it first
+
+One scalar per row, into the forest and into the network's `chem` block. `skempi-foldx` ships
+precomputed values, so FoldX need not run at all for the rows we already have.
+
+The reason to expect it to pay is in `docs/ABSCI_DATASET.md §9.2`. On split-by-complex
+fivefold CV over full SKEMPI v2.0 (n = 5,729), FoldX has the **best Spearman of any individual
+model, 0.526** — above a pretrained geometric GNN's 0.525 — while having the **worst MAE and
+RMSE in the table**. It ranks well and is calibrated badly. Our headline metric is a rank
+correlation, so we want exactly the half of FoldX that is good. Note the caveat before
+budgeting on it: that table is full SKEMPI, not the antibody–antigen subset, and empirical
+force fields are generally reported as weaker on AB/AG interfaces than on globular ones. The
+honest version of this item is *measure FoldX on our 940 rows first*, as its own row in
+`scripts/final_table.py`, beside the complex-mean floor.
+
+### 9b. Synthesise the mutant *structure* — this is the one that closes an architectural hole
+
+`docs/MODEL.md` names the sharpest limitation of the submitted design in one line: **there is
+no mutant structure**. ProteinMPNN sees the wild-type backbone only, so `z_str` is *identical
+for every mutation of a given complex*. The structure modality cannot currently distinguish two
+mutations on the same complex at all — it contributes a per-complex constant, which is precisely
+the thing the per-complex metric is designed to cancel.
+
+FoldX `RepairPDB` → `BuildModel` produces a mutant structure: side chains repacked on a fixed
+backbone. Re-run ProteinMPNN on it and the structure term becomes a **delta**,
+`site_mean(proj_str(struct_mt)) − site_mean(proj_str(struct_wt))`, mirroring the sequence edit
+in step 3 of the forward pass rather than sitting beside it as a constant. That is a genuine
+architectural change reachable without any new labels, and it is testable against a control
+that is already measured: the no-fusion model at +0.212 and the submitted model at +0.293.
+
+**Where it will be least trustworthy is where we most need it.** BuildModel repacks side chains
+and does not model backbone motion. Our own error analysis says absolute error rises with
+interface contacts (ρ 0.317 for the submitted model) and with ΔrSASA on mutation (0.283) — the
+buried, tightly-packed sites where a fixed backbone is the worst assumption, and where Gly and
+Pro substitutions change what the backbone can do. So the per-tier and per-descriptor breakdown
+matters more for this item than the headline does.
+
+### 9c. A pseudo-labelled mutation pool — pretraining, not a target
+
+Enumerate mutations at interface positions SKEMPI never measured, label them with FoldX, and
+use them to **pretrain**, then fine-tune on the real labels. Three conditions, each of which
+this project has already paid to learn:
+
+- **Do not use a learned labeller trained on SKEMPI.** ThermoMPNN, GearBind or our own forest
+  would pseudo-label rows whose information came from complexes sitting in our *test* folds.
+  FoldX is an empirical force field, not fitted to SKEMPI, which is the specific reason it is
+  the right tool for this job and a learned ΔΔG predictor is not.
+- **Pseudo-labels cap the student at the teacher.** Trained *as the target*, the ceiling is
+  FoldX. As a pretraining task with a real-label fine-tune, it buys a representation rather
+  than a score, which is the only form worth doing at 752 training rows per fold.
+- **Do not reintroduce the class imbalance.** Reverse-mutation augmentation moved the training
+  label mean from **+0.720 to −0.031** and that is most of why the submitted model finds three
+  times as many stabilising mutations as the forest (0.19 against 0.06). A synthetic pool
+  enumerated naively will be overwhelmingly destabilising and will hand that back.
+
+### The acceptance test, for all three
+
+**The hard tier, not the average.** Complexes with no structural relative in training score
+**+0.060** against **+0.367** for those with a near-identical twin, and the easy tier is 75 % of
+test rows (§13). Synthetic data drawn from the complexes we already have adds rows in the
+region that is already easy. If FoldX augmentation moves the average and leaves the hard tier
+where it is, it bought retrieval, not generalisation — and §11 below is the finding that says
+that is the likely outcome unless the synthetic complexes are new *structure space*.
+
+## 10. The AB645 / AB1101 rows already built
 
 261 rows are built, cached and leakage-filtered (homology models of our own complexes removed),
 and have never been trained on. They need an ESM re-extract that includes their sequences.
 
-## 10. Target new *structure space*, not new measurements
+## 11. Target new *structure space*, not new measurements
 
 The sharpest data finding here: **how often a complex appears barely predicts performance**
 (Spearman +0.04 / +0.09), while **how structurally close it is to training does** (+0.17 /
@@ -194,7 +285,7 @@ So "more data" should mean **complexes in untested regions of structure space**,
 mutations on complexes we already have. That distinction is worth making to whoever funds the
 next assay plate.
 
-## 11. A ranking loss, for data recovery only
+## 12. A ranking loss, for data recovery only
 
 Measured and rejected on score: at full pair coverage it ties its control (0.421 vs 0.420) and
 pure ranking collapses to 0.170 because the regression term is the only anchor on output scale.
@@ -210,21 +301,21 @@ score.
 
 # Evaluation work, which would change how all of the above is read
 
-## 12. Select and report on the hard tier
+## 13. Select and report on the hard tier
 
 **75 % of test rows have a near-identical training twin** (median TM 0.991); only 19.8 % are
 genuinely hard. On those the forest scores +0.270 and the network +0.117. A model intended for
 novel targets should be **selected** on the hard tier, not on the average — selecting on the
 average selects for retrieval.
 
-## 13. Weight the per-complex mean, or state that it is unweighted
+## 14. Weight the per-complex mean, or state that it is unweighted
 
 It currently treats a 7-row complex with 0.78 label spread identically to an 87-row one
 spanning 2 kcal/mol, and it is computed over **32 of 53 complexes**. Row-weighting, or a
 minimum-spread filter, would both be defensible. Neither is applied; that is a judgment call
 and should be stated as one.
 
-## 14. Three seeds minimum, and publish the spread
+## 15. Three seeds minimum, and publish the spread
 
 Only 8 of 45 configurations here have three complete seeds. The measured spread reaches 0.117
 per complex and 0.376 pooled within a single fold. Most published ΔΔG comparisons would not

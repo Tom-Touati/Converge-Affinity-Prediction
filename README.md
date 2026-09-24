@@ -373,20 +373,46 @@ fold landed. Both are recorded in [AI_PROMPTS.md](AI_PROMPTS.md).
    a fixed 25 % blend lifts per-complex r from +0.397 to +0.416 with the submitted model, and
    +0.424 with `st64_nopca_grouped`. The weight was not tuned on held-out data, so validate it — but it is better
    evidenced than any architecture change here.
-3. **Share the input-noise draw across branches.** Measured: the noise is drawn independently
+3. **Normalise the target within cluster.** Reported at **+0.241 → +0.299** on gated
+   `chem+geom`. It is consistent with the largest effect in the error analysis — regression to
+   the mean at ρ ≈ −0.8, surviving *within* complex at ρ ≈ −0.58 — since a model normalised per
+   cluster no longer spends capacity reproducing each cluster's own location and spread. **The
+   scaling statistics must be fitted on training folds only**: fitted on everything, each test
+   complex supplies its own mean to its own normalisation, which is the complex-mean floor
+   (+0.672 pooled) smuggled in as preprocessing and would look like a large clean gain. That
+   run is not in `results/oof/`, so by this project's own three-seed rule it is a lead, not yet
+   a result.
+4. **Share the input-noise draw across branches.** Measured: the noise is drawn independently
    per branch, so it compounds by √2 and reaches **0.8× the delta's own sd** — at the heaviest
    setting, more noise than signal. Two-line change, and it would explain why heavier
    regularisation kept costing accuracy.
-4. **Give the network the forest's geometry columns.** The largest measured gain in the project
+5. **Give the network the forest's geometry columns.** The largest measured gain in the project
    came from adding chemistry; interface geometry is the untried other half.
-5. **Ordinal loss instead of MSE.** MSE asks the model to reproduce a value whose repeat
-   measurements disagree by ~1.1 kcal/mol. A CORAL head is implemented (`ordinal=2`) and
-   verified; it never completed a run.
-6. **Three seeds minimum for any future claim**, and report the spread.
-7. **More data — but new *structure space*, not new measurements.** How often a complex
+6. **Synthesise mutations — FoldX for the mutant *structure* first, labels second.** The
+   sharpest limitation of the submitted model is that **there is no mutant structure**:
+   ProteinMPNN sees the wild-type backbone only, so the structure term is identical for every
+   mutation of a complex and contributes a per-complex constant. FoldX `BuildModel` produces a
+   mutant structure, which turns that term into a *delta* mirroring the sequence edit — an
+   architectural gain needing no new labels. Separately, FoldX has the best Spearman of any
+   individual model on full SKEMPI (0.526) while having the worst RMSE, so it is worth one
+   input column, and it can pseudo-label mutations SKEMPI never measured. It is the right
+   labeller precisely because it is *not* fitted to SKEMPI — a learned ΔΔG predictor would leak
+   our own test complexes into the synthetic set. Use pseudo-labels to pretrain, not as the
+   target, and keep the synthetic pool class-balanced or it hands back the imbalance that
+   reverse-mutation augmentation removed (+0.720 → −0.031).
+7. **Ordinal loss instead of MSE.** MSE asks for a point value on a target whose repeat
+   measurements disagree by **0.240 kcal/mol** — small, so this is an argument about the *shape*
+   of the loss rather than about noise. It is worth trying because the decision the labels are
+   used for is a three-way one, and because MSE is what shrinks predictions toward the mean. A
+   CORAL head is implemented (`ordinal=2`) and verified; it never completed a run.
+8. **Three seeds minimum for any future claim**, and report the spread.
+9. **More data — but new *structure space*, not new measurements.** How often a complex
    appears barely predicts performance (Spearman +0.04 / +0.09); how structurally close it is
    to training does (+0.17 / +0.37). 261 AB645/AB1101 rows are built, cached and
-   leakage-filtered, and have never been trained on.
+   leakage-filtered, and have never been trained on. This is also the acceptance test for
+   item 6: synthetic mutations on complexes we already have add rows where the model is already
+   strong (**hard tier +0.060 against easy +0.367**), so if FoldX augmentation moves the
+   average and leaves the hard tier flat, it bought retrieval, not generalisation.
 
 **The main proposal is bigger than any of these, and it has two halves that only work
 together: more data, and a sequence–structure alignment pretrained specifically on
