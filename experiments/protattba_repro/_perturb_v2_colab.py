@@ -437,7 +437,11 @@ GRAD_GROUPS_SIMPLE = {"head": "mlp.", "film": "gamma", "film_b": "beta",
                       "red_seq": "proj_seq", "red_str": "proj_str"}
 GRAD_GROUPS_MLP = {"head": "net."}
 GRAD_GROUPS_TT = {"head": "mlp.", "proc": "proc"}
-GRAD_GROUPS_ST = {"head": "mlp."}
+# "attn 0.000" in every sitetok log line was this map, not a starved block: the site-token
+# model names its attention "attn." and "attn2.", neither of which appeared here, so the
+# whole of it was being bucketed into "other" while the printout showed a flat zero.
+GRAD_GROUPS_ST = {"head": "mlp.", "attn": "attn", "fuse": "gate", "proc": "post_attn",
+                  "red_seq": "proj_side", "red_str": "mpnn_proj"}
 GRAD_GROUPS = GRAD_GROUPS_V2
 
 

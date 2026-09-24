@@ -592,7 +592,13 @@ class SiteTokenConfig:
     #: or lives in a different molecule from the keys (antibody attending to antigen, where
     #: a difference of residue indices means nothing).
     rope: bool = False
-    rope_base: float = 10000.0
+    #: 10000 is the language-model value, chosen for thousands of tokens. Measured on these
+    #: crops the same-chain separations run to a median of 29 and a 90th percentile of 75,
+    #: and at that base 7 of the 16 frequency channels turn less than half a radian across
+    #: the whole range -- constants, carrying nothing -- while 5 more wrap and alias. Only 4
+    #: were tuned to anything this data contains. At 200 the series spans 1 to ~170 instead
+    #: of 1 to 47,000: 8 channels usefully tuned and none dead.
+    rope_base: float = 200.0
     #: How far apart to place consecutive chains along the rotary axis.
     #:
     #: The residue index restarts at 0 in every chain, so an antibody crop holds an H30 and
