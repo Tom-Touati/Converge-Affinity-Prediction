@@ -624,6 +624,32 @@ class SiteTokenConfig:
     #:          difference for comparing two vectors of the same space (NLI-style
     #:          ``[u, v, u*v, u-v]``), tried here on its own rather than alongside the sub.
     edit_op: str = "sub"
+    #: A structure-free, chem-free reference check: is there signal in ab-ag SEQUENCE
+    #: complementarity alone, with no ProteinMPNN, no handcrafted columns, no attention.
+    #:
+    #: Per side, per branch (wild-type and mutant separately): project to width ``proj``,
+    #: mean-pool over the binding site (``ab_ag_pool``), giving one 64-d vector per side.
+    #: Multiply the ab and ag vectors elementwise -- the ab-ag interaction, at that
+    #: branch's sequence. Do this once with the mutant sequence and once with the wild
+    #: type, then SUBTRACT the two interaction vectors and feed the difference to the mlp
+    #: head alone. Nothing else in the model runs when this is set.
+    ab_ag_interaction: bool = False
+    #: Which mask defines "binding site" for the pool above. ``mask`` is the whole crop --
+    #: interface<12A union site-neighbourhood<10A union mutated+/-2 -- the literal binding
+    #: region. ``site`` is only the mutated residues, which is what site_mean means
+    #: everywhere else in this file; kept distinct here because the request said BINDING
+    #: SITE, not mutation site, and the two pool over different row counts.
+    ab_ag_pool: str = "mask"
+    #: A second, per-RESIDUE variant of the same reference check. Instead of pooling each
+    #: side to one vector before multiplying, pair every ag crop residue with its closest
+    #: ab residue by the wild-type Ca distance (the ``dist`` matrix the crop already
+    #: carries), multiply THAT pair elementwise, and mean-pool the per-residue products
+    #: over the ag crop afterward. The pairing is a WILD-TYPE geometric fact, shared by
+    #: both branches -- there is no mutant structure, the same reason _struct_vec pools
+    #: the wild type for both wt and mt. Still sequence-only, still the wt/mt subtraction,
+    #: still no chem and no structure EMBEDDING (the distance MATRIX is geometry, but it
+    #: only selects which pair to multiply -- it never enters the multiply itself).
+    ab_ag_nn: bool = False
     #: Give each input its OWN first linear layer instead of one shared map.
     #:
     #: A shared projection forces the antibody, the antigen and ProteinMPNN into a single
@@ -754,6 +780,17 @@ class PerturbSiteToken(nn.Module):
         else:
             self.proj = nn.Linear(seq_in, c.proj, bias=False) if c.proj else None
             self.proj_side = None
+        if c.ab_ag_interaction or c.ab_ag_nn:
+            # Nothing below this belongs to the reference check: no structure, no chem, no
+            # attention. The head takes the single w-dim interaction-difference vector.
+            blocks: list[nn.Module] = []
+            d = w
+            for _ in range(c.layers):
+                blocks += [nn.Linear(d, c.hidden), nn.GELU(), nn.Dropout(c.dropout)]
+                d = c.hidden
+            blocks += [nn.Linear(d, 1)]
+            self.mlp = nn.Sequential(*blocks)
+            return
         pw = c.pool_proj or w
         self.pool_proj = (nn.Linear(seq_in, c.pool_proj, bias=False)
                           if c.pool_proj and c.use_site_pool else None)
@@ -843,6 +880,47 @@ class PerturbSiteToken(nn.Module):
             self.ord_b0 = nn.Parameter(torch.zeros(1))
             self.ord_gap = nn.Parameter(torch.full((c.ordinal - 1,), 0.5))
 
+    def _ab_ag_nn(self, batch, px, tok_proj) -> torch.Tensor:
+        """Per-ag-residue: multiply with the wild-type-nearest ab residue, then mean-pool.
+
+        dist is (B, Lab, Lag) and padded with 99.0 -- far past any real interface contact
+        -- so argmin over the ab axis never lands on a padding row without needing a
+        separate mask there. Pooling afterward DOES need the ag mask, or padded ag rows
+        (product of two zero vectors, i.e. legitimately zero) would still count toward the
+        denominator and dilute rows shorter than the batch's longest crop.
+        """
+        c = self.cfg
+        dist = batch["dist"]                                    # (B, Lab, Lag)
+        nn_idx = dist.argmin(dim=1, keepdim=True)                # (B, 1, Lag)
+        m_ag = batch["mask_ag"].unsqueeze(-1)                    # (B, Lag, 1)
+        out = {}
+        for k in ("wt", "mt"):
+            ab = tok_proj(px(batch[f"seq_ab_{k}"]), "ab")        # (B, Lab, w)
+            ag = tok_proj(px(batch[f"seq_ag_{k}"]), "ag")        # (B, Lag, w)
+            nn = torch.gather(ab, 1, nn_idx.squeeze(1).unsqueeze(-1).expand(-1, -1, ab.shape[-1]))
+            prod = (ag * nn) * m_ag
+            out[k] = prod.sum(1) / m_ag.sum(1).clamp(min=1.0)
+        return out["mt"] - out["wt"]
+
+    def _ab_ag_interaction(self, batch, px, tok_proj) -> torch.Tensor:
+        """v_mt = pool(ab,mt) * pool(ag,mt);  v_wt = pool(ab,wt) * pool(ag,wt);  v_mt-v_wt.
+
+        The multiply is WITHIN a branch, ACROSS sides (ab times ag) -- a different
+        operation from edit_op="mul", which multiplies mt times wt WITHIN one side. Here
+        the mutation is read from the subtraction between two ab-ag interaction terms,
+        each of which is itself a product.
+        """
+        c = self.cfg
+        key = c.ab_ag_pool
+        out = {}
+        for k in ("wt", "mt"):
+            pooled = {}
+            for side in ("ab", "ag"):
+                seq = tok_proj(px(batch[f"seq_{side}_{k}"]), side)
+                pooled[side] = site_mean(seq, batch[f"{key}_{side}"])
+            out[k] = pooled["ab"] * pooled["ag"]
+        return out["mt"] - out["wt"]
+
     def _struct_vec(self, batch, px, tok_proj) -> torch.Tensor:
         """One vector per row describing the wild-type structure at the mutation.
 
@@ -870,6 +948,12 @@ class PerturbSiteToken(nn.Module):
 
     def forward(self, batch) -> torch.Tensor:
         c = self.cfg
+        if c.ab_ag_interaction or c.ab_ag_nn:
+            def px0(x): return x               # no noise/dropout in this reference check
+            def tp0(x, side="ab"):
+                return self.proj_side[side](x) if self.proj_side is not None else x
+            fn = self._ab_ag_nn if c.ab_ag_nn else self._ab_ag_interaction
+            return self.mlp(fn(batch, px0, tp0)).squeeze(-1)
         # The scale and the dropout mask are per WIDTH. They used to be taken once from
         # seq_ab_wt and applied to everything, which held only while the PCA made the
         # sequence and the structure both 128 wide. Without it the sequence is 1280 and
