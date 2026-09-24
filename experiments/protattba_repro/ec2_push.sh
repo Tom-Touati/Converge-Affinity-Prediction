@@ -41,11 +41,43 @@ tar -C "$SRC/data/features" -cf - mpnn_per_residue \
   | $SSH ubuntu@"$IP" 'tar -C /home/ubuntu/perturb -xf -' \
   && say "  ok mpnn_per_residue" || say "  FAILED mpnn"
 
-# 3. the big one
-say "esm token store, 823 MB -- this is the slow part"
-scp -q -i "$KEY" -o StrictHostKeyChecking=no \
-  "$SRC/.perturb_local/esm2_650m_tokens.npy" ubuntu@"$IP":/home/ubuntu/perturb/ \
-  && say "  ok esm tokens" || say "  FAILED esm tokens"
+# 3. the big one, in chunks.
+#    scp of a single 823 MB file restarts from zero on any dropped connection, and rsync is
+#    not available in Git Bash on Windows. Splitting means a failure costs one chunk, and a
+#    re-run skips the chunks that already landed with the right size.
+BIG="$SRC/.perturb_local/esm2_650m_tokens.npy"
+say "esm token store, $(du -h "$BIG" | cut -f1) -- the slow part, sent in 100 MB chunks"
+WANT=$(stat -c %s "$BIG")
+HAVE=$($SSH ubuntu@"$IP" 'stat -c %s /home/ubuntu/perturb/esm2_650m_tokens.npy 2>/dev/null' 2>/dev/null | tr -d '
+')
+if [ "${HAVE:-0}" = "$WANT" ]; then
+  say "  already present and the right size, skipping"
+else
+  TMP=$(mktemp -d)
+  split -b 100m "$BIG" "$TMP/esm."
+  n=$(ls "$TMP" | wc -l | tr -d ' ')
+  say "  $n chunks"
+  $SSH ubuntu@"$IP" 'mkdir -p /home/ubuntu/perturb/.esm_parts' 2>/dev/null
+  i=0
+  for c in "$TMP"/esm.*; do
+    i=$((i + 1)); b=$(basename "$c"); want=$(stat -c %s "$c")
+    got=$($SSH ubuntu@"$IP" "stat -c %s /home/ubuntu/perturb/.esm_parts/$b 2>/dev/null" 2>/dev/null | tr -d '
+')
+    if [ "${got:-0}" = "$want" ]; then say "  $i/$n $b already there"; continue; fi
+    for attempt in 1 2 3; do
+      scp -q -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=20           "$c" ubuntu@"$IP":/home/ubuntu/perturb/.esm_parts/ && break
+      say "  $i/$n $b attempt $attempt failed"; sleep 5
+    done
+    say "  $i/$n $b sent"
+  done
+  rm -rf "$TMP"
+  say "  reassembling on the instance"
+  $SSH ubuntu@"$IP" 'cd /home/ubuntu/perturb && cat .esm_parts/esm.* > esm2_650m_tokens.npy      && rm -rf .esm_parts' 2>/dev/null
+  got=$($SSH ubuntu@"$IP" 'stat -c %s /home/ubuntu/perturb/esm2_650m_tokens.npy 2>/dev/null' 2>/dev/null | tr -d '
+')
+  # a truncated token store fails later and confusingly, so it is checked here
+  [ "$got" = "$WANT" ] && say "  size verified: $got bytes"                        || say "  SIZE MISMATCH want=$WANT got=${got:-none}"
+fi
 
 say "verifying"
 $SSH ubuntu@"$IP" 'cd /home/ubuntu/perturb && du -sh . && ls | tr "\n" " "' 2>/dev/null
