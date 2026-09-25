@@ -731,6 +731,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exp", default="v2_full")
     ap.add_argument("--rows", default=str(ROOT / "perturb_rows.parquet"))
+    ap.add_argument("--fold-map", default=None,
+                    help="CSV with row_id,fold to use INSTEAD of perturb_rows.parquet's own "
+                         "'fold' column -- e.g. a homology-cluster split. Overwrites 'fold' "
+                         "right after loading, so nothing downstream (fold_pca, run_fold) "
+                         "needs to know this happened; --folds then indexes into ITS fold "
+                         "numbers, not the frozen5 ones.")
     ap.add_argument("--folds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
     ap.add_argument("--max-epochs", type=int, default=60)
@@ -780,6 +786,22 @@ def main():
     cfg = cfg_cls(**ov)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     rows = pd.read_parquet(a.rows)
+    if a.fold_map:
+        # A cluster fold can leave a held-out fold with NO training rows at all for a
+        # complex it shares no cluster with, or -- the more common failure -- a fold whose
+        # rows are all from one or two huge clusters. Reported once so a suspicious split
+        # is visible in the log rather than discovered later as an unexplained NaN.
+        fm = pd.read_csv(a.fold_map)[["row_id", "fold"]].set_index("row_id")["fold"]
+        before = rows.fold.copy()
+        rows["fold"] = rows.row_id.map(fm)
+        missing = rows.fold.isna().sum()
+        if missing:
+            raise SystemExit(f"--fold-map {a.fold_map} is missing {missing} of {len(rows)} "
+                             f"row_ids -- refusing to train on a partial remap")
+        rows["fold"] = rows.fold.astype(before.dtype)
+        print(f"fold column replaced from {a.fold_map}: "
+              f"{rows.fold.nunique()} folds, sizes {rows.fold.value_counts().sort_index().tolist()}",
+              flush=True)
     if a.single_only:
         # k is read from the crop file, which is the same source the model pools from, so
         # "one mutated residue" means the same thing here and in the forward pass.
