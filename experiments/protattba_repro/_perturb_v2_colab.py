@@ -522,7 +522,8 @@ def sweep_row(exp, note, params=None):
 
 
 def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True,
-             select_on="per_complex", make_model=PerturbV2):
+             select_on="per_complex", make_model=PerturbV2, init_ckpt=None,
+             save_ckpt=None, val_restrict_abag=True):
     torch.manual_seed(seed); np.random.seed(seed)
     pcas = fold_pca(rows, fold, cache, cfg.pca_dim, seed=0)
     test = rows[rows.fold == fold]
@@ -539,14 +540,26 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
     # 92% protein-protein: the reported per-complex score would describe a different
     # population, and -- the part that actually breaks the run -- early stopping would pick
     # the checkpoint that is best on protein-protein complexes and then test it on
-    # antibodies. Candidates are restricted to AB/AG whenever the corpus has any.
-    cand = tr_all[tr_all.is_abag] if "is_abag" in tr_all.columns else tr_all
+    # antibodies. Candidates are restricted to AB/AG whenever the corpus has any -- unless
+    # val_restrict_abag is False, which a full-SKEMPI PRETRAIN stage sets on purpose: there
+    # the "test" population for THIS run is a checkpoint, not a metric, so validation should
+    # represent the general protein-protein task the pretrain is actually fit to.
+    cand = (tr_all[tr_all.is_abag]
+            if val_restrict_abag and "is_abag" in tr_all.columns else tr_all)
     if len(cand) and cand.complex_key.nunique() > 1:
         sizes = cand.complex_key.value_counts()
         cx = list(sizes.index)
         rng_v = np.random.default_rng(seed)
         rng_v.shuffle(cx)
-    target, taken, val_cx = VAL_FRACTION * len(cand), 0, set()
+    # A general-val pretrain's candidate pool is the whole non-held-out corpus (~5,560
+    # rows), ~7x the AB/AG-restricted pool (~750) -- at the same VAL_FRACTION that is a
+    # ~1,100-row validation set instead of ~150, and every epoch pays for scoring it.
+    # Capped to the AB/AG-restricted pool's usual size so a general-val run costs the same
+    # per epoch as every other run in this project, not so it can see less of the corpus --
+    # it still trains on all of it; only the validation-carving budget is capped.
+    GENERAL_VAL_CAP = 750
+    denom = len(cand) if val_restrict_abag else min(len(cand), GENERAL_VAL_CAP)
+    target, taken, val_cx = VAL_FRACTION * denom, 0, set()
     for c in cx:
         if taken >= target or len(val_cx) >= len(cx) - 1:
             break
@@ -651,6 +664,22 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
               f"struct {cfg.in_str} -> {cfg.in_str // cfg.group_reduce * cfg.group_out}",
               flush=True)
     model = make_model(cfg).to(device)
+    if init_ckpt:
+        # Transfer from a full-SKEMPI pretrain checkpoint. Loaded by NAME AND SHAPE, not
+        # strict: the pretrain config has chem_dim=0 (full-SKEMPI's cache only has the 21
+        # base chem columns, not the AB/AG-specific 33/39-col enriched table), so the head's
+        # first Linear -- the only layer chem touches, since chem is concatenated onto the
+        # FiLM output right before the head -- has a different input width here than in the
+        # checkpoint and is left randomly initialised. Every other tensor (the sequence and
+        # structure FiLM backbone, chem-agnostic by construction) transfers exactly.
+        ckpt = torch.load(init_ckpt, map_location=device)
+        own = model.state_dict()
+        matched = {k: v for k, v in ckpt.items() if k in own and own[k].shape == v.shape}
+        fresh = [k for k in own if k not in matched]
+        model.load_state_dict(matched, strict=False)
+        print(f"  fold {fold} seed {seed}: init from {init_ckpt} -- "
+              f"{len(matched)}/{len(own)} tensors transferred, "
+              f"{len(fresh)} fresh: {fresh}", flush=True)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)  # WD/LR set from argv
     if getattr(cfg, "ordinal", 0):
@@ -728,6 +757,10 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
                 break
     if state:
         model.load_state_dict(state)
+    if save_ckpt:
+        Path(save_ckpt).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), save_ckpt)
+        print(f"  fold {fold} seed {seed}: saved checkpoint to {save_ckpt}", flush=True)
     model.eval(); ids, yp, yt = [], [], []
     with torch.no_grad():
         for b in te:
@@ -776,6 +809,15 @@ def main():
                     help="AdamW weight decay; the ladder has always used 1e-2")
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--patience", type=int, default=None)
+    ap.add_argument("--init-ckpt-dir", default=None,
+                    help="load f{fold}_s{seed}.pt from this dir before training each fold "
+                         "-- a pretrain->finetune transfer. Config must match exactly.")
+    ap.add_argument("--save-ckpt-dir", default=None,
+                    help="save f{fold}_s{seed}.pt to this dir after each fold's early "
+                         "stopping -- pairs with a later --init-ckpt-dir run elsewhere.")
+    ap.add_argument("--general-val", action="store_true",
+                    help="do not restrict early-stopping validation to is_abag rows -- for "
+                         "a full-SKEMPI pretrain stage, where the point is the general task")
     ap.add_argument("--clip", type=float, default=4.0,
                     help="clip |ddG| to this, in training and in scoring; 0 disables")
     a = ap.parse_args()
@@ -879,9 +921,15 @@ def main():
         for seed in a.seeds:
             if (fold, seed) in done:
                 print(f"  fold {fold} seed {seed}: reused", flush=True); continue
+            init_ckpt = (str(Path(a.init_ckpt_dir) / f"f{fold}_s{seed}.pt")
+                        if a.init_ckpt_dir else None)
+            save_ckpt = (str(Path(a.save_ckpt_dir) / f"f{fold}_s{seed}.pt")
+                        if a.save_ckpt_dir else None)
             ids, yt, yp, eps, mins, npar = run_fold(rows, fold, seed, cfg, cache, a.exp,
                                                     device, a.max_epochs, augment,
-                                                    a.select_on, model_cls)
+                                                    a.select_on, model_cls,
+                                                    init_ckpt=init_ckpt, save_ckpt=save_ckpt,
+                                                    val_restrict_abag=not a.general_val)
             recs.append(dict(exp=a.exp, split="frozen5", fold=fold, seed=seed,
                              n_train=int((rows.fold != fold).sum()), n_test=len(ids),
                              pearson=pear(yp, yt),

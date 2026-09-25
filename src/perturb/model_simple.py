@@ -722,6 +722,50 @@ class SiteTokenConfig:
     #: GELU on pair_ffn's OWN output, before the sum -- off by default (the mul variant
     #: was asked to stay linear there), on for the sub variant by request.
     mut_pair_act: bool = False
+    #: mut_pair_ffn only. tok_proj's first Linear is keyed by side (ab/ag) but NOT by
+    #: mutant-vs-wild-type -- LN(mt) and LN(wt) both come out of the SAME map before being
+    #: subtracted. That is the identical weight-sharing this project's own rule (never
+    #: share the first linear layer between modalities) already argues against for ab/ag
+    #: and for structure; mutant and wild-type are arguably just as separate a modality
+    #: pair (before- and after-mutation), just never split. When True, mt and wt each get
+    #: their own Linear per side (4 total: ab_mt, ab_wt, ag_mt, ag_wt) instead of sharing
+    #: tok_proj's map.
+    split_mutwt: bool = False
+    #: mut_pair_ffn only. Injects one more feature INTO the mutation's own projection --
+    #: added to p_mt, before LN and the mt-wt subtraction -- rather than pooled and
+    #: concatenated after the whole backbone the way bsite_extra's modes are. The
+    #: subtraction only ever saw "what changed" between mt and wt; this lets the mutated
+    #: residue's own local environment shape that comparison directly. Every mode below is
+    #: computed from tensors already in the batch (the crop's Ca distance matrix, site/mask
+    #: flags, residue indices) -- no new precomputation.
+    #:
+    #:   dist_to_site       the mutated residue's own minimum Ca distance to the nearest
+    #:                      residue on the OTHER side -- 0 at the interface, large if buried
+    #:   contacts_8a        count of partner-chain residues within 8A -- local contact
+    #:                      density AT the mutation, hard cutoff
+    #:   contacts_soft      sum of exp(-dist/4) over partner-chain residues -- the same idea
+    #:                      without a hard cutoff, so nearer contacts count more smoothly
+    #:   rel_seq_pos        the mutated residue's fractional position along its OWN chain
+    #:                      (original residue index, min-max normalised within the crop) --
+    #:                      N-terminal vs C-terminal vs mid-chain
+    #:   burial_rank        percentile rank of dist_to_site among all same-side crop
+    #:                      residues -- normalises away how large or tight this particular
+    #:                      interface is, which the raw distance conflates
+    #:   dist_delta_mean    dist_to_site MINUS the crop-wide mean ab-ag Ca distance -- is
+    #:                      this mutation closer to the interface than "typical" for this
+    #:                      complex, not just closer in absolute terms
+    #:   local_seq_density  count of same-side crop residues within +-5 sequence positions
+    #:                      -- a loop (sparse crop, low density) vs a densely-sampled
+    #:                      alanine-scan region
+    #:   nearest_partner_struct  the actual ProteinMPNN embedding of the single nearest
+    #:                      partner-chain residue, projected and added -- not just HOW close
+    #:                      the interface is but WHAT is there
+    #:   is_at_interface    smooth sigmoid((8 - dist_to_site) / 2) -- a differentiable
+    #:                      "is this basically a contact residue," softer than contacts_8a
+    #:   n_mut_row          how many residues are mutated simultaneously in this row --
+    #:                      lets the projection condition on single- vs multi-point before
+    #:                      the sites are summed, not just implicitly via the sum itself
+    mut_feat: str = "none"
     #: Extends mut_pair_ffn (meant for mut_pair_op="sub") with a structural cross-
     #: attention term, concatenated with the sequence term before the mlp.
     #:
@@ -809,6 +853,13 @@ class SiteTokenConfig:
     #:                 at the mutated residue
     #:   mean_dist_crop scalar: the average ab-ag Ca distance over the whole crop -- how
     #:                 tight the interface is overall
+    #:   mut_dist_to_site scalar: the mutated residue's OWN distance to the binding site --
+    #:                 the minimum Ca distance from the mutated residue (whichever side it
+    #:                 is on) to the nearest residue on the OTHER side. min_dist_crop asks
+    #:                 how tight the interface is anywhere in the crop; this asks where the
+    #:                 mutation sits relative to it -- 0 if the mutation IS the contact
+    #:                 residue, large if it is buried away from the interface even though
+    #:                 the crop itself has a tight contact elsewhere.
     bsite_extra: str = "none"
 
     #: Give each input its OWN first linear layer instead of one shared map.
@@ -982,6 +1033,15 @@ class PerturbSiteToken(nn.Module):
         if c.mut_pair_ffn:
             self.pair_ln = nn.LayerNorm(w, elementwise_affine=False)  # no params, so one
             self.pair_ffn = nn.Linear(w, w)                           # instance is fine
+            self.proj_mutwt = (
+                nn.ModuleDict({f"{side}_{which}": nn.Linear(seq_in, c.proj, bias=False)
+                               for side in ("ab", "ag") for which in ("mt", "wt")})
+                if getattr(c, "split_mutwt", False) else None)
+            mf = getattr(c, "mut_feat", "none")
+            if mf == "nearest_partner_struct":
+                self.mut_feat_proj = self._make_struct_proj(c, seq_in, w)
+            elif mf != "none":
+                self.mut_feat_proj = nn.Linear(1, w)
             d = w
             if c.mut_pair_struct_xattn:
                 self.mpnn_proj = self._make_struct_proj(c, seq_in, w)
@@ -1015,7 +1075,7 @@ class PerturbSiteToken(nn.Module):
                         d = w * 2
                     elif bx == "crop_size":
                         d = w + 2                # one scalar per side
-                    elif bx in ("min_dist_crop", "mean_dist_crop"):
+                    elif bx in ("min_dist_crop", "mean_dist_crop", "mut_dist_to_site"):
                         d = w + 1                # one scalar, both sides combined
                 elif mode == "gated_site":
                     self.gate = nn.Linear(2 * w, w)
@@ -1148,8 +1208,19 @@ class PerturbSiteToken(nn.Module):
             # the activation sits on the INITIAL projection, not on pair_ffn's output --
             # local to this check, not on the shared proj_side every other architecture
             # in this file reads unactivated
-            p_mt = torch.nn.functional.gelu(tok_proj(px(batch[f"seq_{side}_mt"]), side))
-            p_wt = torch.nn.functional.gelu(tok_proj(px(batch[f"seq_{side}_wt"]), side))
+            if self.proj_mutwt is not None:
+                p_mt = torch.nn.functional.gelu(
+                    self.proj_mutwt[f"{side}_mt"](px(batch[f"seq_{side}_mt"])))
+                p_wt = torch.nn.functional.gelu(
+                    self.proj_mutwt[f"{side}_wt"](px(batch[f"seq_{side}_wt"])))
+            else:
+                p_mt = torch.nn.functional.gelu(tok_proj(px(batch[f"seq_{side}_mt"]), side))
+                p_wt = torch.nn.functional.gelu(tok_proj(px(batch[f"seq_{side}_wt"]), side))
+            if getattr(c, "mut_feat", "none") != "none":
+                # Added to p_mt ONLY (not p_wt): this is a property of where the mutated
+                # residue sits, not of the wild-type sequence, so it has no business
+                # shifting the comparison's other side.
+                p_mt = p_mt + self._mut_feat_bias(batch, px, side)
             n_mt, n_wt = self.pair_ln(p_mt), self.pair_ln(p_wt)
             comb = (n_mt - n_wt) if c.mut_pair_op == "sub" else (n_mt * n_wt)
             h = self.pair_ffn(comb)
@@ -1157,6 +1228,82 @@ class PerturbSiteToken(nn.Module):
                 h = torch.nn.functional.gelu(h)
             acc = acc + (h * site).sum(1)
         return acc
+
+    def _mut_feat_bias(self, batch, px, side: str) -> torch.Tensor:
+        """(B, L, w) bias for p_mt, from SiteTokenConfig.mut_feat -- see its docstring."""
+        c = self.cfg
+        if c.mut_feat == "nearest_partner_struct":
+            other = "ag" if side == "ab" else "ab"
+            dist = batch["dist"]                                  # (B, Lab, Lag)
+            valid = dist < 90.0
+            masked = torch.where(valid, dist, torch.full_like(dist, 1e4))
+            nn_idx = masked.argmin(dim=2) if side == "ab" else masked.argmin(dim=1)
+            st_other = px(batch[f"struct_{other}"])                # (B, L_other, struct_dim)
+            feat = torch.gather(st_other, 1,
+                                nn_idx.unsqueeze(-1).expand(-1, -1, st_other.shape[-1]))
+            proj = self.mut_feat_proj
+            return proj[side](feat) if isinstance(proj, nn.ModuleDict) else proj(feat)
+        return self.mut_feat_proj(self._mut_feat_scalar(batch, side).unsqueeze(-1))
+
+    def _mut_feat_scalar(self, batch, side: str) -> torch.Tensor:
+        """(B, L) scalar feature per residue on `side`. Meaningful only at site positions;
+        the caller's site mask zeroes out everywhere else at aggregation."""
+        mf = self.cfg.mut_feat
+        dist = batch["dist"]                                      # (B, Lab, Lag), pad=99.0
+        valid = dist < 90.0
+        masked = torch.where(valid, dist, torch.full_like(dist, 1e4))
+        d_to_other = masked.min(dim=2).values if side == "ab" else masked.min(dim=1).values
+
+        if mf == "dist_to_site":
+            return d_to_other
+
+        if mf in ("contacts_8a", "contacts_soft"):
+            d_full = masked if side == "ab" else masked.transpose(1, 2)     # (B, L, L_other)
+            valid_full = valid if side == "ab" else valid.transpose(1, 2)
+            if mf == "contacts_8a":
+                return ((d_full < 8.0) & valid_full).float().sum(dim=2)
+            w_ = torch.where(valid_full, torch.exp(-d_full / 4.0), torch.zeros_like(d_full))
+            return w_.sum(dim=2)
+
+        if mf == "rel_seq_pos":
+            res = batch[f"res_{side}"].float()
+            mask = batch[f"mask_{side}"].bool()
+            lo = torch.where(mask, res, torch.full_like(res, 1e9)).min(dim=1, keepdim=True).values
+            hi = torch.where(mask, res, torch.full_like(res, -1e9)).max(dim=1, keepdim=True).values
+            return ((res - lo) / (hi - lo).clamp(min=1.0)).clamp(0, 1)
+
+        if mf == "burial_rank":
+            mask = batch[f"mask_{side}"].bool()
+            d_masked = torch.where(mask, d_to_other, torch.full_like(d_to_other, 1e9))
+            order = d_masked.argsort(dim=1)
+            ranks = torch.zeros_like(d_to_other)
+            arangev = torch.arange(d_to_other.shape[1],
+                                   device=d_to_other.device).float().unsqueeze(0)
+            ranks.scatter_(1, order, arangev.expand_as(order))
+            n = mask.float().sum(dim=1, keepdim=True)
+            return (ranks / (n - 1).clamp(min=1)).clamp(0, 1)
+
+        if mf == "dist_delta_mean":
+            denom = valid.reshape(valid.shape[0], -1).sum(1, keepdim=True).clamp(min=1)
+            mean_d = (dist * valid).reshape(dist.shape[0], -1).sum(1, keepdim=True) / denom
+            return d_to_other - mean_d
+
+        if mf == "local_seq_density":
+            res = batch[f"res_{side}"].float()
+            mask = batch[f"mask_{side}"].bool()
+            diff = (res.unsqueeze(-1) - res.unsqueeze(1)).abs()             # (B, L, L)
+            near = (diff <= 5.0) & mask.unsqueeze(1) & mask.unsqueeze(-1)
+            return near.float().sum(dim=2) - 1.0                            # exclude self
+
+        if mf == "is_at_interface":
+            return torch.sigmoid((8.0 - d_to_other) / 2.0)
+
+        if mf == "n_mut_row":
+            total = batch["site_ab"].sum(dim=1, keepdim=True).float() + \
+                    batch["site_ag"].sum(dim=1, keepdim=True).float()
+            return total.expand(-1, d_to_other.shape[1])
+
+        raise ValueError(f"unknown mut_feat: {mf!r}")
 
     def _make_struct_proj(self, c, seq_in, w):
         """The structure encoder's first linear layer -- split per side when split_proj is
@@ -1203,6 +1350,26 @@ class PerturbSiteToken(nn.Module):
             else:
                 denom = valid.reshape(valid.shape[0], -1).sum(1, keepdim=True).clamp(min=1)
                 stat = (dist * valid).reshape(dist.shape[0], -1).sum(1, keepdim=True) / denom
+            return torch.cat([z, stat], dim=-1)
+
+        if bx == "mut_dist_to_site":
+            # Not "how tight is the interface anywhere in this crop" (min_dist_crop) but
+            # "how close is THIS mutation to it" -- the mutated residue's own minimum Ca
+            # distance to the nearest residue on the other side. A mutation can sit right at
+            # a tight interface or be buried elsewhere in a crop that happens to contact
+            # tightly somewhere else; min_dist_crop cannot tell those apart, this can.
+            dist = batch["dist"]                                  # (B, Lab, Lag), pad=99.0
+            valid = dist < 90.0
+            big = torch.full_like(dist, 1e4)
+            masked = torch.where(valid, dist, big)
+            site_ab, site_ag = batch["site_ab"].bool(), batch["site_ag"].bool()
+            d_ab_to_ag = masked.min(dim=2).values                 # (B, Lab) nearest ag contact
+            d_ag_to_ab = masked.min(dim=1).values                 # (B, Lag) nearest ab contact
+            min_ab = torch.where(site_ab, d_ab_to_ag,
+                                  torch.full_like(d_ab_to_ag, 1e4)).min(dim=1, keepdim=True).values
+            min_ag = torch.where(site_ag, d_ag_to_ab,
+                                  torch.full_like(d_ag_to_ab, 1e4)).min(dim=1, keepdim=True).values
+            stat = torch.minimum(min_ab, min_ag)                  # every row has >=1 mutation
             return torch.cat([z, stat], dim=-1)
 
         if bx == "crop_concat":
