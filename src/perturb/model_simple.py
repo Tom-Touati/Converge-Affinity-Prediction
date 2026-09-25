@@ -360,6 +360,15 @@ class SiteTokenConfig:
     """
 
     pca_dim: int = 128
+    #: The structure PCA's REAL output width, when it differs from pca_dim. PCA cannot
+    #: produce more components than the raw input has, so a raw structure encoder narrower
+    #: than pca_dim (ProteinMPNN, 128-d) silently caps there -- invisible whenever pca_dim
+    #: is also 128, which is why this went unnoticed until pca_dim=256 was tried and
+    #: mpnn_proj (built for width pca_dim) met a 128-wide tensor instead. The trainer sets
+    #: this from the fitted PCA's own n_components_ before constructing the model; 0 means
+    #: "use pca_dim", which stays correct whenever the raw structure width is >= pca_dim
+    #: (ESM-IF1's 512-d encoder, or ProteinMPNN's 128-d one at pca_dim<=128).
+    struct_pca_dim: int = 0
     #: A shared Linear applied to every token after the PCA, before anything is pooled.
     #: 0 leaves the PCA components as they are. Projecting first means the subtraction
     #: below happens in a learned space rather than in PCA coordinates, and the same map
@@ -919,7 +928,7 @@ class PerturbSiteToken(nn.Module):
             # an instance constant on CrossAttn, and the main self.attn (built below, if
             # this were combined with delta_xattn) keeps the ordinary residual, so this
             # cannot reuse it.
-            self.mpnn_proj = nn.Linear(seq_in, w, bias=False)
+            self.mpnn_proj = nn.Linear(c.struct_pca_dim or seq_in, w, bias=False)
             self.struct_attn = CrossAttn(w, c.n_heads, c.dropout, res_pre=0.0, res_post=1.0)
             blocks: list[nn.Module] = []
             d = w * 2                          # sequence term (w) concat structure term (w)
@@ -940,13 +949,13 @@ class PerturbSiteToken(nn.Module):
             self.pair_ffn = nn.Linear(w, w)                           # instance is fine
             d = w
             if c.mut_pair_struct_xattn:
-                self.mpnn_proj = nn.Linear(seq_in, w, bias=False)
+                self.mpnn_proj = nn.Linear(c.struct_pca_dim or seq_in, w, bias=False)
                 self.diff_attn = CrossAttn(w, c.n_heads, c.dropout,
                                            rope=True, rope_base=c.rope_base)
                 d = w * 2                       # sequence term concat structure term
             mode = c.mut_pair_struct_inject
             if mode != "none":
-                self.mpnn_proj = nn.Linear(seq_in, w, bias=False)
+                self.mpnn_proj = nn.Linear(c.struct_pca_dim or seq_in, w, bias=False)
                 self.struct_ln = nn.LayerNorm(w, elementwise_affine=False)
                 if mode in ("site_concat", "crop_concat", "nn_diff_concat"):
                     d = w * 2
@@ -997,7 +1006,7 @@ class PerturbSiteToken(nn.Module):
                 nn.init.zeros_(lin.bias)
         # K and V must arrive at the attention's width, so this maps to w, not to a free
         # choice -- mpnn_proj is a flag for WHETHER it is separate, not for how wide.
-        str_in = self.gr_str.out_dim if self.gr_str is not None else c.pca_dim
+        str_in = self.gr_str.out_dim if self.gr_str is not None else (c.struct_pca_dim or c.pca_dim)
         # Always separate when structure is read at all: falling back to the sequence
         # projection is exactly the weight sharing this is meant to avoid.
         # gated_fusion belongs here and was missing: without it no separate structure

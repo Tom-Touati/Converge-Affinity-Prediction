@@ -851,6 +851,18 @@ def main():
           f"grad_clip {GRAD_CLIP}", flush=True)
 
     cache = Cache()
+    if hasattr(cfg, "struct_pca_dim"):
+        # PCA cannot produce more components than the raw structure encoder has, so this
+        # caps silently at whichever is smaller -- invisible whenever pca_dim happens to
+        # equal the raw width (ProteinMPNN, 128-d, the project's default), which is why it
+        # went unnoticed until a wider pca_dim or a wider encoder (ESM-IF1, 512-d) was
+        # tried. Probed from one real complex rather than assumed, since STRUCT_DIR decides
+        # the raw width and nothing here is meant to hardcode which encoder that is.
+        raw_w = cache.mpnn(rows.complex_key.iloc[0])[0].shape[-1]
+        cfg.struct_pca_dim = min(cfg.pca_dim, raw_w)
+        if cfg.struct_pca_dim != cfg.pca_dim:
+            print(f"  structure raw width {raw_w} < pca_dim {cfg.pca_dim}: "
+                  f"struct_pca_dim capped to {cfg.struct_pca_dim}", flush=True)
     OUT.mkdir(parents=True, exist_ok=True)
     print(f"=== {a.exp} === {len(rows)} rows, device {device}", flush=True)
 

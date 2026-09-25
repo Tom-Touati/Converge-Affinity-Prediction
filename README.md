@@ -77,10 +77,22 @@ Two honest caveats before treating this as settled. **Seed spread is 0.092**, wi
 this model should be read as +0.314 ± 0.09, not +0.369. **Stabilising recall is 0.24**, well
 below `st64_nopca_grouped`'s 0.48 — this model is not the answer if the downstream task is
 *finding* affinity-improving mutations rather than ranking known ones; that recommendation is
-unchanged from before. It has not yet been run on the homology-cluster split (below) or through
-the full bias/error-analysis battery in [ERROR_ANALYSIS.md](ERROR_ANALYSIS.md); those numbers
-there still describe `cat128_reg2_l1` and are flagged as pending an update, not silently
-carried over.
+unchanged from before.
+
+**Now measured on a real homology-cluster split** (17 clusters from 53 complexes,
+`data/cluster_folds.csv`, 4 folds greedily balanced by row count — `experiments/protattba_repro/
+_perturb_v2_colab.py --fold-map`): ensemble **+0.272**, 74% of the standard-split score, seed
+spread 0.034. `gated_cg_clusterscale` was run the same way for comparison: +0.214, 62%
+retained, spread 0.113 — `struct_film_chem` degrades less under the harder split, not just
+scores higher on the easier one. This is a **different cluster assignment and a different
+metric convention** (ensemble Pearson here; the "Generalisation under a homology split" table
+below reports per-complex Spearman on whatever split produced it, and this document does not
+establish the two splits are identical) — read as a second, independent cluster-holdout
+measurement, not a replacement number for that table.
+
+The full bias/error-analysis battery in [ERROR_ANALYSIS.md](ERROR_ANALYSIS.md) has not been
+re-run against the new model; those numbers there still describe `cat128_reg2_l1` and are
+flagged as pending an update, not silently carried over.
 
 `ens` averages the seeds then scores once — what you would ship. `per seed` scores each seed
 separately — what one training run gives you. **`spread` is max − min across seeds, and it is
@@ -329,9 +341,13 @@ Three seeds each, per-complex Spearman:
 Everything degrades; the network degrades most, and 11 of its complexes finish with a
 *negative* within-complex correlation. **The embedding-based model was leaning on homology the
 cluster split withholds.** This is the single most important caveat on the neural result, and
-it is measured on `cat128_reg2_l1` specifically — **`struct_film_chem` has not yet been run on
-the cluster split.** It shares the same encoders and the same crop, so this caveat likely still
-applies, but that is an expectation, not a measurement, and is flagged rather than assumed.
+it is measured on `cat128_reg2_l1` specifically, on this table's own split and metric
+(Spearman). `struct_film_chem` has since been run on a homology-cluster split too — a
+separately-built one (§1: `data/cluster_folds.csv`, ensemble Pearson, not directly comparable
+to this table's numbers) — and the caveat holds there as well: it retains 74% of its standard-
+split score, degrading less than `gated_cg_clusterscale`'s 62% but still degrading. The
+expectation in this paragraph is no longer unmeasured for the current model, even though it
+is not measured on *this specific* split.
 
 ### Where the neural model is better
 
