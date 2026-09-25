@@ -194,7 +194,12 @@ class Cache:
 
     def mpnn(self, key):
         if key not in self._mpnn:
-            z = np.load(ROOT / "mpnn_per_residue" / f"{key}.npz", allow_pickle=False)
+            # STRUCT_DIR swaps the structure encoder without touching a single line below
+            # this: esmif_per_residue/ has the same h_ab/h_ag layout ProteinMPNN's cache
+            # does (same complexes, same chain order, same padding-free residue count),
+            # built that way on purpose so nothing downstream needs to know which one it is.
+            d = os.environ.get("STRUCT_DIR", "mpnn_per_residue")
+            z = np.load(ROOT / d / f"{key}.npz", allow_pickle=False)
             self._mpnn[key] = (z["h_ab"].astype(np.float32), z["h_ag"].astype(np.float32))
         return self._mpnn[key]
 
@@ -247,7 +252,11 @@ def fold_pca(rows, fold, cache, dim, seed=0):
               flush=True)
         return Identity(w_ab), Identity(w_ag), Identity(w_st)
     PCA_DIR.mkdir(parents=True, exist_ok=True)
-    f = PCA_DIR / f"fold{fold}_pca{dim}_{SEQ_AB}_{PCA_ROWS}.joblib"
+    # STRUCT_DIR in the key: a cached fit from ProteinMPNN's 128-d features is invalid for
+    # ESM-IF1's 512-d ones, and sklearn's error for that (n_features mismatch) fires at
+    # transform time deep in training, not here where the mistake actually is
+    struct_tag = os.environ.get("STRUCT_DIR", "mpnn_per_residue")
+    f = PCA_DIR / f"fold{fold}_pca{dim}_{SEQ_AB}_{PCA_ROWS}_{struct_tag}.joblib"
     if f.exists():
         return joblib.load(f)
     from sklearn.decomposition import PCA
