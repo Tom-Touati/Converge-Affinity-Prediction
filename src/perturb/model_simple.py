@@ -776,6 +776,41 @@ class SiteTokenConfig:
     #:                      (a raw number, not an embedding of one)
     mut_pair_struct_inject: str = "none"
 
+    #: Ten ways to add BINDING-SITE information -- the whole crop, not just the mutated
+    #: residue -- on top of mut_pair_struct_inject="film_site". Each computes the same
+    #: site-level FiLM first (unchanged), then combines a crop-level term into it. "none"
+    #: is plain film_site, no addition.
+    #:
+    #: LEARNED, from the crop's structural embeddings:
+    #:   crop_concat   structure pooled over the whole crop (mask, not site), projected,
+    #:                 concatenated after the FiLM output
+    #:   crop_film2    a SECOND FiLM stage, gamma2/beta2 from crop-pooled structure,
+    #:                 applied to the site-FiLM'd vector: two nested gates, mutated-site
+    #:                 then binding-site
+    #:   crop_gate     a learned sigmoid gate from crop-pooled structure scales an
+    #:                 additive crop-pooled term, added post-FiLM (gated concat, not FiLM)
+    #:   crop_xattn    the FiLM'd vector, as a length-1 query, cross-attends over every
+    #:                 crop structural token (not just the mutated ones); RoPE'd. Output
+    #:                 concatenated
+    #:   crop_wpool    structure pooled over the crop, but distance-WEIGHTED toward the
+    #:                 mutated residue (inverse-distance softmax) rather than uniform --
+    #:                 a smooth interpolation between site_mean and a flat crop mean
+    #:   crop_std      the STANDARD DEVIATION of structural embeddings across the crop,
+    #:                 concatenated -- how variable the local environment is, not just
+    #:                 its mean
+    #:   nn_diff_crop  the ag-vs-nearest-ab structural difference (the same nearest-
+    #:                 neighbour pairing nn_diff_concat uses), mean-pooled over the WHOLE
+    #:                 crop instead of only the mutated residues
+    #:
+    #: PURE GEOMETRY, from the crop's own Ca distance matrix, no learned embedding:
+    #:   crop_size     scalar per side: how many residues are in the crop -- how large
+    #:                 this binding site is
+    #:   min_dist_crop scalar: the tightest ab-ag contact anywhere in the crop, not just
+    #:                 at the mutated residue
+    #:   mean_dist_crop scalar: the average ab-ag Ca distance over the whole crop -- how
+    #:                 tight the interface is overall
+    bsite_extra: str = "none"
+
     #: Give each input its OWN first linear layer instead of one shared map.
     #:
     #: A shared projection forces the antibody, the antigen and ProteinMPNN into a single
@@ -961,6 +996,27 @@ class PerturbSiteToken(nn.Module):
                     d = w * 2
                 elif mode == "film_site":
                     self.film = nn.Linear(w, 2 * w)                 # -> gamma, beta
+                    bx = c.bsite_extra
+                    if bx != "none":
+                        self.bsite_mpnn_proj = self._make_struct_proj(c, seq_in, w)
+                        self.bsite_ln = nn.LayerNorm(w, elementwise_affine=False)
+                    if bx in ("crop_concat", "crop_wpool", "crop_std", "nn_diff_crop"):
+                        d = w * 2
+                    elif bx == "crop_film2":
+                        self.film2 = nn.Linear(w, 2 * w)
+                    elif bx == "crop_gate":
+                        self.bsite_gate = nn.Linear(2 * w, w)
+                        self.bsite_gate_val = nn.Linear(w, w, bias=False)
+                    elif bx == "crop_xattn":
+                        # no RoPE: the query is the pooled, site-FiLM'd vector, which has
+                        # no single residue position of its own -- CrossAttn's own rule is
+                        # both sides carry a position or neither does
+                        self.bsite_attn = CrossAttn(w, c.n_heads, c.dropout)
+                        d = w * 2
+                    elif bx == "crop_size":
+                        d = w + 2                # one scalar per side
+                    elif bx in ("min_dist_crop", "mean_dist_crop"):
+                        d = w + 1                # one scalar, both sides combined
                 elif mode == "gated_site":
                     self.gate = nn.Linear(2 * w, w)
                     self.gate_val = nn.Linear(w, w, bias=False)
@@ -1119,6 +1175,105 @@ class PerturbSiteToken(nn.Module):
         p = self.mpnn_proj
         return p[side](x) if isinstance(p, nn.ModuleDict) else p(x)
 
+    def _bsite_extra(self, batch, px, z) -> torch.Tensor:
+        """Add ONE binding-site (whole-crop) term to the site-FiLM'd vector z. Ten modes,
+        see SiteTokenConfig.bsite_extra. z is already (1+gamma)*z_seq + beta.
+        """
+        c = self.cfg
+        bx = c.bsite_extra
+        gelu = torch.nn.functional.gelu
+
+        def crop_struct(side):
+            st = px(batch[f"struct_{side}"])
+            return self.bsite_ln(gelu(self.bsite_mpnn_proj[side](st)
+                                      if isinstance(self.bsite_mpnn_proj, nn.ModuleDict)
+                                      else self.bsite_mpnn_proj(st)))
+
+        if bx in ("crop_size", "min_dist_crop", "mean_dist_crop"):
+            dist = batch["dist"]                                  # (B, Lab, Lag), pad=99.0
+            valid = dist < 90.0
+            if bx == "crop_size":
+                n_ab = batch["mask_ab"].sum(1, keepdim=True)
+                n_ag = batch["mask_ag"].sum(1, keepdim=True)
+                return torch.cat([z, n_ab, n_ag], dim=-1)
+            big = torch.full_like(dist, 1e4)
+            masked = torch.where(valid, dist, big)
+            if bx == "min_dist_crop":
+                stat = masked.reshape(masked.shape[0], -1).min(dim=1, keepdim=True).values
+            else:
+                denom = valid.reshape(valid.shape[0], -1).sum(1, keepdim=True).clamp(min=1)
+                stat = (dist * valid).reshape(dist.shape[0], -1).sum(1, keepdim=True) / denom
+            return torch.cat([z, stat], dim=-1)
+
+        if bx == "crop_concat":
+            z_crop = 0
+            for side in ("ab", "ag"):
+                z_crop = z_crop + site_mean(crop_struct(side), batch[f"mask_{side}"])
+            return torch.cat([z, z_crop], dim=-1)
+
+        if bx == "crop_film2":
+            z_crop = 0
+            for side in ("ab", "ag"):
+                z_crop = z_crop + site_mean(crop_struct(side), batch[f"mask_{side}"])
+            gamma2, beta2 = self.film2(z_crop).chunk(2, dim=-1)
+            return (1 + gamma2) * z + beta2
+
+        if bx == "crop_gate":
+            z_crop = 0
+            for side in ("ab", "ag"):
+                z_crop = z_crop + site_mean(crop_struct(side), batch[f"mask_{side}"])
+            g = torch.sigmoid(self.bsite_gate(torch.cat([z, z_crop], dim=-1)))
+            return z + g * self.bsite_gate_val(z_crop)
+
+        if bx == "crop_xattn":
+            out_acc = 0
+            for side in ("ab", "ag"):
+                kv = crop_struct(side)
+                q = z.unsqueeze(1)                                # (B, 1, w) -- length-1 query
+                out = self.bsite_attn(q, kv, batch[f"mask_{side}"].bool())
+                out_acc = out_acc + out.squeeze(1)
+            return torch.cat([z, out_acc], dim=-1)
+
+        if bx == "crop_wpool":
+            z_wp = 0
+            for side in ("ab", "ag"):
+                st = crop_struct(side)                            # (B, L, w)
+                res = batch[f"res_{side}"].float()                # true residue index
+                site = batch[f"site_{side}"]                      # (B, L)
+                mask = batch[f"mask_{side}"]
+                has_site = (site.sum(1, keepdim=True) > 0)
+                # distance (in residues) from every crop position to the NEAREST mutated
+                # one on the same chain; site rows contribute 0, so they always win
+                site_res = torch.where(site.bool(), res, torch.full_like(res, 1e4))
+                d_to_site = (res.unsqueeze(-1) - site_res.unsqueeze(1)).abs().min(dim=-1).values
+                w_logits = torch.where(mask.bool(), -d_to_site / 10.0, torch.full_like(res, -1e9))
+                weights = torch.softmax(w_logits, dim=1).unsqueeze(-1)
+                pooled = (st * weights).sum(1)
+                z_wp = z_wp + pooled * has_site.float()
+            return torch.cat([z, z_wp], dim=-1)
+
+        if bx == "crop_std":
+            z_std = 0
+            for side in ("ab", "ag"):
+                st = crop_struct(side)
+                mask = batch[f"mask_{side}"].unsqueeze(-1)
+                n = mask.sum(1, keepdim=True).clamp(min=1.0)
+                mean = (st * mask).sum(1, keepdim=True) / n
+                var = ((st - mean) ** 2 * mask).sum(1) / n.squeeze(1)
+                z_std = z_std + var.clamp(min=1e-8).sqrt()
+            return torch.cat([z, z_std], dim=-1)
+
+        if bx == "nn_diff_crop":
+            dist = batch["dist"]
+            st_ab, st_ag = crop_struct("ab"), crop_struct("ag")
+            nn_for_ag = dist.argmin(dim=1, keepdim=True).squeeze(1).unsqueeze(-1)
+            nn_ab = torch.gather(st_ab, 1, nn_for_ag.expand(-1, -1, st_ab.shape[-1]))
+            diff = st_ag - nn_ab
+            z_diff = site_mean(diff, batch["mask_ag"])           # whole crop, not just site
+            return torch.cat([z, z_diff], dim=-1)
+
+        raise ValueError(f"unknown bsite_extra: {bx!r}")
+
     def _mut_pair_struct(self, batch, px, tok_proj) -> torch.Tensor:
         """ag-indexed structural diffs (ag minus nearest ab, geometry) as keys/values;
         the mutation tokens (LN(mt)-LN(wt), from either side) as queries. RoPE both sides.
@@ -1182,7 +1337,10 @@ class PerturbSiteToken(nn.Module):
                 st = self.struct_ln(gelu(self.struct_proj(px(batch[f"struct_{side}"]), side)))
                 z_st = z_st + site_mean(st, batch[f"site_{side}"])
             gamma, beta = self.film(z_st).chunk(2, dim=-1)
-            return (1 + gamma) * z_seq + beta
+            z = (1 + gamma) * z_seq + beta
+            if c.bsite_extra != "none":
+                return self._bsite_extra(batch, px, z)
+            return z
 
         if mode == "gated_site":
             z_st = 0
