@@ -5,7 +5,9 @@ appended in the same commit as the code a prompt produced, not reconstructed aft
 
 Tooling: Claude Code (Opus 5) in the Claude desktop app, working directly in this repository.
 
-What it converged on: **`cat128_reg2_l1`** — see [docs/MODEL.md](docs/MODEL.md). The errors and retractions listed at the end of this file are part of the record on purpose; several of them are the reason the submitted model is the simplest one in the family rather than the most elaborate.
+What it converged on: **`struct_film_chem`** — see [docs/DETAILS.md](docs/DETAILS.md#struct_film_chem).
+It superseded `cat128_reg2_l1` ([docs/MODEL.md](docs/MODEL.md)), which held the role for the
+sessions up to 2026-09-24. The errors and retractions listed at the end of this file are part of the record on purpose; several of them are the reason the submitted model is the simplest one in the family rather than the most elaborate.
 
 ---
 

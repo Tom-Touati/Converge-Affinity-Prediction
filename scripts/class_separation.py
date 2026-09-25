@@ -45,17 +45,15 @@ from src import paths  # noqa: E402
 EDGES = (-0.5, 0.5)
 NAMES = ("stabilising", "neutral", "destabilising")
 MODELS = {
-    "forest":    ("reports", "E0a_rf_handcrafted_seed0"),
-    "abag_xat":  ("oof", "ec2_cls_abag_xattn"),
-    "xattn":     ("oof", "ec2_cls_xattn"),
-    "film":      ("oof", "ec2_cls_film"),
-    "areapool":  ("oof", "ec2_cls_areapool"),
-    "sitepool":  ("oof", "ec2_cls_sitepool"),
-    "xattn_rev": ("oof", "ec2_cls_xattn_rev"),
-    # the regression ladder's best, scored the same way so the ordinal head can be told
-    # apart from the architecture it sits on
-    "l1_gated":  ("oof", "l1_gated"),
-    "l1_concat": ("oof", "cat128_reg2_l1"),
+    "forest":       ("reports", "E0a_rf_handcrafted_seed0"),
+    "film_chem":    ("oof", "struct_film_chem"),          # the submitted model
+    "film_esmif":   ("oof", "struct_film_chem_esmif"),
+    "gated_cg":     ("oof", "gated_cg_clusterscale"),
+    "film_nochem":  ("oof", "struct_film_site"),
+    "seq_only":     ("oof", "mut_pair_ffn_sub"),
+    "delta_xattn":  ("oof", "delta_xattn2"),
+    "l1_gated":     ("oof", "l1_gated"),
+    "l1_concat":    ("oof", "cat128_reg2_l1"),            # the previous submission
 }
 
 

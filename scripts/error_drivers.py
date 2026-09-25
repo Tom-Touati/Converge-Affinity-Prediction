@@ -36,11 +36,12 @@ MUT = re.compile(r"^([A-Z])([A-Za-z0-9])(-?\d+[A-Za-z]?)([A-Z])$")
 #: "film_chem" is the SUBMITTED model (was cat128, superseded); the others are there to show
 #: which failures are shared rather than specific to one architecture.
 MODELS = {
-    "forest":    ("reports", "E0a_rf_handcrafted_seed0"),   # the baseline
-    "film_chem": ("oof", "struct_film_chem"),               # the submitted model
-    "cat128":    ("oof", "cat128_reg2_l1"),                 # the previous submission
-    "gated":     ("oof", "l1_gated"),
-    "nopca":     ("oof", "st64_nopca_grouped"),
+    "forest":     ("reports", "E0a_rf_handcrafted_seed0"),   # the baseline
+    "film_chem":  ("oof", "struct_film_chem"),               # the submitted model
+    "film_esmif": ("oof", "struct_film_chem_esmif"),
+    "gated_cg":   ("oof", "gated_cg_clusterscale"),
+    "seq_only":   ("oof", "mut_pair_ffn_sub"),
+    "cat128":     ("oof", "cat128_reg2_l1"),                 # the previous submission
 }
 MIN_ABS = 0.05          # ignore correlations smaller than this in the summary
 

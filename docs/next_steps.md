@@ -1,4 +1,9 @@
-# Next steps, ranked by expected value
+# Next steps, ranked by expected value — *(superseded)*
+
+> **Superseded by [FUTURE_WORK.md](FUTURE_WORK.md)**, which is the current forward plan and
+> reflects everything measured since. This file is the version written after the overnight
+> fusion run; several items in it (per-residue caches, the chemistry block, the homology-cluster
+> split) have since been built. Kept as the record of what was next at that point.
 
 Each item names the evidence from this run that motivates it. Numbers are from
 `results/summary.md` and `results/error_analysis.md` unless stated.

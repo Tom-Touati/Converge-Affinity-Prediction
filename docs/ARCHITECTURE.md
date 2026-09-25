@@ -69,7 +69,8 @@ Two facts to carry forward:
 * **The best model has no learned encoder in its head at all.** 33 scalar features into a random
   forest. **0.475 is the number a neural model has to beat**, not 0.408.
   *(As written, this was the state before the fusion ladder. The submitted model is
-  `cat128_reg2_l1` — see [MODEL.md](MODEL.md) — and it still does not beat the forest at
+  `cat128_reg2_l1`, since superseded by `struct_film_chem` (see [DETAILS.md](DETAILS.md#struct_film_chem);
+  MODEL.md still specifies the older one) — and it still does not beat the forest at
   ranking; that is reported, not buried.)*
 * **Label noise looks like the binding constraint.** The forest beats the boosted trees on
   identical features by +0.069 [+0.002, +0.144] and is far steadier across folds. Bagging beating

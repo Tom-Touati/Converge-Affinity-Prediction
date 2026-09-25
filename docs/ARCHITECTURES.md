@@ -9,6 +9,11 @@ Every number is per-complex Pearson on the frozen by-complex split, scored again
 truth by `scripts/report_runs.py`. Seeds are averaged where more than one exists; the count is
 in the table.
 
+> **Families A–D are the first 45 runs. [Family E](#family-e--the-site-pair-ladder-and-how-the-submitted-model-changed)
+> covers a later phase** (~30 further 3-seed configurations plus a 200-trial single-seed
+> screen) which produced the current submitted model, `struct_film_chem`. Where the two
+> disagree, E is the later measurement and says so explicitly.
+
 > **Read every gap against the seed spread.** Measured at **0.028 to 0.117** depending on
 > configuration (ERROR_ANALYSIS §9). Most rows in this document are separated by less than
 > that. The families tell a story; individual orderings inside a family mostly do not.
@@ -21,7 +26,7 @@ in the table.
 | --- | --- | --- | --- | --- |
 | **A.** full attention model (v2/v3/v4) | `full` | 810,886 | +0.200 | capacity is not the constraint |
 | **B.** pooled-delta MLPs | `mlp_delta_chem_reg` | 85,376 | +0.266 | chem features carry the gain |
-| **C.** site-token fusion ladder | **`cat128_reg2_l1` ← the model** | 36,353 | +0.293 | fusion *mechanism* is not the constraint |
+| **C.** site-token fusion ladder | `cat128_reg2_l1` *(the model, at the time of this table)* | 36,353 | +0.293 | fusion *mechanism* is not the constraint |
 | **D.** random forest on 49 columns | `E0a_rf_handcrafted` | — | **+0.381** | the **baseline** the model is measured against |
 
 The largest model in the project (810k parameters) scores **+0.200**. The best neural model
@@ -91,7 +96,7 @@ a config so exactly one thing changes per run.
 
 | run | params | per-cx r | mechanism |
 | --- | --- | --- | --- |
-| **`cat128_reg2_l1` ← the model** | 36,353 | +0.293 | plain concatenation, one-layer head, **separate projection per modality** |
+| `cat128_reg2_l1` *(the model, at the time of this table)* | 36,353 | +0.293 | plain concatenation, one-layer head, **separate projection per modality** |
 | `l1_gated` | 48,001 | +0.300 | gated fusion — but see the note below: it shares one projection across modalities |
 | `st64_gated_fusion` | 64,513 | +0.282 | gated fusion, two-layer head |
 | `st64_film_struct` | 52,993 | +0.227 | FiLM on the structure delta |
@@ -220,3 +225,101 @@ pay for itself**.
    representation at all.
 4. **Most of this table is inside the noise.** Two runs of one identical configuration differ
    by 0.075. Any ordering here read at finer resolution than that is not a finding.
+
+---
+
+## Family E — the site-pair ladder, and how the submitted model changed
+
+The 45 runs above ended with plain concatenation (`cat128_reg2_l1`, +0.293) as the best
+network, and the conclusion that *fusion mechanism is not the constraint*. A later phase
+(2026-09-24/25, on EC2 rather than Colab) built a different backbone and then swept how to
+attach structure to it. **The conclusion survived in a stronger form than it was stated, and
+one part of it was wrong.**
+
+### E.1 The backbone: drop everything except the mutated residue
+
+| run | params | per-cx r | what it tests |
+| --- | --- | --- | --- |
+| `mut_pair_ffn` (multiply) | 28,993 | +0.014 | LN(mt) × LN(wt) at mutated residues |
+| **`mut_pair_ffn_sub`** | **28,993** | **+0.262** | LN(mt) − LN(wt), otherwise identical |
+
+Per side, at each mutated residue only: project, LayerNorm mutant and wild type separately,
+**subtract**, one shared Linear, GELU, sum over the mutated positions. No structure, no chem,
+no attention, 28,993 parameters — and +0.262, which at the time was third in the project.
+
+**The multiply/subtract pair is the single largest controlled effect measured anywhere in this
+project**: +0.014 against +0.262 from changing one operator. Two mechanisms, both checkable:
+an elementwise product cannot distinguish "both channels silent" from "one channel active, one
+silent" — same near-zero output, opposite meaning — and its gradient with respect to one side
+*is* the other side's value, so a near-zero channel on one side starves the gradient reaching
+the other. A subtraction has neither property.
+
+This was then confirmed at scale: a 200-trial grid (10 injection modes × 2 operators × 2 chem
+states × 5 regularisation presets, single seed each) had **`sub` ahead of `mul` in 91 of 100
+matched pairs, mean advantage +0.149**, and `chem=39` ahead of `chem=0` in **96 of 100**.
+
+### E.2 Eleven ways to attach structure to it
+
+Each row is the same backbone plus one mechanism, 3 seeds, full 5 folds:
+
+| mechanism | per-cx r | note |
+| --- | --- | --- |
+| **FiLM at the mutated site + 39-col chem** (`struct_film_chem`) | **+0.369** | **the submitted model** |
+| FiLM, ESM-IF1 in place of ProteinMPNN | +0.360 | best class separation of anything measured |
+| FiLM at the mutated site, no chem block | +0.340 | |
+| learned gate at the mutated site | +0.318 | |
+| raw scalars: 5 ProteinMPNN zero-shot scores | +0.328 | no learned structure encoder at all |
+| raw scalars: 7 handcrafted geometry columns | +0.315 | |
+| concat, pooled at the mutated site | +0.294 | |
+| concat, pooled over the whole crop | +0.282 | |
+| nearest-ab-residue structural difference, concatenated | +0.277 | |
+| nearest-ab-residue difference, cross-attended (RoPE both sides) | +0.239 | |
+| cross-attention, sequence queries structure | +0.253 | |
+| cross-attention, structure queries sequence | +0.206 | worst of the eleven |
+
+**Gating beat concatenation, and concatenation beat attention — every time.** Family C
+concluded "fusion mechanism is not the constraint" because nothing beat plain concatenation.
+With a backbone that works, the ordering separates cleanly, and the part of the earlier
+conclusion that was wrong is the implied *nothing can beat concatenation*: FiLM does, by
++0.075 over the plain-concat variant of the same backbone. What survives, and is now much
+better evidenced, is **attention being the worst mechanism available** — bottom two of eleven
+here, and four of five below the no-fusion control in family C.
+
+That two raw-scalar injections (+0.328, +0.315) beat every attention variant and every
+concatenation of a *learned* structural embedding is the sharpest form of the project's
+recurring finding: what reaches the model matters more than how it is combined.
+
+### E.3 Rotary position encoding, and why it did almost nothing
+
+| run | per-cx r |
+| --- | --- |
+| cross-attention baseline (no RoPE) | +0.151 |
+| + RoPE, base 10000 (the language-model default) | +0.185 |
+| + RoPE, base 200 (retuned) on the chem-query model | +0.302 vs +0.279 without |
+
+Keyed on true residue index, not crop slot — measured on real crops, consecutive slots sit 1
+to 40 residues apart, so rotating by slot would encode a spacing that does not exist. A
+per-chain offset was needed too: the index restarts at 0 in every chain, so an H30 and an L30
+were being handed the same phase.
+
+**The default base is wrong for this data by a wide margin.** Same-chain separations here have
+median 29 and 90th percentile 75. At base 10000, **7 of 16 frequency channels turn less than
+half a radian across that entire range** — constants, carrying nothing — and 5 more wrap and
+alias. Four channels were doing anything. At base 200 the series spans 1–170: 8 usefully
+tuned, none dead. Every gap in the table above is still inside the seed spread, so this is a
+diagnostic finding rather than a result: the encoding was present and three-quarters idle, and
+saying so is worth more than the +0.023.
+
+### E.4 Reference checks — what the floor actually is
+
+Structure-free, chem-free, deliberately naive:
+
+| check | per-cx r |
+| --- | --- |
+| ab/ag nearest-neighbour product, per residue | +0.073 |
+| pooled-ab × pooled-ag interaction | −0.093 |
+| the same with a `mul` outer combine | −0.009 |
+
+All at or below zero. Worth keeping because they price the rest: the fusion mechanisms in
+family C and E.2 are doing real work, and a naive interaction term is not a cheap substitute
+for any of them.

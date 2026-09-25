@@ -232,7 +232,9 @@ performance is.
 
 **Chosen.** `E0a_rf_handcrafted` — chemistry + interface geometry + ProteinMPNN — is built,
 tuned and reported as the reference the multimodal model is measured against. The submitted
-model is `cat128_reg2_l1` ([docs/MODEL.md](MODEL.md)).
+model is `struct_film_chem` ([DETAILS.md](DETAILS.md#struct_film_chem)); it superseded
+`cat128_reg2_l1` ([docs/MODEL.md](MODEL.md)), which the measurements in this document
+were taken against and which they remain correct for.
 
 **Why a baseline at all, and why this one.** A multimodal deep model on 940 rows is only worth
 building if it beats what the same features support without one. The forest is the strongest

@@ -1,11 +1,12 @@
 # Handoff — state of the project, and what a fresh session needs to know
 
-> **Historical snapshot, 2026-09-21. Superseded in one important respect.** This document
-> says "the random forest is the model". That was accurate when written, before the gated
-> fusion ladder was built. The submitted model is now `cat128_reg2_l1` ([MODEL.md](MODEL.md)) and the
-> forest is the **baseline** it is measured against — see [JUSTIFICATIONS.md §A5](JUSTIFICATIONS.md).
-> Its numbers here also predate the censored-affinity drop (997 rows, not 940). Kept as the
-> record of what was known at the time.
+> **Historical snapshot, 2026-09-21. Superseded twice since.** This document says "the random
+> forest is the model". That was accurate when written, before the fusion ladder was built.
+> The submitted model became `cat128_reg2_l1` ([MODEL.md](MODEL.md)), and is now
+> **`struct_film_chem`** ([DETAILS.md](DETAILS.md#struct_film_chem), README §1) at +0.369 —
+> the forest is the **baseline** it is measured against, see
+> [JUSTIFICATIONS.md §A5](JUSTIFICATIONS.md). Numbers here also predate the censored-affinity
+> drop (997 rows, not 940). Kept as the record of what was known at the time.
 
 Written 2026-09-21, after the session that removed residual learning. Read this before
 trusting any number in the older documents: several headline figures in `README.md`,
@@ -43,9 +44,12 @@ Dropping is a holding policy, not the right answer. See §9.
 
 **The random forest is the model. The neural network does not beat it, on either split.**
 
-> *Superseded — see the banner at the top.* The submitted model is `cat128_reg2_l1`; the forest
-> is the **baseline**. It is still the better ranker (+0.381 against +0.293), which is reported
-> as such in [MODEL.md](MODEL.md) and `ERROR_ANALYSIS.md`, not hidden.
+> *Superseded — see the banner at the top.* The submitted model is now `struct_film_chem`; the
+> forest is the **baseline**. The forest is still the better ranker, but the margin has narrowed
+> from +0.381 against +0.293 to +0.381 against +0.369 — an eighth of the seed spread rather than
+> 2.5× it. `ERROR_ANALYSIS.md` Part IV shows where each one actually wins, and it is not a
+> uniform advantage: the forest cannot rank inside the stabilising class at all (r = 0.007),
+> and its edge is concentrated in alanine scanning.
 
 Cluster-grouped split (the reported one), all models scored on identical rows:
 

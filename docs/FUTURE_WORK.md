@@ -47,11 +47,26 @@ forest — best +0.424 against +0.397. The weight was not tuned on held-out data
 properly; but it is better evidenced than any architecture change in this project, and it costs
 one cross-validation loop.
 
-## 4. Give the network the forest's interface-geometry columns
+## 4. Geometry into the FiLM gate, not the tail concatenation — *(item updated: the original was done)*
 
-The largest single gain measured anywhere here was adding 26 chemistry columns to the network
-(+0.191 → +0.266). The forest's other block — rSASA, burial, contact counts — has never been
-given to the network. It is the untried half of the one intervention that demonstrably worked.
+The original form of this item — "give the network the forest's interface-geometry columns" —
+**has been done.** The block the current model reads is 39 columns: chemistry, the seven
+geometry columns (rSASA, burial, contact counts), ESM-2 and ProteinMPNN zero-shot scalars. It
+helped: `struct_film_site` (no chem block) +0.340 → `struct_film_chem` (with it) +0.369.
+
+**What it did not do is remove the bias it was meant to remove.** ERROR_ANALYSIS §29: signed
+error still correlates with `rsasa_bound` at +0.279 for the current model, +0.018 for the
+forest. Same for `min_dist_partner` (+0.267 vs +0.005) and `n_contacts` (−0.339 vs −0.116).
+Every network carries it; the forest carries none of it.
+
+The shape of that gap is the next experiment. The forest reads burial **at every split**; the
+network reads it only in the head, after the structure has already been pooled — so the model
+knows how buried the site is but learns it too late to change how it *read* the site. So:
+feed the geometry columns into the FiLM gate (`mut_pair_struct_inject="film_site"`, where a
+Linear already maps pooled structure to gamma/beta) instead of, or in addition to, the tail
+concatenation. Burial would then modulate how the structural representation is read rather
+than correcting the answer afterwards. One config change, one cross-validation loop, and a
+falsifiable prediction: if the mechanism is right, the §29 correlations shrink.
 
 ## 5. Normalise the target within cluster — measured, and it moved
 
@@ -167,7 +182,8 @@ is the relation ΔΔG actually depends on.
    non-redundant information there is to mix, and would **explain** that null rather than
    record it.
 
-**Then** freeze `f_seq` and `f_str` and drop them into `cat128_reg2_l1` in place of the two
+**Then** freeze `f_seq` and `f_str` and drop them into the submitted model (now
+`struct_film_chem`; this item predates it, and the argument is unchanged) in place of the two
 projections currently fitted to 752 labels. Everything downstream is unchanged, so the
 comparison is clean.
 
@@ -320,3 +336,44 @@ and should be stated as one.
 Only 8 of 45 configurations here have three complete seeds. The measured spread reaches 0.117
 per complex and 0.376 pooled within a single fold. Most published ΔΔG comparisons would not
 survive this standard, which is itself worth saying.
+
+## 16. Evaluate on the AbSci HER-2 set — the one genuinely external test available
+
+Everything above is measured by cross-validation on 940 SKEMPI rows. Every number in this
+repository, including the homology-cluster split, is still **one lab, one curation, one assay
+convention**. [docs/ABSCI_DATASET.md](ABSCI_DATASET.md) profiles the only external set that
+fits this model's input requirements: AbSci's HER-2 release (Shanehsazzadeh et al.), 1,855
+trastuzumab CDR variants against human HER2 with SPR-measured KD, Clear BSD licensed.
+
+**This is the highest-value evaluation left, and it is not another fold.** Different lab,
+different assay, different mutation regime, a target chosen by someone else. If the model
+holds there, the per-complex number means something outside this dataset; if it collapses,
+that is the most useful negative result the project could produce, and it would apply to the
+forest as much as to the network.
+
+**The protocol is already worked out and it has one trap in it.** ABSCI_DATASET.md §5: **PDB
+1N8Z — trastuzumab/HER2 — is already one of our test complexes**, 14 rows in fold 3, cluster
+`3N85_A_LH`, and four of those rows mutate residues *inside the exact HCDR3 loop* AbSci
+redesigned. One of them, `DB102W` at −0.71, is one of our scarce stabilising measurements.
+Evaluating a model that saw any of the 100 rows in that cluster is not an external test, it is
+a memory check. So:
+
+1. Retrain with cluster `3N85_A_LH` **wholly excluded** (100 rows, not just the 14). The
+   `--fold-map` mechanism added for the homology split does this directly.
+2. Evaluate on the **442 substitution-only** spr-controls (§2 of that doc: the rest are loop
+   redesigns at median edit distance 8, outside the single-substitution regime this model's
+   mutation representation is built for).
+3. Derive ΔΔG as `RT·ln(KD_variant / KD_trastuzumab)`, KD_parent 1.9 nM (§3).
+4. Report the same metrics as everywhere else — per-complex is meaningless here, since it is
+   one complex, so the honest headline is **pooled Spearman plus the stab/dest AUC** the
+   threshold-free section of ERROR_ANALYSIS §31 already uses.
+
+**Predict before running it.** ABSCI §3 notes the ΔΔG distribution is the opposite of ours —
+almost no stabilising examples, and ours is 70% destabilising. ERROR_ANALYSIS §26 shows the
+forest cannot rank inside the stabilising class at all and the networks can. A set with
+almost no stabilising rows therefore plays to the forest's strengths, not the network's, and
+the fair reading is that a network loss there is **not** evidence against §26. Stating that
+now, before the number exists, is the only way the result stays interpretable either way.
+
+**Cost.** One retrain, one loader, no new modelling. The dataset is downloaded and profiled
+already.

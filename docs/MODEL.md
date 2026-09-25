@@ -1,7 +1,14 @@
-# The multimodal model
+# The multimodal model — `cat128_reg2_l1` (superseded)
+
+> **This is no longer the submitted model.** `cat128_reg2_l1` was superseded by
+> **`struct_film_chem`** (+0.369 against +0.293) — specified in
+> [DETAILS.md](DETAILS.md#struct_film_chem), summarised in README §1. **This document is left
+> intact and is still accurate for the model it describes**, which remains the reference point
+> for most of `JUSTIFICATIONS.md` and Parts I–III of `ERROR_ANALYSIS.md`. Read it as the full
+> specification of the previous submission, not the current one.
 
 One architecture, specified completely. `docs/ARCHITECTURES.md` records the 45 configurations
-measured to arrive at it; this is the one that is submitted.
+measured to arrive at it.
 
 **`cat128_reg2_l1` — ESM-2 and ProteinMPNN each given their own projection, read at the mutated
 residues, concatenated with substitution chemistry into a single-hidden-layer head. 36,353
