@@ -928,7 +928,7 @@ class PerturbSiteToken(nn.Module):
             # an instance constant on CrossAttn, and the main self.attn (built below, if
             # this were combined with delta_xattn) keeps the ordinary residual, so this
             # cannot reuse it.
-            self.mpnn_proj = nn.Linear(c.struct_pca_dim or seq_in, w, bias=False)
+            self.mpnn_proj = self._make_struct_proj(c, seq_in, w)
             self.struct_attn = CrossAttn(w, c.n_heads, c.dropout, res_pre=0.0, res_post=1.0)
             blocks: list[nn.Module] = []
             d = w * 2                          # sequence term (w) concat structure term (w)
@@ -949,13 +949,13 @@ class PerturbSiteToken(nn.Module):
             self.pair_ffn = nn.Linear(w, w)                           # instance is fine
             d = w
             if c.mut_pair_struct_xattn:
-                self.mpnn_proj = nn.Linear(c.struct_pca_dim or seq_in, w, bias=False)
+                self.mpnn_proj = self._make_struct_proj(c, seq_in, w)
                 self.diff_attn = CrossAttn(w, c.n_heads, c.dropout,
                                            rope=True, rope_base=c.rope_base)
                 d = w * 2                       # sequence term concat structure term
             mode = c.mut_pair_struct_inject
             if mode != "none":
-                self.mpnn_proj = nn.Linear(c.struct_pca_dim or seq_in, w, bias=False)
+                self.mpnn_proj = self._make_struct_proj(c, seq_in, w)
                 self.struct_ln = nn.LayerNorm(w, elementwise_affine=False)
                 if mode in ("site_concat", "crop_concat", "nn_diff_concat"):
                     d = w * 2
@@ -1102,6 +1102,23 @@ class PerturbSiteToken(nn.Module):
             acc = acc + (h * site).sum(1)
         return acc
 
+    def _make_struct_proj(self, c, seq_in, w):
+        """The structure encoder's first linear layer -- split per side when split_proj is
+        set, exactly like proj_side already is for sequence. Without this, every mode in
+        the mut_pair_ffn family forced the antibody's and the antigen's ProteinMPNN
+        embeddings through ONE shared map -- the same weight-sharing split_proj exists to
+        prevent, just missed on the structure side because sequence was the branch that
+        had a proj_side pattern to copy from.
+        """
+        dim = c.struct_pca_dim or seq_in
+        if c.split_proj:
+            return nn.ModuleDict({k: nn.Linear(dim, w, bias=False) for k in ("ab", "ag")})
+        return nn.Linear(dim, w, bias=False)
+
+    def struct_proj(self, x, side):
+        p = self.mpnn_proj
+        return p[side](x) if isinstance(p, nn.ModuleDict) else p(x)
+
     def _mut_pair_struct(self, batch, px, tok_proj) -> torch.Tensor:
         """ag-indexed structural diffs (ag minus nearest ab, geometry) as keys/values;
         the mutation tokens (LN(mt)-LN(wt), from either side) as queries. RoPE both sides.
@@ -1109,8 +1126,8 @@ class PerturbSiteToken(nn.Module):
         dist = batch["dist"]                                      # (B, Lab, Lag)
         nn_idx = dist.argmin(dim=1, keepdim=True).squeeze(1).unsqueeze(-1)  # (B, Lag, 1)
         gelu = torch.nn.functional.gelu
-        st_ab = gelu(self.mpnn_proj(px(batch["struct_ab"])))
-        st_ag = gelu(self.mpnn_proj(px(batch["struct_ag"])))
+        st_ab = gelu(self.struct_proj(px(batch["struct_ab"]), "ab"))
+        st_ag = gelu(self.struct_proj(px(batch["struct_ag"]), "ag"))
         nn_ab = torch.gather(st_ab, 1, nn_idx.expand(-1, -1, st_ab.shape[-1]))
         struct_diff = st_ag - nn_ab                                # (B, Lag, w)
         kv_mask = batch["mask_ag"].bool()
@@ -1155,14 +1172,14 @@ class PerturbSiteToken(nn.Module):
             key = "site" if mode == "site_concat" else "mask"
             z_st = 0
             for side in ("ab", "ag"):
-                st = self.struct_ln(gelu(self.mpnn_proj(px(batch[f"struct_{side}"]))))
+                st = self.struct_ln(gelu(self.struct_proj(px(batch[f"struct_{side}"]), side)))
                 z_st = z_st + site_mean(st, batch[f"{key}_{side}"])
             return torch.cat([z_seq, z_st], dim=-1)
 
         if mode == "film_site":
             z_st = 0
             for side in ("ab", "ag"):
-                st = self.struct_ln(gelu(self.mpnn_proj(px(batch[f"struct_{side}"]))))
+                st = self.struct_ln(gelu(self.struct_proj(px(batch[f"struct_{side}"]), side)))
                 z_st = z_st + site_mean(st, batch[f"site_{side}"])
             gamma, beta = self.film(z_st).chunk(2, dim=-1)
             return (1 + gamma) * z_seq + beta
@@ -1170,7 +1187,7 @@ class PerturbSiteToken(nn.Module):
         if mode == "gated_site":
             z_st = 0
             for side in ("ab", "ag"):
-                st = self.struct_ln(gelu(self.mpnn_proj(px(batch[f"struct_{side}"]))))
+                st = self.struct_ln(gelu(self.struct_proj(px(batch[f"struct_{side}"]), side)))
                 z_st = z_st + site_mean(st, batch[f"site_{side}"])
             g = torch.sigmoid(self.gate(torch.cat([z_seq, z_st], dim=-1)))
             return z_seq + g * self.gate_val(z_st)
@@ -1179,8 +1196,8 @@ class PerturbSiteToken(nn.Module):
             # symmetric: an ag residue paired with its nearest ab, AND the reverse, each
             # pooled at ITS OWN side's mutated positions -- a mutation on either side
             # reaches a real term, unlike a one-directional version would.
-            st_ab = self.struct_ln(gelu(self.mpnn_proj(px(batch["struct_ab"]))))
-            st_ag = self.struct_ln(gelu(self.mpnn_proj(px(batch["struct_ag"]))))
+            st_ab = self.struct_ln(gelu(self.struct_proj(px(batch["struct_ab"]), "ab")))
+            st_ag = self.struct_ln(gelu(self.struct_proj(px(batch["struct_ag"]), "ag")))
             nn_for_ag = dist.argmin(dim=1, keepdim=True).squeeze(1).unsqueeze(-1)  # (B,Lag,1)
             nn_for_ab = dist.argmin(dim=2, keepdim=True)                          # (B,Lab,1)
             diff_ag = st_ag - torch.gather(st_ab, 1, nn_for_ag.expand(-1, -1, st_ab.shape[-1]))
@@ -1191,7 +1208,7 @@ class PerturbSiteToken(nn.Module):
         if mode in ("seq_to_struct_attn", "struct_to_seq_attn"):
             z_st = 0
             for side in ("ab", "ag"):
-                st = gelu(self.mpnn_proj(px(batch[f"struct_{side}"])))
+                st = gelu(self.struct_proj(px(batch[f"struct_{side}"]), side))
                 mut = self._mut_seq(batch, px, tok_proj, side)     # per-position, unpooled
                 pos = self.rope_pos(batch, side)
                 mask = batch[f"mask_{side}"].bool()
@@ -1217,7 +1234,7 @@ class PerturbSiteToken(nn.Module):
             # mutated residues -- "wild type site means the binding site")
             z_st = 0
             for side in ("ab", "ag"):
-                st = self.struct_ln(gelu(self.mpnn_proj(px(batch[f"struct_{side}"]))))
+                st = self.struct_ln(gelu(self.struct_proj(px(batch[f"struct_{side}"]), side)))
                 z_st = z_st + site_mean(st, batch[f"mask_{side}"])
             u, v = self.bilin_struct(z_st), self.bilin_seq(z_seq)
             z_cc = u * v                    # each projected separately, THEN multiplied
@@ -1246,7 +1263,7 @@ class PerturbSiteToken(nn.Module):
             acc_sim = acc_sim + site_mean(p_mt * p_wt, site)
 
             st = px(batch[f"struct_{side}"])
-            stp = self.mpnn_proj(st)
+            stp = self.struct_proj(st, side)
             q = site_mean(stp, mask).unsqueeze(1)                      # (B, 1, w)
             out = self.struct_attn(q, stp, mask.bool()).squeeze(1)
             # a side can still be entirely absent from the crop (no interface residues
