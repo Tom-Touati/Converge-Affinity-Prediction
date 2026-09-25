@@ -310,6 +310,30 @@ tuned, none dead. Every gap in the table above is still inside the seed spread, 
 diagnostic finding rather than a result: the encoding was present and three-quarters idle, and
 saying so is worth more than the +0.023.
 
+### E.3b Widening the PCA to 256 — a clean loss
+
+| run | per-cx r | seed spread | negative complexes |
+| --- | --- | --- | --- |
+| `struct_film_chem`, PCA-128 | **+0.369** | 0.092 | **3** |
+| `struct_film_chem`, PCA-256 | +0.305 | 0.123 | 8 |
+
+Doubling the fold-local PCA width costs 0.064, widens the seed spread, and nearly triples the
+complexes that finish with a *negative* within-complex correlation. At 752 training rows per
+fold, 256 components per side is more basis than the labels can constrain, and the extra
+directions are fitted to fold-specific noise — which is exactly what a rise in both seed
+variance and negative-complex count looks like.
+
+Worth recording because the obvious reading of "89% of variance retained at 128" is that more
+components must help. They do not; the retained-variance number describes the *inputs*, and
+what binds here is the supervision.
+
+It also exposed a latent bug worth naming: `mpnn_proj` had been built assuming the structure's
+post-PCA width always equals `pca_dim`. PCA cannot exceed the raw input's width, so with
+ProteinMPNN's 128-d encoder the structure PCA silently capped at 128 while the layer expected
+256. This was invisible for the whole project because the default `pca_dim` *is* 128 — the two
+were equal by coincidence, not by construction. Fixed with `struct_pca_dim`, computed by the
+trainer from the fitted PCA and verified byte-identical at the default.
+
 ### E.4 Reference checks — what the floor actually is
 
 Structure-free, chem-free, deliberately naive:
