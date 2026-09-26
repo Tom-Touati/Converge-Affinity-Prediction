@@ -48,7 +48,14 @@ AA_IDX = {a: i for i, a in enumerate(ALPHABET)}
 DEFAULT_WEIGHTS = "v_48_020.pt"
 
 
-def _load_model(device: str, weights: str = DEFAULT_WEIGHTS):
+def _load_model(device: str, weights: str = DEFAULT_WEIGHTS, weights_path=None,
+                k_neighbors: int | None = None):
+    """``weights_path`` overrides the default ``vanilla_model_weights/`` lookup -- StaB-ddG's
+    own checkpoints (see ``_load_stab_model``) live outside the vanilla dauparas repo and are
+    not shaped like its checkpoints: no guaranteed ``num_edges``/``noise_level`` metadata, and
+    sometimes no ``model_state_dict`` wrapper at all (``run_stabddg.py`` itself branches on
+    this). ``k_neighbors`` lets a caller supply the value directly when the checkpoint can't.
+    """
     if not MPNN_DIR.exists():
         raise FileNotFoundError(
             f"{MPNN_DIR} not found. Clone it with:\n"
@@ -58,15 +65,18 @@ def _load_model(device: str, weights: str = DEFAULT_WEIGHTS):
     sys.path.insert(0, str(MPNN_DIR))
     from protein_mpnn_utils import ProteinMPNN
 
-    ckpt = torch.load(MPNN_DIR / "vanilla_model_weights" / weights,
-                      map_location=device, weights_only=False)
+    path = weights_path or (MPNN_DIR / "vanilla_model_weights" / weights)
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found.")
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
     model = ProteinMPNN(
         num_letters=21, node_features=128, edge_features=128, hidden_dim=128,
         num_encoder_layers=3, num_decoder_layers=3,
         augment_eps=0.0,                    # training-time coordinate noise off: determinism
-        k_neighbors=ckpt["num_edges"],
+        k_neighbors=k_neighbors if k_neighbors is not None else ckpt["num_edges"],
     )
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(state_dict)
     return model.eval().to(device), ckpt
 
 
@@ -106,6 +116,191 @@ def _log_probs(model, structure, chain_group: str, device: str):
     X, mask, residue_idx, chain_enc, offsets = _featurize(structure, chain_group, device)
     lp = model.unconditional_probs(X, mask, residue_idx, chain_enc)
     return lp[0].float().cpu().numpy(), offsets                 # (L, 21)
+
+
+# ---------------------------------------------------------------------------------------------
+# StaB-ddG (Deng et al., arXiv 2507.05502, github.com/LDeng0205/StaB-ddG): the SAME frozen
+# ProteinMPNN weights loaded above, scored with the paper's own folding-energy cycle instead of
+# unconditional_probs' single-pass per-position marginal. unconditional_probs treats every
+# position as independent of every other position's identity -- a pseudo-likelihood. StaB-ddG's
+# f(s) = log p(s | backbone) is the actual autoregressive sequence log-likelihood (ProteinMPNN's
+# OWN training objective), decomposed along one decoding order, one position at a time, each
+# conditioned on the others already decoded. That is a materially different quantity, not just a
+# reweighting of the same one -- hence a new code path rather than a new column on the old one.
+#
+# No vendored StaB-ddG code and no new checkpoint for the zero-shot variant: the paper's own
+# ProteinMPNN.forward() modification (stabddg/mpnn_utils.py) turns out to be unnecessary for us
+# -- the vanilla dauparas forward() we already load already accepts a fixed decoding order via
+# ``use_input_decoding_order``/``decoding_order``; the only other piece of "fixed randomness" the
+# paper needs, shared backbone coordinate noise, we add ourselves before calling forward (with
+# augment_eps=0 the model contributes none of its own), which is behaviourally identical to their
+# ``fix_backbone_noise`` argument without touching the model class at all.
+# ---------------------------------------------------------------------------------------------
+
+STAB_MC_SAMPLES = 20            # the paper's own default ensemble size
+STAB_NOISE_LEVEL = 0.1          # the paper's own default backbone-noise magnitude (Angstrom)
+#: variant -> (weights filename, whether it needs the vanilla dauparas weights directory).
+#: "stability_finetuned" is ProteinMPNN fine-tuned on Megascale folding-stability data only --
+#: never on SKEMPI, so it carries no leakage risk against our own homology-clustered eval, and
+#: (per the paper) it is calibrated to real kcal/mol rather than raw log-likelihood units. The
+#: SKEMPI-fine-tuned checkpoint (``stabddg.pt``) is deliberately absent from this dict: loading
+#: it would mean scoring our own SKEMPI-derived eval rows with a model fine-tuned on SKEMPI.
+STAB_VARIANTS = {
+    "zeroshot": (DEFAULT_WEIGHTS, True),
+    "stability_finetuned": ("stability_finetuned.pt", False),
+}
+STAB_CKPT_DIR = paths.ROOT / "third_party" / "StaB-ddG-ckpts"
+_stab_model_cache: dict = {}     # (device, variant) -> frozen nn.Module, load once per process
+_stab_cache: dict = {}           # (pdb, ab, ag, mutation_string, variant, n_samples, noise, seed) -> result dict
+
+
+def _load_stab_model(device: str, variant: str = "zeroshot"):
+    if variant not in STAB_VARIANTS:
+        raise ValueError(f"variant must be one of {sorted(STAB_VARIANTS)}, got {variant!r}")
+    weights, use_vanilla_dir = STAB_VARIANTS[variant]
+    assert "skempi" not in weights.lower(), (
+        f"refusing to load {weights!r}: a SKEMPI-fine-tuned checkpoint would leak our own eval "
+        f"labels into a feature we are treating as zero-shot/leak-free"
+    )
+    key = (device, variant)
+    if key in _stab_model_cache:
+        return _stab_model_cache[key]
+    if use_vanilla_dir:
+        model, _ = _load_model(device, weights)
+    else:
+        path = STAB_CKPT_DIR / weights
+        if not path.exists():
+            raise FileNotFoundError(
+                f"{path} not found. Download it (after checking with the user -- it is an "
+                f"~6.7 MB file from a third party) with:\n"
+                f"  curl -L -o {path} "
+                f"https://raw.githubusercontent.com/LDeng0205/StaB-ddG/main/model_ckpts/{weights}"
+            )
+        model, _ = _load_model(device, weights, weights_path=path, k_neighbors=48)
+    for p in model.parameters():
+        p.requires_grad_(False)             # frozen: not eligible for any optimizer param group
+    model = model.eval()
+    _stab_model_cache[key] = model
+    return model
+
+
+def _seq_ids(seq: str) -> np.ndarray:
+    return np.array([AA_IDX.get(a, AA_IDX["X"]) for a in seq], dtype=np.int64)
+
+
+def _featurize_stab(structure, chain_group: str, device: str):
+    """Like ``_featurize``, but also returns the wild-type sequence as ProteinMPNN token ids:
+    ``unconditional_probs`` never needed ``S`` as an input, StaB's teacher-forced score does."""
+    xs, seqs, res_idx, chain_enc, offsets = [], [], [], [], {}
+    cursor = 0
+    for c_i, cid in enumerate(chain_group):
+        ch = structure.chains.get(cid)
+        if ch is None:
+            continue
+        n = len(ch.seq)
+        xs.append(ch.backbone)
+        seqs.append(_seq_ids(ch.seq))
+        res_idx.append(100 * c_i + np.arange(n))
+        chain_enc.append(np.full(n, c_i + 1))
+        offsets[cid] = cursor
+        cursor += n
+
+    X = np.concatenate(xs, 0)[None]
+    S = np.concatenate(seqs, 0)[None]
+    finite = np.isfinite(X).all(axis=(2, 3))
+    X = np.nan_to_num(X, nan=0.0)
+    t = lambda a, d: torch.as_tensor(a, dtype=d, device=device)
+    return (t(X, torch.float32), t(S, torch.long), t(finite.astype(np.float32), torch.float32),
+            t(np.concatenate(res_idx)[None], torch.long),
+            t(np.concatenate(chain_enc)[None], torch.long), offsets)
+
+
+@torch.no_grad()
+def _stab_logp(model, X, S, mask, residue_idx, chain_enc, decoding_order, backbone_noise):
+    """StaB-ddG's f(s): the teacher-forced sequence log-likelihood log p(S | noised backbone),
+    decomposed along ONE FIXED decoding order, under ONE FIXED backbone-coordinate noise draw.
+
+    Fixing both here (rather than letting ``ProteinMPNN.forward`` draw its own, as it does by
+    default) is what makes the wild-type/mutant PAIR in ``_stab_trial`` antithetic variates: the
+    two forward passes below differ ONLY in which sequence (``S``) goes in, so the common
+    decoding-order and geometry-noise draw cancels in ``f(mut) - f(wt)`` instead of contributing
+    two independent draws' variance to it. The paper reports this is where the signal comes
+    from -- shared noise instead of independent noise drops per-interface Spearman 0.45 -> 0.30.
+    """
+    chain_M = torch.ones_like(mask)               # nothing is "given"; every position is scored
+    randn_dummy = torch.zeros_like(mask)           # unused: use_input_decoding_order=True below
+    log_probs = model(X + backbone_noise, S, mask, chain_M, residue_idx, chain_enc, randn_dummy,
+                      use_input_decoding_order=True, decoding_order=decoding_order)
+    ll = torch.gather(log_probs, 2, S.unsqueeze(-1)).squeeze(-1)   # (B, L)
+    return (ll * mask).sum(dim=1)                                  # (B,)
+
+
+def _mutate(S_wt: torch.Tensor, structure, chain_group: str, offsets: dict, mutations) -> torch.Tensor:
+    S_mut = S_wt.clone()
+    for m in mutations:
+        if m.chain not in chain_group:
+            continue
+        pos = offsets[m.chain] + structure.chains[m.chain].index[m.key]
+        S_mut[0, pos] = AA_IDX[m.mut]
+    return S_mut
+
+
+def _stab_trial(model, structure, ab: str, ag: str, mutations, device: str,
+                noise_level: float, gen: torch.Generator) -> dict:
+    """One Monte Carlo trial of StaB-ddG's cycle: b(s) = f(AB) - f(A) - f(B), for both the
+    wild-type and the mutant sequence, on the SAME backbone coordinates for all three systems
+    (the paper's rigid-backbone assumption -- one structure, three chain subsets read off it).
+    Six forward passes total. Returns all six f(...) terms plus this trial's binding ddG.
+    """
+    terms = {}
+    for name, group in (("complex", ab + ag), ("ab_alone", ab), ("ag_alone", ag)):
+        X, S_wt, mask, residue_idx, chain_enc, offsets = _featurize_stab(structure, group, device)
+        S_mut = _mutate(S_wt, structure, group, offsets, mutations)
+        order = torch.argsort(torch.abs(torch.randn(mask.shape, generator=gen))).to(device)
+        noise = (noise_level * torch.randn(X.shape, generator=gen)).to(device)
+        f_wt = _stab_logp(model, X, S_wt, mask, residue_idx, chain_enc, order, noise)
+        f_mut = _stab_logp(model, X, S_mut, mask, residue_idx, chain_enc, order, noise)
+        terms[f"f_wt_{name}"] = float(f_wt.item())
+        terms[f"f_mut_{name}"] = float(f_mut.item())
+
+    b_wt = terms["f_wt_complex"] - terms["f_wt_ab_alone"] - terms["f_wt_ag_alone"]
+    b_mut = terms["f_mut_complex"] - terms["f_mut_ab_alone"] - terms["f_mut_ag_alone"]
+    # StaB-ddG's own convention (run_stabddg.py negates its raw cycle output): raw b_mut - b_wt
+    # is positive when the MUTANT is the more favourable (higher-log-likelihood) sequence, i.e.
+    # positive = stabilising. Our ddg_true, like SKEMPI's own convention, is positive =
+    # DESTABILISING -- so flip the sign once here, at the source, not at every consumer.
+    terms["stab_ddg"] = -(b_mut - b_wt)
+    return terms
+
+
+def stab_ddg(structure, ab: str, ag: str, mutations, *, device: str = "auto",
+            variant: str = "zeroshot", n_samples: int = STAB_MC_SAMPLES,
+            noise_level: float = STAB_NOISE_LEVEL, seed: int = 0) -> dict:
+    """StaB-ddG's binding ddG for one mutation, averaged over ``n_samples`` antithetic Monte
+    Carlo trials. Returns the six per-system f(...) terms (also averaged over trials -- our own
+    head may recombine them better than the fixed b = f(AB) - f(A) - f(B) cycle does), the final
+    ``stab_ddg`` scalar, and ``unit`` ("log-likelihood" for zero-shot, "kcal/mol" for
+    stability_finetuned -- branch on this downstream rather than assuming one scale).
+
+    Cached by every argument that changes the answer: a complex is scored by many mutations, and
+    re-running six ProteinMPNN forward passes per row when only the mutation differs is pure
+    waste. ``noise_level`` is included even though the task's own cache-key list omitted it --
+    leaving it out would silently reuse a stale answer for anyone who sweeps it.
+    """
+    device = resolve_device(device)
+    mut_str = ",".join(str(m) for m in mutations)
+    key = (structure.pdb, ab, ag, mut_str, variant, n_samples, noise_level, seed)
+    if key in _stab_cache:
+        return _stab_cache[key]
+
+    model = _load_stab_model(device, variant)
+    gen = torch.Generator().manual_seed(seed)
+    trials = [_stab_trial(model, structure, ab, ag, mutations, device, noise_level, gen)
+             for _ in range(n_samples)]
+    out = {k: float(np.mean([t[k] for t in trials])) for k in trials[0]}
+    out["unit"] = "log-likelihood" if variant == "zeroshot" else "kcal/mol"
+    _stab_cache[key] = out
+    return out
 
 
 def extract(device: str = "auto", weights: str = DEFAULT_WEIGHTS,

@@ -59,6 +59,7 @@ CONFIGS = {
     "fuse_add": dict(mut_pair_struct_inject="film_site", fuse_mode="add"),
     "fuse_concat": dict(mut_pair_struct_inject="film_site", fuse_mode="concat"),
     "struct_bind_feat": dict(mut_pair_struct_inject="film_site", struct_bind_feat=True),
+    "struct_stab_feat": dict(mut_pair_struct_inject="film_site", struct_stab_feat=True),
     "fusion_early": dict(mut_pair_struct_inject="none", fusion_stage="early"),
     "fusion_mid": dict(mut_pair_struct_inject="none", fusion_stage="mid"),
     "bsite_crop_concat": dict(mut_pair_struct_inject="film_site", bsite_extra="crop_concat"),

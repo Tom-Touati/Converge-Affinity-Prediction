@@ -148,23 +148,28 @@ class ConcatFusion(Fusion):
 
 class FiLMFusion(Fusion):
     """z = (1+gamma)*z_seq + beta, gamma/beta from Linear(w[+1], 2w) of z_st. The +1 and
-    the chem read are struct_bind_feat: the ITW (wild-type) complex's ProteinMPNN
-    log-probability (column 25 of chem_perturb_v2's fixed 39-column layout, a proxy for how
-    strong the wild-type binding already is), concatenated onto z_st before it drives FiLM
+    the chem read are struct_bind_feat/struct_stab_feat: a single extra scalar from
+    chem_perturb_v2's fixed 39-column layout, concatenated onto z_st before it drives FiLM
     -- reaching the structure branch directly rather than only the tail chem concat every
-    other column uses.
+    other column uses. struct_bind_feat reads column 25 (mpnn__logp_wt_complex, the ITW
+    wild-type complex's ProteinMPNN log-probability -- a proxy for how strong the wild-type
+    binding already is). struct_stab_feat reads column 23 (mpnn__llr_alone, ProteinMPNN's
+    log-likelihood-ratio computed on the ISOLATED chain, no partner present -- a proxy for
+    the mutation's effect on folding stability rather than binding). At most one may be set.
     """
 
-    def __init__(self, w: int, struct_bind_feat: bool = False):
+    def __init__(self, w: int, struct_bind_feat: bool = False, struct_stab_feat: bool = False):
         super().__init__()
-        self.struct_bind_feat = struct_bind_feat
-        self.film = nn.Linear(w + 1 if struct_bind_feat else w, 2 * w)
+        assert not (struct_bind_feat and struct_stab_feat), \
+            "struct_bind_feat and struct_stab_feat are mutually exclusive"
+        self.extra_col = 25 if struct_bind_feat else (23 if struct_stab_feat else None)
+        self.film = nn.Linear(w + 1 if self.extra_col is not None else w, 2 * w)
 
     def forward(self, z_seq, z_st, chem=None):
-        if self.struct_bind_feat:
+        if self.extra_col is not None:
             assert chem is not None and chem.shape[-1] == 39, \
-                "struct_bind_feat needs chem_perturb_v2 (39 cols)"
-            z_st = torch.cat([z_st, chem[:, 25:26]], dim=-1)
+                "struct_bind_feat/struct_stab_feat need chem_perturb_v2 (39 cols)"
+            z_st = torch.cat([z_st, chem[:, self.extra_col:self.extra_col + 1]], dim=-1)
         gamma, beta = self.film(z_st).chunk(2, dim=-1)
         return (1 + gamma) * z_seq + beta
 
@@ -172,10 +177,11 @@ class FiLMFusion(Fusion):
 def _make_fusion(c, w: int) -> Fusion:
     fm = getattr(c, "fuse_mode", "film")
     bind = getattr(c, "struct_bind_feat", False)
+    stab = getattr(c, "struct_stab_feat", False)
     if fm == "film":
-        return FiLMFusion(w, bind)
-    if bind:
-        raise ValueError("struct_bind_feat needs fuse_mode='film'")
+        return FiLMFusion(w, bind, stab)
+    if bind or stab:
+        raise ValueError("struct_bind_feat/struct_stab_feat need fuse_mode='film'")
     return {"multiply": MultiplyFusion, "add": AddFusion, "concat": ConcatFusion}[fm]()
 
 
@@ -867,6 +873,12 @@ class SiteTokenConfig:
     #: forward time rather than assumed silently. Not supported with fuse_mode="multiply"
     #: (z_st's width would no longer match z_seq's).
     struct_bind_feat: bool = False
+    #: film_site + fuse_mode="film" only. Same mechanism as struct_bind_feat, but reads
+    #: column 23 (mpnn__llr_alone) instead of column 25: ProteinMPNN's log-likelihood-ratio
+    #: for the mutation computed on the ISOLATED chain, no binding partner present -- a
+    #: proxy for the mutation's effect on folding stability rather than on binding.
+    #: Mutually exclusive with struct_bind_feat.
+    struct_stab_feat: bool = False
     #: mut_pair_ffn only. tok_proj's first Linear is keyed by side (ab/ag) but NOT by
     #: mutant-vs-wild-type -- LN(mt) and LN(wt) both come out of the SAME map before being
     #: subtracted. That is the identical weight-sharing this project's own rule (never
