@@ -82,6 +82,15 @@ GRAD_CLIP = 5.0
 #: Epochs over which the antibody-antigen share of a batch rises from 50% to
 #: 100%. 0 disables the curriculum and samples uniformly.
 CURRICULUM = 0
+#: Relative sampling weight for a training row whose mutation is on the antigen side (or
+#: both sides) against one on the antibody side alone -- 0 (default) samples uniformly, 2.0
+#: makes an antigen-side row twice as likely to be drawn per epoch as an antibody-side one.
+#: Motivated the same way CURRICULUM is (rebalancing which rows the gradient spends its time
+#: on), but for the antibody/antigen SCORE gap (pooled r +0.647 vs +0.236,
+#: struct_film_chem_kendall) rather than the antibody/general-PPI one. Derived from
+#: sites_ab/sites_ag directly (non-empty means that side has a mutated residue this row), not
+#: a stored mut_side column, matching PerturbSiteToken's own _mut_side_idx convention.
+OVERSAMPLE_AG = 0.0
 #: Which training rows the fold-local PCA is FITTED on. "all" uses everything in the
 #: training folds; "abag" fits on the antibody-antigen rows alone and then applies that
 #: basis to every row.
@@ -377,6 +386,19 @@ class DS(Dataset):
         src = self.chem_rev if (swap and self.chem_rev is not None) else self.chem
         chem = (src.loc[r.row_id].values.astype(np.float32)
                 if src is not None else np.zeros(0, np.float32))
+        # Censored-affinity recovery (README "censored rows"): mut_is_bound means the row's own
+        # `y` is a LOWER bound on the true ddG (only penalise predicting BELOW it); wt_is_bound
+        # means an UPPER bound (only penalise predicting ABOVE it). Absent for ordinary rows --
+        # getattr keeps this backward compatible with any perturb_rows.parquet built before this
+        # existed. Swapping wt/mt for the reverse-mutation augmentation swaps WHICH bound applies
+        # (the same treatment as the chem block's own SWAP columns): the mutation whose affinity
+        # was too weak to measure is now playing the "wt" role, not the "mut" role, but which
+        # DIRECTION the surviving y bounds the truth in is unchanged by relabelling roles, so no
+        # sign logic is needed here beyond the swap itself.
+        mut_is_bound = bool(getattr(r, "mut_is_bound", False))
+        wt_is_bound = bool(getattr(r, "wt_is_bound", False))
+        if swap:
+            mut_is_bound, wt_is_bound = wt_is_bound, mut_is_bound
         return dict(chem=chem,
                     seq_ab_wt=s_ab_wt, seq_ab_mt=s_ab_mt, seq_ag_wt=s_ag_wt, seq_ag_mt=s_ag_mt,
                     struct_ab=t_ab, struct_ag=t_ag,
@@ -386,7 +408,8 @@ class DS(Dataset):
                     chain_ab=c["ab_chain"].astype(np.int64),
                     chain_ag=c["ag_chain"].astype(np.int64),
                     res_ab=c["ab_res"].astype(np.int64), res_ag=c["ag_res"].astype(np.int64),
-                    dist=c["dist"], y=np.float32(y), row_id=r.row_id)
+                    dist=c["dist"], y=np.float32(y), row_id=r.row_id,
+                    mut_is_bound=mut_is_bound, wt_is_bound=wt_is_bound)
 
 
 def collate(items):
@@ -423,6 +446,8 @@ def collate(items):
         out["chem"] = torch.from_numpy(np.stack([x["chem"] for x in items]))
     out["y"] = torch.tensor([x["y"] for x in items])
     out["row_id"] = [x["row_id"] for x in items]
+    out["mut_is_bound"] = torch.tensor([x["mut_is_bound"] for x in items])
+    out["wt_is_bound"] = torch.tensor([x["wt_is_bound"] for x in items])
     return out
 
 
@@ -762,7 +787,14 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
              save_ckpt=None, val_restrict_abag=True):
     torch.manual_seed(seed); np.random.seed(seed)
     pcas = fold_pca(rows, fold, cache, cfg.pca_dim, seed=0)
-    test = rows[rows.fold == fold]
+    # Censored rows (recovered SKEMPI ">"/"<" affinities, README "censored rows") carry a
+    # BOUND, not a point label -- they train fine under the one-sided loss above, but must
+    # never be scored: per-complex Pearson against a label that is not the true value would be
+    # measuring against the wrong number. Excluded from every scored split (test AND the
+    # early-stopping val), kept only in `train`, where the one-sided loss reads it correctly.
+    is_censored = (rows.get("mut_is_bound", False) | rows.get("wt_is_bound", False)) \
+        if "mut_is_bound" in rows.columns else pd.Series(False, index=rows.index)
+    test = rows[(rows.fold == fold) & ~is_censored]
     tr_all = rows[rows.fold != fold]
     # Hold out complexes until the ROW target is met, not a fixed count of complexes.
     # Complexes run from 2 to 87 rows, so taking 20% of them took 311 of 752 rows on the
@@ -801,7 +833,7 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
             break
         val_cx.add(c); taken += int(sizes[c])
     train = tr_all[~tr_all.complex_key.isin(val_cx)]
-    val = tr_all[tr_all.complex_key.isin(val_cx)]
+    val = tr_all[tr_all.complex_key.isin(val_cx) & ~is_censored.loc[tr_all.index]]
 
     memo = {}                                  # one PCA cache shared by all three splits
     chem = chem_rev = None
@@ -877,6 +909,16 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
         every row stays reachable at every epoch and only its probability changes.
         """
         if CURRICULUM <= 0:
+            if OVERSAMPLE_AG > 0:
+                # Same WeightedRandomSampler mechanism as the curriculum above, but static
+                # across epochs (the antigen/antibody imbalance is not something to anneal
+                # away from, unlike the AB/AG-vs-general-PPI one CURRICULUM handles).
+                has_ag = (frame["sites_ag"].astype(str) != "").to_numpy()
+                w = np.where(has_ag, OVERSAMPLE_AG, 1.0)
+                sampler = torch.utils.data.WeightedRandomSampler(
+                    torch.as_tensor(w, dtype=torch.double), num_samples=len(frame),
+                    replacement=True)
+                return mk(frame, True, sampler)
             return mk(frame, True)
         p = min(1.0, 0.5 + 0.5 * epoch / max(CURRICULUM, 1))
         is_ab = frame["is_abag"].to_numpy() if "is_abag" in frame.columns             else np.ones(len(frame), bool)
@@ -945,7 +987,23 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
             x = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
             y_dev = b["y"].to(device)
             z = model(x)
-            loss = lf(z, y_dev)
+            if getattr(cfg, "ordinal", 0):
+                loss = lf(z, y_dev)
+            else:
+                # Censored-affinity recovery: mut_is_bound/wt_is_bound are False for every row
+                # of the original 940-row table (DS.__getitem__'s getattr default), so this is
+                # torch.nn.MSELoss()'s own mean-of-squared-error exactly whenever neither flag
+                # is ever set -- the one-sided clamp only changes anything for rows recovered
+                # from SKEMPI's censored (">"/"<") affinities, where the label is a bound, not
+                # a point value, and squared-erroring against it as if it were exact teaches
+                # the model a number nobody measured (README, "censored rows").
+                err = z - y_dev
+                sq = err.pow(2)
+                mut_bound = b["mut_is_bound"].to(device)
+                wt_bound = b["wt_is_bound"].to(device)
+                sq = torch.where(mut_bound, err.clamp(max=0.0).pow(2), sq)   # y is a LOWER bound
+                sq = torch.where(wt_bound, err.clamp(min=0.0).pow(2), sq)    # y is an UPPER bound
+                loss = sq.mean()
             if RANK_WEIGHT > 0:
                 # MSE (or the ordinal loss) is the only anchor on output SCALE; the rank
                 # term constrains order only, so it is ADDED to the regression loss, never
@@ -1051,6 +1109,9 @@ def main():
                     help="fit the fold-local PCA on all training rows, or AB/AG only")
     ap.add_argument("--curriculum", type=int, default=0,
                     help="epochs to anneal the AB/AG batch share 50%% -> 100%%")
+    ap.add_argument("--oversample-ag", type=float, default=0.0,
+                    help="relative sampling weight for antigen-side training rows against "
+                         "antibody-side ones; 0 (default) samples uniformly")
     ap.add_argument("--chem-scale", default="fold", choices=["fold", "cluster"],
                     help="standardise the chem block globally or within homology cluster")
     ap.add_argument("--clusters", default=None,
@@ -1146,6 +1207,7 @@ def main():
         print(f"clipped |ddG| to {a.clip}: {n} of {len(rows)} rows "
               f"({100 * n / len(rows):.1f}%)", flush=True)
     global LR, WD, PATIENCE, GRAD_CLIP, CHEM_SCALE, CLUSTER_OF, CURRICULUM, PCA_ROWS
+    global OVERSAMPLE_AG
     global RANK_WEIGHT, RANK_MARGIN, CORR_WEIGHT, CORR_MIN_GROUP, RANK_METHOD
     RANK_WEIGHT = a.rank_weight
     RANK_MARGIN = a.rank_margin
@@ -1168,6 +1230,7 @@ def main():
         CLUSTER_OF = cl.set_index("row_id")["cluster"]
         print(f"  clusters: {CLUSTER_OF.nunique()} over {len(CLUSTER_OF)} rows", flush=True)
     CURRICULUM = a.curriculum
+    OVERSAMPLE_AG = a.oversample_ag
     PCA_ROWS = a.pca_rows
     print(f"  optim: lr {LR}, weight_decay {WD}, patience {PATIENCE}, "
           f"grad_clip {GRAD_CLIP}", flush=True)
