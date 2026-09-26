@@ -20,9 +20,11 @@ in the table.
 > covers a later phase still** — ranking-loss objectives, a depth × fusion-mechanism factorial
 > sweep on the leader's own two branches, and an early/mid/late fusion-stage ablation. The
 > leader's own FiLM-at-the-end design beats every alternative fusion timing and every simpler
-> combining rule tried; a small candidate improvement (two extra MLP layers) is flagged as
-> inside the seed-spread floor G.2 established, not yet confirmed. Where families disagree, the
-> later one is the later measurement and says so explicitly.
+> combining rule tried; a depth-2 architecture change and a tied-init fix for `split_mutwt`
+> both looked promising at 3 seeds and did NOT survive an 8-seed re-measurement (§G.2). One
+> training-objective change did survive it — a soft-Kendall-tau ranking term added to the
+> regression loss — and is now part of the submitted recipe (DETAILS.md). Where families
+> disagree, the later one is the later measurement and says so explicitly.
 
 > **Read every gap against the seed spread.** Measured at **0.028 to 0.117** depending on
 > configuration (ERROR_ANALYSIS §9). Most rows in this document are separated by less than
@@ -622,6 +624,27 @@ the same 8 seeds — real, but a modest finding, not the standout it looked like
 lesson generalises past this one method: **a 3-seed spread this project has quoted everywhere
 is a floor on the true variability, not an estimate of it**, and a result that depends on being
 in the tail of that floor should be re-measured at more seeds before being trusted.
+
+**Applying that lesson to the two other candidates this sweep produced** (§G.3's best depth
+config, §G.5's `split_mutwt_tied_init`): both re-measured at 8 seeds, matched against the
+plain leader on the identical seeds.
+
+| run | seeds | ens | per-seed mean | seed spread |
+| --- | --- | --- | --- | --- |
+| `kendall_soft` | 8 | **+0.379** | **+0.290** | 0.217 |
+| `struct_film_chem` (plain regression) | 8 | +0.368 | +0.281 | 0.217 |
+| both-branches-depth-2 (§G.3) | 8 | +0.359 | +0.298 | **0.148** |
+| `split_mutwt_tied_init` (§G.5) | 8 | +0.353 | +0.250 | 0.247 |
+
+Neither survives as an ensemble improvement — both land BELOW the plain leader once matched
+on 8 seeds, not just inside its noise. The depth-2 config's profile is genuinely different
+(highest per-seed mean of the four, tightest spread by a wide margin) but its ensemble is
+lower, and this project ships the ensemble (README's own `ens` vs `per seed` distinction) —
+by that standard it is a worse choice, an interesting reliability/ensemble trade-off rather
+than a candidate. `split_mutwt_tied_init` is worse on every column. **`kendall_soft` is the
+only one of the three that beats the leader on the metric that matters, is now part of the
+submitted training recipe** (DETAILS.md's `struct_film_chem` section), and the other two are
+recorded here as negative results, the same way §Family F's confound was.
 
 ### G.3 Depth × fusion, a factorial sweep on the leader's two branches
 

@@ -7,7 +7,12 @@ Predicting how a mutation changes antibody–antigen binding free energy, from *
 embedding from the wild-type at the mutated residue, one shared linear layer, sum — modulated
 by a single FiLM gate built from pooled ProteinMPNN structure at that same site, with
 substitution chemistry and interface geometry concatenated on top. 50,497 trainable
-parameters, both encoders frozen.**
+parameters, both encoders frozen. Trained with the regression loss PLUS a small soft-Kendall-
+tau ranking term (`--rank-method kendall_soft --rank-weight 1.0`) — the only change out of
+dozens tried in a later session that survived being re-measured against the plain-regression
+version on a matched, larger seed count (README §1a; [docs/ARCHITECTURES.md §G.2](docs/ARCHITECTURES.md#g2-ten-ranking-methods-at-a-fixed-weight-and-a-re-measurement-that-mattered)).
+Architecture and parameter count are unchanged; only the training objective differs — see
+below for the evidence.**
 
 **The mechanism that won was a gate, not plain concatenation and not attention.** An earlier
 sweep of 45 configurations — cross-attention in five variants, antibody↔antigen attention
@@ -41,6 +46,27 @@ earlier fix, so the whole sweep ran on an architecture 0.015 worse than the true
 not improving the real model. `struct_film_chem` remains the submitted model. The confound and
 the full sweep are recorded as a negative result in
 [docs/ARCHITECTURES.md §Family F](docs/ARCHITECTURES.md#family-f--injecting-where-a-mutation-sits-relative-to-the-binding-site).
+
+**The one change that DID survive.** A later sweep tried 10 ranking-loss terms added to the
+regression objective, at 3 seeds each; the best-looking one (`kendall_soft`, a smooth
+Kendall-tau-style concordance term) reached +0.391 ens with a TIGHTER seed spread than the
+leader's own 0.092 — exactly the kind of result this project has learned to distrust on sight.
+Re-measured at 8 seeds, matched against the leader on the identical seeds: the tight spread did
+not survive (both land at 0.217 — the leader's own 3-seed spread had never been a reliable
+estimate of it either), but a small edge did:
+
+| run | seeds | ens | per-seed mean | seed spread |
+| --- | --- | --- | --- | --- |
+| `struct_film_chem` + `kendall_soft` | 8 | **+0.379** | **+0.290** | 0.217 |
+| `struct_film_chem` (plain regression) | 8 | +0.368 | +0.281 | 0.217 |
+
+Two other 3-seed candidates that looked competitive (a depth-2 MLP on both branches, and a
+tied-initialisation fix for `split_mutwt`) were also re-measured at 8 seeds and did NOT survive
+— both scored below the plain leader once matched on the same seeds
+([docs/ARCHITECTURES.md §G.2–G.5](docs/ARCHITECTURES.md#g2-ten-ranking-methods-at-a-fixed-weight-and-a-re-measurement-that-mattered)
+has all three). `kendall_soft` is the only one out of everything tried in that later session
+that held up, which is why it is now part of the submitted training recipe rather than a
+recorded negative result — a small, honestly-small improvement, not a new architecture.
 
 | | |
 | --- | --- |

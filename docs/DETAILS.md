@@ -520,15 +520,28 @@ on the seed mean. The 39 columns add +0.029 on top.
 **Head.** `Linear(103 → 128) → GELU → Dropout(0.35) → Linear(128 → 1)`. 50,497
 parameters total. No attention, no RoPE, no cross-molecule pairing.
 
+**Training objective.** MSE plus a small soft-Kendall-tau-style ranking term, within each
+complex: `tanh(Δpred / 0.5) · sign(Δtrue)`, averaged over ordered pairs (|Δtrue| > 0.5
+kcal/mol) and subtracted from 1, weighted at 1.0 and ADDED to the MSE loss (never replacing
+it — pure ranking has no anchor on output scale, JUSTIFICATIONS.md §A1b). The only change,
+out of dozens tried in the same later session, that survived being re-measured at 8 seeds
+matched against plain MSE on the identical seeds: +0.379 ens against +0.368, +0.290 per-seed
+mean against +0.281, same seed spread (0.217) either way — see
+[ARCHITECTURES.md §G.2](ARCHITECTURES.md#g2-ten-ranking-methods-at-a-fixed-weight-and-a-re-measurement-that-mattered)
+for the two other candidates from that sweep that did NOT survive the same check. Small and
+honestly reported as small; the architecture above is completely unchanged.
+
 **What has not yet been done for this model**, honestly listed rather than implied:
 the homology-cluster-split retention number and the full bias/error-analysis battery
-in `ERROR_ANALYSIS.md` — both completed (README §1, `ERROR_ANALYSIS.md` Part IV) — but
-nothing beyond that: a later sweep of ten features describing a mutation's position
-relative to the binding site, injected into the mutation's own projection, did not
-beat this model once measured correctly (a confound in an early comparison made one
-of them look competitive; see
+in `ERROR_ANALYSIS.md` were run against the plain-MSE version (README §1,
+`ERROR_ANALYSIS.md` Part IV) and have not yet been re-run with the ranking-loss addition
+above. A later sweep of ten features describing a mutation's position relative to the
+binding site, injected into the mutation's own projection, did not beat this model once
+measured correctly (a confound in an early comparison made one of them look competitive;
+see
 [ARCHITECTURES.md §Family F](ARCHITECTURES.md#family-f--injecting-where-a-mutation-sits-relative-to-the-binding-site)
-for the full account). `struct_film_chem` remains the submitted model.
+for the full account). `struct_film_chem` (now trained with the ranking-loss addition)
+remains the submitted model.
 
 **What has not yet been done for this model**, honestly listed rather than implied:
 the homology-cluster-split retention number and the full bias/error-analysis battery
