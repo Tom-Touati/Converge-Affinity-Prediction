@@ -887,6 +887,25 @@ class SiteTokenConfig:
     #: proxy for the mutation's effect on folding stability rather than on binding.
     #: Mutually exclusive with struct_bind_feat.
     struct_stab_feat: bool = False
+    #: mut_pair_ffn only. The antigen side scores far worse than the antibody side (pooled
+    #: Pearson +0.236 against +0.647, struct_film_chem_kendall) despite z_seq's own
+    #: construction giving the network no explicit signal for WHICH side a mutation is on --
+    #: ab and ag contributions are just summed, unweighted (see mut_side_gate for the other
+    #: half of this pair). This adds a 3-way category (ab-only / ag-only / both, derived
+    #: directly from which side's site mask is nonzero -- no new data column, so it is exactly
+    #: consistent with however the crop defines "the mutated residues" everywhere else) and a
+    #: learned nn.Embedding(3, w) added to z_seq before fusion. Mutually exclusive in principle
+    #: with mut_side_gate, though nothing stops running both; the ablation runs them separately.
+    mut_side_embed: bool = False
+    #: mut_pair_ffn only. Where mut_side_embed adds a location signal AFTER ab and ag are
+    #: already summed, this changes the SUM itself: instead of z_seq = h_ab + h_ag (fixed,
+    #: unweighted), a small embedding of the same 3-way mut_side category is projected to two
+    #: FiLM-style (1+delta) gates and z_seq = gate_ab * h_ab + gate_ag * h_ag. The projection is
+    #: the only
+    #: new mechanism -- the gate never sees h_ab/h_ag's own content, only which side the
+    #: mutation is on, so it can learn e.g. "trust the ag branch less" as a fixed correction
+    #: rather than a per-example one.
+    mut_side_gate: bool = False
     #: mut_pair_ffn only. tok_proj's first Linear is keyed by side (ab/ag) but NOT by
     #: mutant-vs-wild-type -- LN(mt) and LN(wt) both come out of the SAME map before being
     #: subtracted. That is the identical weight-sharing this project's own rule (never
@@ -1336,6 +1355,18 @@ class PerturbSiteToken(nn.Module):
                 # training step with "no attribute ord_b0" -- the head was never built
                 self.ord_b0 = nn.Parameter(torch.zeros(1))
                 self.ord_gap = nn.Parameter(torch.full((c.ordinal - 1,), 0.5))
+            if c.mut_side_embed:
+                # Same early-return trap as ordinal above: this branch (mut_pair_ffn=True,
+                # every config in this project) returns before the fall-through construction
+                # at the bottom of __init__ ever runs, so building these there is dead code.
+                self.mut_side_emb = nn.Embedding(3, w)      # 0=ab-only, 1=ag-only, 2=both
+                nn.init.zeros_(self.mut_side_emb.weight)     # starts a no-op
+            if c.mut_side_gate:
+                self.mut_side_emb2 = nn.Embedding(3, 8)
+                nn.init.zeros_(self.mut_side_emb2.weight)
+                self.mut_side_gate_proj = nn.Linear(8, 2)
+                nn.init.zeros_(self.mut_side_gate_proj.weight)
+                nn.init.zeros_(self.mut_side_gate_proj.bias)  # both gates start at 1+0=1 exactly
             return
         pw = c.pool_proj or w
         self.pool_proj = (nn.Linear(seq_in, c.pool_proj, bias=False)
@@ -1428,13 +1459,27 @@ class PerturbSiteToken(nn.Module):
             # something the optimiser is merely encouraged to discover.
             self.ord_b0 = nn.Parameter(torch.zeros(1))
             self.ord_gap = nn.Parameter(torch.full((c.ordinal - 1,), 0.5))
+        # mut_side_embed/mut_side_gate are mut_pair_ffn-only (see their docstrings) and are
+        # built inside that branch above, which returns before reaching here -- not repeated
+        # in this fall-through path, unlike ordinal, since neither has a defined meaning
+        # outside mut_pair_ffn's own per-side pooling.
+
+    def _mut_side_idx(self, batch) -> torch.Tensor:
+        """(B,) 0=ab-only, 1=ag-only, 2=both -- derived directly from which side's site mask
+        is nonzero, not from a stored column, so it is exactly consistent with however the
+        crop defines "the mutated residues" everywhere else in this file (mut_side_embed,
+        mut_side_gate)."""
+        has_ab = batch["site_ab"].sum(1) > 0
+        has_ag = batch["site_ag"].sum(1) > 0
+        idx = torch.where(has_ab & has_ag, 2, torch.where(has_ag, 1, 0))
+        return idx.long()
 
     def _mut_pair_ffn(self, batch, px, tok_proj) -> torch.Tensor:
         """At each mutated residue: GELU(proj) -> LN(mt) combine LN(wt) -> Linear, summed."""
         c = self.cfg
         stage = getattr(c, "fusion_stage", "late")
         gelu = torch.nn.functional.gelu
-        acc = 0
+        pooled = {}
         for side in ("ab", "ag"):
             site = batch[f"site_{side}"].unsqueeze(-1)
             st = None
@@ -1476,7 +1521,24 @@ class PerturbSiteToken(nn.Module):
                 # Structure reweights an ALREADY-COMPUTED "what changed" signal, one residue
                 # at a time, rather than reshaping the residues that feed it.
                 h = h + st
-            acc = acc + (h * site).sum(1)
+            pooled[side] = (h * site).sum(1)
+        if c.mut_side_gate:
+            # The projection IS the mechanism: two (1 + delta) gates -- FiLM's own "starts as
+            # a no-op" convention (docs: "keeps gamma(0) == 0, so a null edit is zero"), not a
+            # sigmoid -- from a category embedding that never sees h_ab/h_ag's own content, so
+            # this can only learn a fixed per-location correction (e.g. "trust the ag branch
+            # less everywhere"), not a per-example reweighting -- that would need the gate to
+            # read pooled itself, a different, larger change this config deliberately does not
+            # make. Zero-initialised weight and bias make BOTH gates exactly 1.0 at the start
+            # of training, exactly reproducing the plain sum below -- a sigmoid gate would
+            # start at 0.5 and immediately halve every mutation's contribution.
+            idx = self._mut_side_idx(batch)
+            gate = 1.0 + self.mut_side_gate_proj(self.mut_side_emb2(idx))  # (B, 2)
+            acc = gate[:, 0:1] * pooled["ab"] + gate[:, 1:2] * pooled["ag"]
+        else:
+            acc = pooled["ab"] + pooled["ag"]
+        if c.mut_side_embed:
+            acc = acc + self.mut_side_emb(self._mut_side_idx(batch))
         return acc
 
     def _mut_feat_bias(self, batch, px, side: str) -> torch.Tensor:
