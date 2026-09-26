@@ -45,15 +45,16 @@ from src import paths  # noqa: E402
 EDGES = (-0.5, 0.5)
 NAMES = ("stabilising", "neutral", "destabilising")
 MODELS = {
-    "forest":       ("reports", "E0a_rf_handcrafted_seed0"),
-    "film_chem":    ("oof", "struct_film_chem"),          # the submitted model
-    "film_esmif":   ("oof", "struct_film_chem_esmif"),
-    "gated_cg":     ("oof", "gated_cg_clusterscale"),
-    "film_nochem":  ("oof", "struct_film_site"),
-    "seq_only":     ("oof", "mut_pair_ffn_sub"),
-    "delta_xattn":  ("oof", "delta_xattn2"),
-    "l1_gated":     ("oof", "l1_gated"),
-    "l1_concat":    ("oof", "cat128_reg2_l1"),            # the previous submission
+    "forest":        ("reports", "E0a_rf_handcrafted_seed0"),
+    "film_kendall":  ("oof", "struct_film_chem_kendall"),  # the submitted model
+    "film_chem":     ("oof", "struct_film_chem"),          # superseded: same arch, plain MSE
+    "film_esmif":    ("oof", "struct_film_chem_esmif"),
+    "gated_cg":      ("oof", "gated_cg_clusterscale"),
+    "film_nochem":   ("oof", "struct_film_site"),
+    "seq_only":      ("oof", "mut_pair_ffn_sub"),
+    "delta_xattn":   ("oof", "delta_xattn2"),
+    "l1_gated":      ("oof", "l1_gated"),
+    "l1_concat":     ("oof", "cat128_reg2_l1"),            # the previous submission
 }
 
 

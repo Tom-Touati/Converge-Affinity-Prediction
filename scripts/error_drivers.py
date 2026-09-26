@@ -33,15 +33,17 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from src import paths                 # noqa: E402
 
 MUT = re.compile(r"^([A-Z])([A-Za-z0-9])(-?\d+[A-Za-z]?)([A-Z])$")
-#: "film_chem" is the SUBMITTED model (was cat128, superseded); the others are there to show
-#: which failures are shared rather than specific to one architecture.
+#: "film_kendall" is the SUBMITTED model (struct_film_chem + the kendall_soft training-
+#: objective addition; film_chem was cat128, then plain struct_film_chem, both superseded);
+#: the others are there to show which failures are shared rather than specific to one arch.
 MODELS = {
-    "forest":     ("reports", "E0a_rf_handcrafted_seed0"),   # the baseline
-    "film_chem":  ("oof", "struct_film_chem"),               # the submitted model
-    "film_esmif": ("oof", "struct_film_chem_esmif"),
-    "gated_cg":   ("oof", "gated_cg_clusterscale"),
-    "seq_only":   ("oof", "mut_pair_ffn_sub"),
-    "cat128":     ("oof", "cat128_reg2_l1"),                 # the previous submission
+    "forest":       ("reports", "E0a_rf_handcrafted_seed0"),   # the baseline
+    "film_kendall": ("oof", "struct_film_chem_kendall"),       # the submitted model
+    "film_chem":    ("oof", "struct_film_chem"),               # superseded: same arch, plain MSE
+    "film_esmif":   ("oof", "struct_film_chem_esmif"),
+    "gated_cg":     ("oof", "gated_cg_clusterscale"),
+    "seq_only":     ("oof", "mut_pair_ffn_sub"),
+    "cat128":       ("oof", "cat128_reg2_l1"),                 # the previous submission
 }
 MIN_ABS = 0.05          # ignore correlations smaller than this in the summary
 
@@ -121,7 +123,9 @@ def main() -> None:
                 e = fn((p.loc[idx] - ref.y_true.loc[idx]).values)
                 xv = x.loc[idx].values
                 ok = ~(np.isnan(xv) | np.isnan(e))
-                rec[tag] = spearmanr(xv[ok], e[ok]).statistic if ok.sum() > 50 else np.nan
+                # [0] not .statistic: scipy < 1.9 returns a plain tuple with no .statistic
+                # attribute, and both old and new SpearmanrResult support [0] indexing.
+                rec[tag] = spearmanr(xv[ok], e[ok])[0] if ok.sum() > 50 else np.nan
             rows.append(rec)
         t = pd.DataFrame(rows).set_index("descriptor")
         t["mean_abs"] = t.abs().mean(axis=1)
@@ -141,7 +145,7 @@ def main() -> None:
             idx = preds[a].index.intersection(preds[b].index).intersection(ref.index)
             ea = (preds[a].loc[idx] - ref.y_true.loc[idx]).abs()
             eb = (preds[b].loc[idx] - ref.y_true.loc[idx]).abs()
-            M.loc[a, b] = spearmanr(ea, eb).statistic
+            M.loc[a, b] = spearmanr(ea, eb)[0]
     print(M.round(3).to_string())
     print("\nHigh off-diagonal values mean the architectures are not failing independently,")
     print("so an ensemble of them cannot recover much -- the hard rows are hard for all.")

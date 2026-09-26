@@ -150,17 +150,21 @@ either split. Not pursued further — see
 [docs/ARCHITECTURES.md §G.6](docs/ARCHITECTURES.md#g6-the-submitted-recipe-under-the-homology-cluster-split-and-a-seq-depth-2-variant-that-loses-on-both-splits)
 for the full comparison table.
 
-The full bias/error-analysis battery in [ERROR_ANALYSIS.md](ERROR_ANALYSIS.md) Part IV was run
-against the plain-MSE version of this model (six models including its ESM-IF1 variant and the
-gated-fusion runner-up); Parts I–III still describe `cat128_reg2_l1` and are kept as history,
-not silently carried over. The `kendall_soft` addition has been run through `bias_analysis.py`,
-`class_separation.py` and `error_drivers.py` separately (not yet folded into Part IV's own
-table): it fails on almost exactly the same rows as the plain version (0.950 error
-correlation, the highest of any pair measured), with slightly DAMPENED versions of the same
-structure-correlated biases (e.g. `n_contacts` signed-error correlation −0.331 vs −0.339) and
-a small pooled class-separation loss (AUC stab|dest 0.831 vs 0.841) alongside a small
-within-complex ranking gain (0.770 vs 0.758) — consistent with a genuine but modest effect on
-the same underlying model, not a different failure mode.
+The full bias/error-analysis battery in [ERROR_ANALYSIS.md](ERROR_ANALYSIS.md) Parts I–IV
+describes `cat128_reg2_l1` (Parts I–III) and the plain-MSE `struct_film_chem` (Part IV).
+**[Part V](ERROR_ANALYSIS.md#part-v--the-training-objective-changed-kendall_soft-and-the-failures-mostly-didnt)**
+now covers `struct_film_chem_kendall`, the actually-submitted model, with `film_kendall` wired
+into `bias_analysis.py`/`class_separation.py`/`error_drivers.py`'s own `MODELS` dicts rather than
+patched in at runtime. It fails on almost exactly the same rows as the plain version (0.950
+error correlation, the highest of any pair measured in the project), a small pooled
+class-separation loss (AUC stab|dest 0.831 vs 0.841) alongside a small within-complex gain (0.770
+vs 0.758), and a small precision gain on large-effect rows. **Correcting an earlier, less
+careful readout of this same comparison**: the geometry-descriptor bias is NOT uniformly
+dampened — two of the three columns Part IV's §29 tracks got slightly *worse* under
+`kendall_soft` (`rsasa_bound` 0.331 vs 0.279, `min_dist_partner` 0.283 vs 0.267), only
+`n_contacts` moved the other way, and by less than run-to-run noise (−0.331 vs −0.339). Net
+read: a genuine but modest effect on the same underlying model, not a different failure mode —
+see Part V for the full, honest breakdown rather than the summary above.
 
 `ens` averages the seeds then scores once — what you would ship. `per seed` scores each seed
 separately — what one training run gives you. **`spread` is max − min across seeds, and it is
