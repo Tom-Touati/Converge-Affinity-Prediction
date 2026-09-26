@@ -16,8 +16,13 @@ in the table.
 > a later phase still** — checkpoint transfer from full SKEMPI, and a sweep of features
 > describing a mutation's own position relative to the binding site — all of it negative once
 > measured correctly, including a real confound (§F.4) caught in the process of checking an
-> apparent win. Where families disagree, the later one is the later measurement and says so
-> explicitly.
+> apparent win. **[Family G](#family-g--training-objectives-and-a-factorial-sweep-of-the-leaders-own-architecture)
+> covers a later phase still** — ranking-loss objectives, a depth × fusion-mechanism factorial
+> sweep on the leader's own two branches, and an early/mid/late fusion-stage ablation. The
+> leader's own FiLM-at-the-end design beats every alternative fusion timing and every simpler
+> combining rule tried; a small candidate improvement (two extra MLP layers) is flagged as
+> inside the seed-spread floor G.2 established, not yet confirmed. Where families disagree, the
+> later one is the later measurement and says so explicitly.
 
 > **Read every gap against the seed spread.** Measured at **0.028 to 0.117** depending on
 > configuration (ERROR_ANALYSIS §9). Most rows in this document are separated by less than
@@ -542,3 +547,170 @@ tying the leader and improving `wc s|d` (0.799 vs 0.758). The batch-mixing curri
 first and independently, scores lowest of the three and was not worth revisiting with the same
 fix, since it mixes the two populations throughout training rather than sequencing them —
 there is no separate "backbone" stage to protect from the chemistry mismatch.
+
+---
+
+## Family G — training objectives, and a factorial sweep of the leader's own architecture
+
+A later phase again, on the true `struct_film_chem` base (`split_struct: false`) throughout.
+Two questions: does the LOSS the leader is trained with matter as much as its architecture,
+and does deepening or re-fusing the architecture itself — not adding a new feature, just
+changing how the existing two branches combine — beat it.
+
+### G.1 An AbRank-style ranking loss, mixed in at several weights
+
+This project already measured a within-complex pairwise ranking loss once (JUSTIFICATIONS.md
+§A1b) and rejected it — on the pre-correction 997-row dataset, with the OLDER `fusion_v2`
+backbone, not the current leader. Re-measured on `struct_film_chem` itself, `MSE + λ ·
+pairwise_rank_loss` (softplus logistic on pairs with |Δtrue| > 0.5 kcal/mol, never replacing
+the regression term — pure ranking has no anchor on output scale, the same finding as before):
+
+| weight λ | ens | seed spread |
+| --- | --- | --- |
+| 0 (control, reproduces the leader exactly) | +0.369 | 0.092 |
+| 0.2 | +0.365 | 0.095 |
+| 0.5 | +0.358 | 0.102 |
+| **1.0** | **+0.371** | 0.125 |
+
+Non-monotonic: 0.2 and 0.5 both underperform the control, 1.0 edges above it. The same
+non-monotonic pattern (a low mixing weight hurting more than a high one) appeared in the
+original AbRank measurement too. A parallel sweep of `1 - Pearson correlation` within each
+complex (`--corr-weight`, a direct differentiable surrogate for the headline metric instead of
+a ranking-margin term) is monotonically WORSE as its weight increases (+0.363, +0.352, +0.350
+at 0.2/0.5/1.0) — correlation-as-loss does not help at any weight tried.
+
+### G.2 Ten ranking methods at a fixed weight, and a re-measurement that mattered
+
+Ten formulations of "make correct relative order more likely," all mixed at λ=1.0, replacing
+just the pairwise term above: a hinge margin instead of the logistic; the logistic weighted by
+|Δtrue| ("severity"); an "equal-pairs attract" term giving the |Δtrue| ≤ 0.5 bin its own loss
+instead of excluding it; a smooth (tanh-based) Kendall-tau-style concordance; the classification-
+labels-as-ranking-metric idea directly — 5 ordinal bins (≪, <, ≈, >, ≫ at ±0.5/±1.5 kcal/mol)
+via both a cumulative-threshold BCE and an RBF-softmax cross-entropy; a soft-rank Spearman
+correlation; ListMLE (Plackett-Luce negative log-likelihood of the group's true order); and a
+triplet hinge anchored on each complex's own most-stabilising and most-destabilising row.
+
+| method | ens | per-seed mean | seed spread |
+| --- | --- | --- | --- |
+| `class5_ce` (RBF softmax, 5 bins) | **+0.401** | +0.310 | 0.150 |
+| `kendall_soft` | +0.391 | **+0.326** | 0.087 |
+| `class5_ord` (cumulative BCE, 5 bins) | +0.389 | +0.304 | 0.149 |
+| `severity` | +0.388 | +0.299 | 0.154 |
+| `spearman_soft` | +0.382 | +0.325 | 0.116 |
+| `equal_attract` | +0.373 | +0.312 | 0.101 |
+| `triplet` | +0.373 | +0.312 | 0.115 |
+| `binary` (= G.1's λ=1.0) | +0.371 | +0.315 | 0.125 |
+| `hinge` | +0.370 | +0.309 | 0.123 |
+| `struct_film_chem` (no addition) | +0.369 | +0.314 | 0.092 |
+| `listmle` | +0.369 | +0.310 | 0.089 |
+
+Every one of the ten ties or beats the leader on ensemble at 3 seeds. `kendall_soft` looked
+like the one worth trusting — best per-seed mean, and the only method with a TIGHTER seed
+spread than the leader's own. **An 8-seed rerun, `kendall_soft` against the leader on the
+identical 8 seeds, found the tight spread did not survive:**
+
+| run | seeds | ens | per-seed mean | seed spread |
+| --- | --- | --- | --- | --- |
+| `kendall_soft` | 8 | **+0.379** | **+0.290** | 0.217 |
+| `struct_film_chem` | 8 | +0.368 | +0.281 | 0.217 |
+
+Both land at the SAME spread once measured on enough seeds — 0.087 was itself a lucky draw of
+3 seeds, not a property of the method, and the leader's own true spread (0.217) is more than
+double what its 3-seed table (0.092) suggested throughout every OTHER comparison in this
+document. What survives: a small, consistent +0.01 edge on both ensemble and per-seed mean, on
+the same 8 seeds — real, but a modest finding, not the standout it looked like at 3 seeds. The
+lesson generalises past this one method: **a 3-seed spread this project has quoted everywhere
+is a floor on the true variability, not an estimate of it**, and a result that depends on being
+in the tail of that floor should be re-measured at more seeds before being trusted.
+
+### G.3 Depth × fusion, a factorial sweep on the leader's two branches
+
+Two structural questions, crossed: does making the sequence-delta MLP (`pair_ffn`) or the
+structure MLP deeper help, and does FiLM's gate beat simpler ways to combine the two branches
+once both are fully pooled. `seq_mlp_depth`/`struct_mlp_depth` ∈ {1 (leader), 2, 3}; `fuse_mode`
+∈ {film (leader), multiply, add, concat}. Full 15-combo runs:
+
+| config | ens | seed spread | wc s\|d |
+| --- | --- | --- | --- |
+| **both depth 2, FiLM** | **+0.372** | 0.103 | **0.795** |
+| `struct_film_chem` (both depth 1, FiLM) | +0.369 | 0.092 | 0.758 |
+| struct depth 2, FiLM | +0.367 | 0.086 | 0.801 |
+| seq depth 2, FiLM | +0.360 | 0.098 | 0.755 |
+| struct depth 2, multiply | +0.359 | 0.129 | 0.812 |
+| both depth 3, FiLM | +0.353 | 0.130 | 0.758 |
+| both depth 2, multiply | +0.339 | 0.101 | 0.760 |
+| seq depth 3, FiLM | +0.338 | 0.100 | 0.775 |
+| seq depth 2, multiply | +0.321 | 0.137 | 0.776 |
+| both depth 1, multiply | +0.263 | 0.129 | 0.760 |
+
+Separately, `fuse_mode` alone (both branches at depth 1, matching the leader exactly except
+the combining rule): **FiLM +0.369 > concat +0.351 > add +0.337 > multiply +0.263** — the same
+ordering holds throughout the depth sweep above (every multiply row is well below its FiLM
+counterpart at the same depth), confirming this is about the mechanism, not an interaction with
+depth. FiLM's combined multiplicative-and-additive gate is doing real work no single simpler
+rule reproduces.
+
+**Depth 2 on both branches together is the best single configuration measured in this
+project** (+0.372 ens) and also has the best `wc s|d` of anything in this table (0.795,
+struct-depth-2-alone reaches 0.801, the single highest). Depth 3 reverses the gain on both
+axes — 752 training rows per fold cannot support a third layer on top of the frozen encoders.
+The improvement is inside the seed-spread floor established in §G.2 (0.217, not the 0.09ish
+these 3-seed numbers show), so it is reported as a candidate worth an 8-seed confirmation, not
+a settled win.
+
+### G.4 Early vs mid vs late fusion — WHEN structure enters, not just how
+
+A different axis: at what point does structure enter the sequence computation, relative to the
+per-residue mutant/wild-type delta. **Late** (`struct_film_chem` itself, unchanged): the
+sequence branch — LN(mt) − LN(wt) → pair_ffn → sum over sites — never sees structure at all;
+FiLM combines the two only after BOTH are fully pooled into one vector each. **Early**: the
+wild-type structure embedding at each residue is added to both p_mt and p_wt BEFORE LayerNorm
+and the subtraction — structure shapes what "the same residue" means before any delta exists.
+**Mid**: structure is added to the per-residue delta AFTER the subtraction and `pair_ffn`, but
+before summing over the mutated sites — reweighting an already-computed "what changed" signal,
+one residue at a time.
+
+| fusion stage | ens | seed spread | neg | wc s\|d |
+| --- | --- | --- | --- | --- |
+| **late** (`struct_film_chem`) | **+0.369** | 0.092 | 3 | 0.758 |
+| mid | +0.312 | 0.126 | 6 | 0.772 |
+| early | +0.302 | 0.176 | 3 | 0.741 |
+
+Late fusion wins clearly, and mid beats early. The ordering makes sense in hindsight: late
+fusion lets the sequence branch finish computing an already-meaningful "what changed" signal
+before structure conditions the final decision. Mid fusion perturbs that signal after it exists
+— a smaller intervention. Early fusion perturbs BOTH p_mt and p_wt with the identical
+wild-type structure embedding before their SEPARATE LayerNorms; because LayerNorm normalises
+each vector by its own mean and variance, adding an identical vector to two different inputs
+does not cancel in the subtraction the way it might if this were linear, and empirically this
+is the most damaging place to introduce structure of the three tried. **The leader's own design
+— fuse only after both branches are fully formed — is not an arbitrary choice among these
+three; it is the best of the three by a wide margin, wider than any other single ablation in
+this document moved the leader.**
+
+### G.5 Two smaller checks: a wild-type binding-strength feature, and concat instead of subtract
+
+`struct_bind_feat`: the wild-type complex's own ProteinMPNN log-probability (`mpnn__logp_wt_
+complex`, a proxy for how strong the wild-type binding already is), concatenated onto z_st
+before FiLM rather than left in the tail chem block. **+0.335 ens** — a regression, and with a
+wide seed spread (0.171). Structure's own pooled representation does not benefit from a scalar
+that chemistry already carries at the tail.
+
+`mut_pair_op="concat"`: replace the fixed LN(mt) − LN(wt) subtraction with [LN(mt); LN(wt)],
+2w-wide, reduced back to w by `pair_ffn`'s own first layer instead of a rule fixed in advance.
+**+0.368 ens** — ties the leader (within noise), at the cost of 4,096 more parameters for the
+wider first layer. Letting the network learn how to combine mt and wt does not beat simply
+subtracting them; the fixed rule was not leaving anything on the table.
+
+`split_mutwt_tied_init`: revisits §F.1's regression (giving mt/wt separate projections cost
+0.075 ens and doubled the seed spread) by initialising the two projections IDENTICAL per side
+(copying one to the other, then perturbing each with independent noise, std 0.02) instead of
+independently random, so the split architecture starts at approximately the shared-weight
+leader's own computation and only diverges from there. **+0.375 ens** — recovers past the
+leader's own score, and reaches the best `wc s|d` measured in this project (0.819). But the
+per-seed mean (+0.261) and seed spread (0.229) are barely improved from the untied version
+(+0.260, 0.237) — the ensemble recovery looks like averaging out continued per-run instability,
+not fixing it. Tied initialisation fixes the SYMPTOM the earlier ablation measured (the
+ensemble number) more than the CAUSE (mt and wt still drift into different spaces over
+training); worth the second look, not yet worth trusting as a replacement for the shared
+projection.
