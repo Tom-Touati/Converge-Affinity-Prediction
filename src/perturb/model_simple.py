@@ -934,6 +934,15 @@ class SiteTokenConfig:
     #: antigen-specific or "more depth anywhere helps a bit."
     proj_depth_ab: int = 1
     proj_depth_ag: int = 1
+    #: mut_pair_ffn only. A per-side (ab=0/ag=1) identity, CONCATENATED onto the mt-wt delta
+    #: before the SHARED pair_ffn -- see the constructor comment for how this differs from
+    #: mut_side_embed/gate (which act once, after pooling). side_tag_dim sets its width.
+    side_tag_concat: bool = False
+    side_tag_dim: int = 8
+    #: mut_pair_ffn only. The same per-side identity, ADDED to h (per-residue) before the site
+    #: mask pools it -- masked out exactly like the real signal for whichever side has no
+    #: mutated residue this row.
+    side_tag_add: bool = False
     #: mut_pair_ffn only. tok_proj's first Linear is keyed by side (ab/ag) but NOT by
     #: mutant-vs-wild-type -- LN(mt) and LN(wt) both come out of the SAME map before being
     #: subtracted. That is the identical weight-sharing this project's own rule (never
@@ -1284,8 +1293,24 @@ class PerturbSiteToken(nn.Module):
             return
         if c.mut_pair_ffn:
             self.pair_ln = nn.LayerNorm(w, elementwise_affine=False)  # no params, so one
-            pair_in = 2 * w if c.mut_pair_op == "concat" else w
+            tag_dim = getattr(c, "side_tag_dim", 8) if getattr(c, "side_tag_concat", False) else 0
+            pair_in = (2 * w if c.mut_pair_op == "concat" else w) + tag_dim
             self.pair_ffn = _mlp_stack(w, getattr(c, "seq_mlp_depth", 1), in_w=pair_in)
+            if c.side_tag_concat:
+                # A per-side identity CONCATENATED onto the mt-wt delta before the shared
+                # pair_ffn sees it -- unlike mut_side_embed/gate (added AFTER pooling, once
+                # per row), this reaches every layer of the shared transformation itself, so
+                # pair_ffn can in principle learn side-conditional behaviour despite sharing
+                # its weights across ab and ag. Zero-initialised: pair_ffn's extra input
+                # columns start multiplying an all-zero tag regardless of side, so this is a
+                # no-op at initialisation like every other addition this session.
+                self.side_tag_emb = nn.Embedding(2, tag_dim)   # 0=ab, 1=ag
+                nn.init.zeros_(self.side_tag_emb.weight)
+                # NOT a no-op at initialisation, unlike side_tag_add below: pair_ffn's first
+                # layer is genuinely wider (in_w includes tag_dim), so its OWN random init
+                # draws a different weight matrix (and, under fan-in-scaled init, a different
+                # SCALE) than the unwidened leader's, even though the tag itself starts at
+                # zero. This is the same situation mut_pair_op="concat" is already in.
             self.proj_mutwt = (
                 nn.ModuleDict({f"{side}_{which}": nn.Linear(seq_in, c.proj, bias=False)
                                for side in ("ab", "ag") for which in ("mt", "wt")})
@@ -1398,6 +1423,20 @@ class PerturbSiteToken(nn.Module):
                 self.mut_side_gate_proj = nn.Linear(8, 2)
                 nn.init.zeros_(self.mut_side_gate_proj.weight)
                 nn.init.zeros_(self.mut_side_gate_proj.bias)  # both gates start at 1+0=1 exactly
+            if c.side_tag_add:
+                # A per-side identity ADDED to h, the per-residue "what changed" vector,
+                # BEFORE (h * site).sum(1) -- masked out exactly like the real signal is for
+                # the side that has no mutated residue this row, never introducing a constant
+                # per-side baseline the way adding it to the already-pooled vector
+                # unconditionally would. Built here (not next to pair_ffn/side_tag_concat
+                # above) for the same reason mut_side_embed/gate are: this is a plain
+                # nn.Embedding with no effect on any OTHER layer's shape, so it is the one
+                # tag mechanism that CAN be an exact no-op at initialisation -- but only if
+                # building it doesn't shift the RNG draws every later-constructed layer's own
+                # random init consumes. Building it last, right before return, means nothing
+                # is constructed after it in this branch to shift.
+                self.side_tag_emb2 = nn.Embedding(2, w)        # 0=ab, 1=ag
+                nn.init.zeros_(self.side_tag_emb2.weight)
             return
         pw = c.pool_proj or w
         self.pool_proj = (nn.Linear(seq_in, c.pool_proj, bias=False)
@@ -1545,6 +1584,11 @@ class PerturbSiteToken(nn.Module):
                 comb = torch.cat([n_mt, n_wt], dim=-1)
             else:
                 comb = n_mt * n_wt
+            if c.side_tag_concat:
+                side_idx = comb.new_tensor(0 if side == "ab" else 1, dtype=torch.long)
+                tag = self.side_tag_emb(side_idx)                        # (tag_dim,)
+                tag = tag.view(1, 1, -1).expand(comb.shape[0], comb.shape[1], -1)
+                comb = torch.cat([comb, tag], dim=-1)
             h = self.pair_ffn(comb)
             if c.mut_pair_act:
                 h = torch.nn.functional.gelu(h)
@@ -1552,6 +1596,9 @@ class PerturbSiteToken(nn.Module):
                 # Structure reweights an ALREADY-COMPUTED "what changed" signal, one residue
                 # at a time, rather than reshaping the residues that feed it.
                 h = h + st
+            if c.side_tag_add:
+                side_idx = h.new_tensor(0 if side == "ab" else 1, dtype=torch.long)
+                h = h + self.side_tag_emb2(side_idx)   # (w,), broadcasts over (B, L, w)
             pooled[side] = (h * site).sum(1)
         if c.mut_side_gate:
             # The projection IS the mechanism: two (1 + delta) gates -- FiLM's own "starts as

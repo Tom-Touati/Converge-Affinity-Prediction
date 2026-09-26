@@ -66,6 +66,8 @@ CONFIGS = {
     "mut_side_gate": dict(mut_pair_struct_inject="film_site", mut_side_gate=True),
     "proj_depth_ag": dict(mut_pair_struct_inject="film_site", proj_depth_ag=2),
     "proj_depth_both": dict(mut_pair_struct_inject="film_site", proj_depth_ab=2, proj_depth_ag=2),
+    "side_tag_concat": dict(mut_pair_struct_inject="film_site", side_tag_concat=True),
+    "side_tag_add": dict(mut_pair_struct_inject="film_site", side_tag_add=True),
     "fusion_early": dict(mut_pair_struct_inject="none", fusion_stage="early"),
     "fusion_mid": dict(mut_pair_struct_inject="none", fusion_stage="mid"),
     "bsite_crop_concat": dict(mut_pair_struct_inject="film_site", bsite_extra="crop_concat"),
