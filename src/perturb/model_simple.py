@@ -874,6 +874,15 @@ class SiteTokenConfig:
     #: Structure additionally used to FALL BACK to the sequence projection whenever
     #: mpnn_proj was unset, which is the same violation by another route.
     split_proj: bool = True
+    #: Overrides split_proj for STRUCTURE's first linear layer only (_make_struct_proj),
+    #: leaving sequence's proj_side exactly as split_proj already sets it. None (default)
+    #: defers to split_proj, so every existing config is unaffected. Exists because
+    #: splitting sequence and splitting structure turned out to be two independent
+    #: findings, not one -- splitting sequence's projection is neutral-to-positive
+    #: everywhere it's been tried, but splitting structure's alone cost struct_film_chem
+    #: +0.015 ens (struct_film_chem_splitstruct, +0.354 vs +0.369) -- and split_proj had
+    #: been silently coupling both together since the day structure's split was added.
+    split_struct: bool | None = None
     input_noise: float = 0.0
     feature_dropout: float = 0.0
 
@@ -1042,6 +1051,16 @@ class PerturbSiteToken(nn.Module):
                 self.mut_feat_proj = self._make_struct_proj(c, seq_in, w)
             elif mf != "none":
                 self.mut_feat_proj = nn.Linear(1, w)
+            if mf != "none":
+                # A brand-new signal added straight into p_mt starts with the SAME
+                # magnitude as the rest of the projection on step one -- effectively a
+                # random perturbation to an otherwise-working representation, before the
+                # network has any evidence the feature helps. A learned sigmoid gate,
+                # initialised at -4 (sigmoid(-4) = 0.018), starts the model at
+                # approximately the ungated baseline and lets gradient descent open the
+                # gate only if the feature earns it, rather than forcing that decision at
+                # init.
+                self.mut_feat_gate = nn.Parameter(torch.tensor(-4.0))
             d = w
             if c.mut_pair_struct_xattn:
                 self.mpnn_proj = self._make_struct_proj(c, seq_in, w)
@@ -1230,8 +1249,10 @@ class PerturbSiteToken(nn.Module):
         return acc
 
     def _mut_feat_bias(self, batch, px, side: str) -> torch.Tensor:
-        """(B, L, w) bias for p_mt, from SiteTokenConfig.mut_feat -- see its docstring."""
+        """(B, L, w) bias for p_mt, from SiteTokenConfig.mut_feat -- see its docstring.
+        Scaled by a learned gate that starts near zero (see mut_feat_gate's comment)."""
         c = self.cfg
+        gate = torch.sigmoid(self.mut_feat_gate)
         if c.mut_feat == "nearest_partner_struct":
             other = "ag" if side == "ab" else "ab"
             dist = batch["dist"]                                  # (B, Lab, Lag)
@@ -1242,8 +1263,9 @@ class PerturbSiteToken(nn.Module):
             feat = torch.gather(st_other, 1,
                                 nn_idx.unsqueeze(-1).expand(-1, -1, st_other.shape[-1]))
             proj = self.mut_feat_proj
-            return proj[side](feat) if isinstance(proj, nn.ModuleDict) else proj(feat)
-        return self.mut_feat_proj(self._mut_feat_scalar(batch, side).unsqueeze(-1))
+            raw = proj[side](feat) if isinstance(proj, nn.ModuleDict) else proj(feat)
+            return gate * raw
+        return gate * self.mut_feat_proj(self._mut_feat_scalar(batch, side).unsqueeze(-1))
 
     def _mut_feat_scalar(self, batch, side: str) -> torch.Tensor:
         """(B, L) scalar feature per residue on `side`. Meaningful only at site positions;
@@ -1312,9 +1334,17 @@ class PerturbSiteToken(nn.Module):
         embeddings through ONE shared map -- the same weight-sharing split_proj exists to
         prevent, just missed on the structure side because sequence was the branch that
         had a proj_side pattern to copy from.
+
+        Measured afterwards (struct_film_chem_splitstruct, +0.354 vs the shared-projection
+        leader's +0.369): splitting structure's projection alone is a net loss for THIS
+        architecture, unlike splitting sequence's. split_struct decouples the two so a
+        config can keep split_proj's sequence behaviour while choosing structure
+        independently -- None (the default) defers to split_proj, preserving every
+        existing config's behaviour exactly; True/False overrides just this layer.
         """
         dim = c.struct_pca_dim or seq_in
-        if c.split_proj:
+        split = c.split_proj if getattr(c, "split_struct", None) is None else c.split_struct
+        if split:
             return nn.ModuleDict({k: nn.Linear(dim, w, bias=False) for k in ("ab", "ag")})
         return nn.Linear(dim, w, bias=False)
 

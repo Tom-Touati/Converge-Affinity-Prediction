@@ -11,8 +11,13 @@ in the table.
 
 > **Families A–D are the first 45 runs. [Family E](#family-e--the-site-pair-ladder-and-how-the-submitted-model-changed)
 > covers a later phase** (~30 further 3-seed configurations plus a 200-trial single-seed
-> screen) which produced the current submitted model, `struct_film_chem`. Where the two
-> disagree, E is the later measurement and says so explicitly.
+> screen) which produced `struct_film_chem`, still the submitted model.
+> **[Family F](#family-f--injecting-where-a-mutation-sits-relative-to-the-binding-site) covers
+> a later phase still** — checkpoint transfer from full SKEMPI, and a sweep of features
+> describing a mutation's own position relative to the binding site — all of it negative once
+> measured correctly, including a real confound (§F.4) caught in the process of checking an
+> apparent win. Where families disagree, the later one is the later measurement and says so
+> explicitly.
 
 > **Read every gap against the seed spread.** Measured at **0.028 to 0.117** depending on
 > configuration (ERROR_ANALYSIS §9). Most rows in this document are separated by less than
@@ -347,3 +352,193 @@ Structure-free, chem-free, deliberately naive:
 All at or below zero. Worth keeping because they price the rest: the fusion mechanisms in
 family C and E.2 are doing real work, and a naive interaction term is not a cheap substitute
 for any of them.
+
+---
+
+## Family F — injecting where a mutation sits relative to the binding site
+
+A later phase again, following two questions in sequence: does the ~300 non-antibody complexes
+in the rest of SKEMPI transfer anything to the AB/AG task, and can the model be told directly
+where a mutation sits relative to the interface, rather than leaving it to infer that from
+pooled structure. Both were tried on the real 940-row AB/AG set, 5 folds × 3 seeds unless noted.
+
+### F.1 Splitting the mutant/wild-type projection — a real regression
+
+`mut_pair_ffn`'s subtraction, `LN(mt) − LN(wt)`, projects both sides through the SAME map
+(`tok_proj`) before the LayerNorm. This project's own rule — never share the first linear layer
+between modalities — argues for splitting it, exactly as it argued for splitting ab/ag and
+structure. Tried directly: mutant and wild-type each get their own `Linear(128 → 64)`, 4 total
+(ab_mt, ab_wt, ag_mt, ag_wt) instead of 2.
+
+| run | per-cx r | seed spread | negative complexes |
+| --- | --- | --- | --- |
+| `struct_film_chem` (shared mt/wt projection) | **+0.369** | 0.092 | 3 |
+| `split_mutwt` (separate mt/wt projection) | +0.294 | **0.237** | 4 |
+
+The sharpest instability measured anywhere in this project — seed spread more than doubles.
+Unlike ab/ag or sequence/structure, mutant and wild-type are not two different modalities to
+keep apart; they are the same modality at two time points, and the subtraction only means
+anything if both land in the identical learned space. Splitting the projection lets them drift
+apart across training, so `LN(mt) − LN(wt)` increasingly compares two different bases rather
+than measuring what changed. The "don't share weights across modalities" rule has a real
+exception, and this is it.
+
+### F.2 Ten ways to add whole-crop binding-site context — none beat the leader
+
+Ten mechanisms added ON TOP of `struct_film_chem`'s existing site-pooled FiLM gate, each
+injecting binding-site context pooled over the WHOLE crop rather than just the mutated residue
+— concatenation, a second FiLM stage, a learned gate, cross-attention, distance-weighted
+pooling, standard deviation of the local embedding, the nearest-neighbour structural
+difference, and three pure-geometry scalars (crop size, tightest contact anywhere in the crop,
+mean contact distance). Full 15-combo runs each:
+
+| mechanism | per-cx r | ens | negative complexes |
+| --- | --- | --- | --- |
+| `struct_film_chem` (no addition) | +0.314 | **+0.369** | 3 |
+| `mean_dist_crop` (pure geometry) | +0.296 | +0.361 | 3 |
+| `crop_concat` | +0.269 | +0.360 | 3 |
+| `crop_std` | +0.276 | +0.347 | 2 |
+| `nn_diff_crop` | +0.267 | +0.343 | 3 |
+| `min_dist_crop` (pure geometry) | +0.311 | +0.341 | 3 |
+| `crop_gate` | +0.285 | +0.338 | 5 |
+| `crop_film2` | +0.271 | +0.335 | 3 |
+| `crop_wpool` | +0.266 | +0.327 | 5 |
+| `crop_size` (pure geometry) | +0.267 | +0.318 | 4 |
+| `crop_xattn` | +0.272 | +0.303 | 6 |
+
+None improve on the leader. The closest is pure geometry with no learned structure at all
+(`mean_dist_crop`, a scalar), matching this project's recurring finding that what reaches the
+model matters more than how elaborately it is fused. `crop_xattn` is worst — attention loses
+again, the same pattern in every fusion sweep this project has run. Read together with F.3
+below: whole-crop context added AFTER the backbone does not help, but a per-residue feature
+added INTO the mutation's own representation does.
+
+### F.3 Ten features encoding a mutation's position relative to the binding site
+
+A different injection point: instead of pooling structure over the crop and concatenating it
+after `mut_pair_ffn` runs (F.2's approach), compute one feature PER MUTATED RESIDUE from
+tensors already in the batch — the crop's own Cα distance matrix, site/mask flags, residue
+indices, no new precomputation — and add it directly to the mutant projection `p_mt`, before
+the LayerNorm and the mt−wt subtraction:
+
+```
+p_mt = p_mt + sigmoid(gate) * Linear(1 -> 64)(feature)      # gate initialised at sigmoid(-4) = 0.018
+```
+
+The gate is a single learned scalar, starting closed so a brand-new signal does not perturb an
+otherwise-working representation before there is any gradient evidence it helps — the model
+starts at approximately the ungated baseline and only opens the gate if the feature earns it.
+
+Ten features tried, all through the same mechanism: the mutated residue's own minimum distance
+to the nearest partner-chain residue, a hard- and a soft-cutoff local contact count, its
+fractional position along its own chain, the percentile rank of its own interface distance
+among all same-side crop residues, its distance relative to the crop's own mean, a
+sequence-local density count, the actual structural embedding of its single nearest partner
+residue, a smooth interface indicator, and the row's own mutation count. Full 15-combo runs:
+
+| mechanism | per-cx r | ens | negative complexes | wc s\|d |
+| --- | --- | --- | --- | --- |
+| `burial_rank` | +0.311 | **+0.370** | 3 | **0.795** |
+| `struct_film_chem` (no addition) | +0.314 | +0.369 | 3 | 0.758 |
+| `nearest_partner_struct` | +0.306 | +0.366 | 5 | 0.794 |
+| `rel_seq_pos` | +0.311 | +0.365 | 3 | 0.786 |
+| `is_at_interface` | +0.311 | +0.364 | 3 | 0.790 |
+| `contacts_soft` | +0.299 | +0.362 | 2 | 0.792 |
+| `n_mut_row` | +0.304 | +0.359 | 4 | 0.779 |
+| `contacts_8a` | +0.308 | +0.355 | 5 | 0.792 |
+| `local_seq_density` | +0.295 | +0.346 | 4 | 0.790 |
+| `dist_to_site` | +0.287 | +0.343 | 4 | 0.777 |
+| `dist_delta_mean` | +0.271 | +0.340 | 4 | **0.165 spread** |
+
+`wc s|d` is the within-complex AUC ranking a stabilising mutation above a destabilising one of
+the SAME complex — identity-free, prevalence-free, the hardest of this project's ranking
+metrics. **Every mode except `local_seq_density` and `dist_delta_mean` improves it over the
+leader** in this table, several by a wide margin, even where ensemble Pearson is roughly
+level — but §F.4 below found that this table's own baseline was wrong, and the improvement
+does not survive the correction. `dist_delta_mean` is the clearest failure regardless: worst
+ensemble score and, at 0.165, the widest seed spread of anything in this table.
+
+Raw distance (`dist_to_site`) underperforms its own normalised form (`burial_rank`) by 0.027
+ens here. Complexes vary enormously in interface size and packing, so a fixed distance means
+different things in different complexes — 6 Å is buried in a tight, small interface and
+essentially the contact surface in a large, loose one. Converting to a percentile rank within
+the crop's own residues removes that confound, and is the single largest difference between
+any two of the ten modes — though, again, see §F.4 for why this ranking should not be trusted
+without the correction below.
+
+### F.4 A confound found while running F.3 — and why the apparent win did not survive it
+
+Every run in F.2 and F.3 above used `split_proj=true`, this project's own standing convention
+for `struct_film_chem`. That flag was believed to control only sequence's per-side projection —
+but the fix in E that gave structure its own per-side map (§E.2's own history) reused the SAME
+flag rather than adding a new one, so `split_proj=true` has been silently splitting structure's
+projection too, in every run since that fix landed. `struct_film_chem`'s own 50,497 parameters
+are only reachable with structure's projection SHARED; `split_proj=true` under the current code
+produces a 58,689-parameter model with structure split — the same architecture separately
+measured in E.2 as `struct_film_chem_splitstruct`, **+0.354 ens, a 0.015 regression** against
+the true leader.
+
+Every number in F.2 and F.3 was therefore measured on a base architecture already 0.015 worse
+than `struct_film_chem`, without that being visible in the tables above — they read as
+comparisons against the leader, but the actual comparison was against a handicapped variant of
+it. Fixed with a new `split_struct` field (`SiteTokenConfig`) that decouples the two: `None`
+defers to `split_proj` exactly as before, so every existing config and every number in E and in
+F.1–F.3 above is unaffected as a *record*; an explicit `True`/`False` overrides structure's
+projection independently of sequence's. Re-running `burial_rank`, the best of F.3's ten, on the
+TRUE `struct_film_chem` base (`split_struct: false`):
+
+| run | params | per-cx r | ens | seed spread |
+| --- | --- | --- | --- | --- |
+| `struct_film_chem` (true base, no addition) | 50,497 | +0.314 | **+0.369** | 0.092 |
+| `burial_rank` on the SPLIT-STRUCT base (F.3's number) | 58,818 | +0.311 | +0.370 | 0.087 |
+| `burial_rank` on the TRUE base (`split_struct: false`) | 50,626 | +0.292 | +0.335 | **0.147** |
+
+**The apparent tie was an artefact of the wrong baseline, not a real improvement.** On the
+architecture `struct_film_chem` actually is, `burial_rank` is a clear regression — 0.034 ens
+below the leader, with the widest seed spread measured for any variant of this backbone in the
+project. It was not improving the real model; it was compensating for an unrelated regression
+(split structure) that it happened to be measured on top of, landing at roughly the split
+architecture's score by coincidence of two effects working in opposite directions on two
+different problems. **`struct_film_chem` remains the submitted model.** None of the other nine
+modes in F.3 has been re-verified on the true base, but the mechanism that seemed most promising
+did not survive the correction, and the confound applies identically to all ten — the F.3 table
+should be read as measuring a different (weaker) base architecture than the one it appears to
+compare against, not retried in the hope a different mode fares better.
+
+**Worth keeping regardless of the negative result:** the `split_proj`/`split_struct` coupling
+was a real bug affecting every run in this project since structure's split was added in Family E
+— not just this sweep — and the decoupling is a genuine fix, independent of whether any feature
+in F.3 turns out to help. It is also a second instance of this project's most persistent lesson:
+comparing a promising result against the wrong baseline is easy to do by accident, and checking
+which exact architecture a number was measured against is not optional.
+
+### F.5 Checkpoint transfer from full SKEMPI — two ways tried, both short of training on AB/AG alone
+
+Separately from F.1–F.4: does pretraining on the ~300 non-antibody SKEMPI complexes help,
+either mixed into every batch or as initialisation before fine-tuning on AB/AG. Full-SKEMPI
+infrastructure (5,748 rows, 343 complexes) built earlier in the project made both cheap to try.
+
+| approach | ens | note |
+| --- | --- | --- |
+| `struct_film_chem` (AB/AG only, with chem) | **+0.369** | the leader |
+| pretrain (backbone) → fine-tune with chem (partial load) | +0.362 | ties the leader; see below |
+| `control_nochem` (AB/AG only, no chem, matched architecture) | +0.304 | the fair baseline for the two below |
+| pretrain (backbone, no chem) → fine-tune, no chem | +0.272 | below its own matched baseline |
+| batch-mixing curriculum (AB/AG share annealed 50%→100%) | +0.241 | worst of the three |
+
+Pretraining excludes each AB/AG fold's own held-out rows from the pretrain pool (a `--fold-map`
+assigning AB/AG rows their real CV fold and every other SKEMPI row a sentinel that never
+matches), so the fine-tune test fold is never seen during pretraining. Checkpoint transfer uses
+`--init-ckpt-dir`/`--save-ckpt-dir`, added to `_perturb_v2_colab.py` for this.
+
+The first pretrain→fine-tune attempt (+0.272) looked like a clean negative result — pretraining
+hurt. It was really about chemistry: full SKEMPI's cache only has the 21 base chemistry columns
+computed for all 5,748 rows, not the 33/39-column enriched table AB/AG's own cache has, so a
+checkpoint trained with chemistry there cannot be loaded into a model expecting AB/AG's richer
+block — the two head widths differ. Restoring chemistry via a name-and-shape PARTIAL load (chem
+only touches the head's first Linear, which necessarily differs in width and re-initialises;
+every backbone tensor — the part chemistry never touches — transfers exactly) reaches +0.362,
+tying the leader and improving `wc s|d` (0.799 vs 0.758). The batch-mixing curriculum, tried
+first and independently, scores lowest of the three and was not worth revisiting with the same
+fix, since it mixes the two populations throughout training rather than sequencing them —
+there is no separate "backbone" stage to protect from the chemistry mismatch.

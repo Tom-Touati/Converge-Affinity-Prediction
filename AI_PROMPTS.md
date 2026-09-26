@@ -7,7 +7,7 @@ Tooling: Claude Code (Opus 5) in the Claude desktop app, working directly in thi
 
 What it converged on: **`struct_film_chem`** — see [docs/DETAILS.md](docs/DETAILS.md#struct_film_chem).
 It superseded `cat128_reg2_l1` ([docs/MODEL.md](docs/MODEL.md)), which held the role for the
-sessions up to 2026-09-24. The errors and retractions listed at the end of this file are part of the record on purpose; several of them are the reason the submitted model is the simplest one in the family rather than the most elaborate.
+sessions up to 2026-09-24. The errors and retractions listed at the end of this file are part of the record on purpose; several of them are the reason the submitted model is the simplest one in the family rather than the most elaborate — including a later attempt to improve on it that looked like a win, was caught before being submitted, and turned out to be a baseline confound (see the final session entry below).
 
 ---
 
@@ -461,3 +461,52 @@ branch": update the docs to name the new best model and merge.
   *scaling* option of the same name; both items silently ran the standard 5-fold
   complex split. Caught before reporting the numbers as evidence of anything, and
   retracted rather than left ambiguous.
+
+## Session, 2026-09-25/26 — 10 binding-site injections, checkpoint transfer, and a confound caught before submission
+
+Extended `struct_film_chem` in three directions, all on the real 940-row AB/AG set unless noted:
+
+- `bsite_extra`: 10 ways to add whole-crop structural/geometric context on top of the existing
+  site-pooled FiLM gate. None beat the leader; the closest was a pure-geometry scalar with no
+  learned structure at all, and cross-attention was again the worst of the ten.
+- `split_mutwt`: gave the mutant and wild-type sequence their own separate first projection,
+  extending this project's "never share the first layer across modalities" rule to mt/wt. This
+  one made it worse — +0.294 against +0.369, seed spread more than doubled. The rule has a real
+  exception: mt and wt need to land in the SAME space for the subtraction to mean anything,
+  unlike ab/ag or sequence/structure, which are genuinely different distributions.
+- `mut_feat`: 10 features describing a mutation's position relative to the binding site
+  (contact counts, chain position, burial rank, the nearest partner residue's own embedding,
+  and others), injected directly into the mutation's own projection through a learned gate that
+  starts closed (`sigmoid(-4) ≈ 0.018`), rather than concatenated after the backbone. The best
+  of them (burial rank) appeared to tie the leader and clearly improve within-complex
+  stabilising/destabilising ranking.
+- Checkpoint transfer from full SKEMPI (`--init-ckpt-dir`/`--save-ckpt-dir`, added to
+  `_perturb_v2_colab.py`): pretrain on the ~300 non-antibody complexes (excluding each AB/AG
+  fold's own held-out rows), fine-tune on AB/AG. A chem-free version underperformed a matched
+  from-scratch control; restoring chemistry via a name-and-shape partial load (only the head's
+  first Linear differs in width and re-initialises; every backbone tensor transfers) reached
+  +0.362, tying the leader — better than a batch-mixing curriculum alternative (+0.241), but
+  not an improvement over training on AB/AG alone.
+
+### The retraction
+
+`burial_rank`'s apparent tie with the leader was reported and half-written into the docs as a
+promotion — `struct_film_chem_burial`, a new submitted model — before a routine "does this
+survive on the exact leader architecture" check was run. It did not survive it: **+0.335 against
++0.369, a clear regression, with the widest seed spread measured for any variant of this
+backbone.** The `mut_feat`/`bsite_extra` sweep had been run with `split_proj=true`, believed to
+control only sequence's per-side projection — but a fix from an earlier session (giving
+structure its own per-side map) had reused the SAME flag rather than adding a new one, so
+`split_proj=true` had been silently splitting structure's projection too in every run since,
+producing a 58,689-parameter architecture already measured elsewhere as a 0.015 regression on
+its own (`struct_film_chem_splitstruct`). `burial_rank` was compensating for that regression, not
+improving the real model, and landed at roughly the split architecture's own score by
+coincidence of two unrelated effects. Decoupled with a new `split_struct` config field (`None`
+defers to `split_proj`, preserving every existing number; an explicit override controls
+structure independently) and re-measured on the true architecture — the number above.
+
+`struct_film_chem` remains the submitted model. The documentation was corrected before being
+pushed, not after: the writeup, the top-line synopsis, and the results table were reverted
+across seven files in the same session that had just updated them, once the corrected number
+came back. Kept as the record of what was believed for about twenty minutes, and why checking
+before writing up a win matters as much on your own project as scrutinising someone else's claim.

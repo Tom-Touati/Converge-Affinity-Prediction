@@ -2,10 +2,13 @@
 
 > **This is no longer the submitted model.** `cat128_reg2_l1` was superseded by
 > **`struct_film_chem`** (+0.369 against +0.293) — specified in
-> [DETAILS.md](DETAILS.md#struct_film_chem), summarised in README §1. **This document is left
-> intact and is still accurate for the model it describes**, which remains the reference point
-> for most of `JUSTIFICATIONS.md` and Parts I–III of `ERROR_ANALYSIS.md`. Read it as the full
-> specification of the previous submission, not the current one.
+> [DETAILS.md](DETAILS.md#struct_film_chem), summarised in README §1. A later sweep of
+> mutation-position features tried to improve on it and did not, once a baseline confound in
+> that sweep was caught and corrected (`ARCHITECTURES.md` §Family F) — `struct_film_chem` is
+> still the submitted model. **This document is left intact and is still accurate for the
+> model it describes**, which remains the reference point for most of `JUSTIFICATIONS.md` and
+> Parts I–III of `ERROR_ANALYSIS.md`. Read it as the full specification of a previous
+> submission, not the current one.
 
 One architecture, specified completely. `docs/ARCHITECTURES.md` records the 45 configurations
 measured to arrive at it.

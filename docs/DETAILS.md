@@ -491,10 +491,14 @@ already-fused difference, not a raw single-modality input), GELU, then **sum ove
 mutated residues only**. Summed across both sides into one 64-d vector, `z_seq`.
 
 **Structure term (FiLM).** Per side: project the wild-type ProteinMPNN embedding with
-its own linear layer, GELU, LayerNorm, then mean-pool at the **mutated** residues
-(tight site pool, not the whole crop). Summed across sides into one 64-d vector,
-`z_st`. `z_st` is fed through one `Linear(64 → 128)`, split into two 64-d halves
-`gamma, beta`, and modulates the sequence term:
+**one linear layer shared between ab and ag** ([this was corrected after being
+mis-stated here](ARCHITECTURES.md#family-f--injecting-where-a-mutation-sits-relative-to-the-binding-site)
+as split — splitting it was tried directly, `struct_film_chem_splitstruct`, and cost
+0.015 ens; the 50,497 parameters below are only reachable with it shared), GELU,
+LayerNorm, then mean-pool at the **mutated** residues (tight site pool, not the whole
+crop). Summed across sides into one 64-d vector, `z_st`. `z_st` is fed through one
+`Linear(64 → 128)`, split into two 64-d halves `gamma, beta`, and modulates the
+sequence term:
 
 ```
 z = (1 + gamma) * z_seq + beta
@@ -517,6 +521,16 @@ on the seed mean. The 39 columns add +0.029 on top.
 parameters total. No attention, no RoPE, no cross-molecule pairing.
 
 **What has not yet been done for this model**, honestly listed rather than implied:
-the homology-cluster-split retention number (§ the earlier section on the cluster
-split), and the full bias/error-analysis battery in `ERROR_ANALYSIS.md` — both still
-describe `cat128_reg2_l1`, the previously-best net.
+the homology-cluster-split retention number and the full bias/error-analysis battery
+in `ERROR_ANALYSIS.md` — both completed (README §1, `ERROR_ANALYSIS.md` Part IV) — but
+nothing beyond that: a later sweep of ten features describing a mutation's position
+relative to the binding site, injected into the mutation's own projection, did not
+beat this model once measured correctly (a confound in an early comparison made one
+of them look competitive; see
+[ARCHITECTURES.md §Family F](ARCHITECTURES.md#family-f--injecting-where-a-mutation-sits-relative-to-the-binding-site)
+for the full account). `struct_film_chem` remains the submitted model.
+
+**What has not yet been done for this model**, honestly listed rather than implied:
+the homology-cluster-split retention number and the full bias/error-analysis battery
+in `ERROR_ANALYSIS.md` — both still describe `struct_film_chem`, the model this
+superseded.

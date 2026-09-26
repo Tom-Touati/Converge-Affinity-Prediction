@@ -29,13 +29,26 @@ architectural differences in this problem are smaller than the noise. Establishi
 differences are real — and which of this project's own earlier claims did not survive that
 test — became the substance of the work.
 
+A later sweep tried 10 features describing a mutation's own position relative to the binding
+site — contact counts, chain position, rank of burial, the nearest partner residue's own
+embedding, and others — injected directly into the mutation's projection rather than
+concatenated after the backbone. The best of them (burial rank) appeared to tie
+`struct_film_chem`, but that comparison turned out to be against the wrong baseline: a config
+flag governing sequence's per-side projection had been silently coupled to structure's since an
+earlier fix, so the whole sweep ran on an architecture 0.015 worse than the true
+`struct_film_chem`. Re-measured on the correct, decoupled base, burial rank is a **regression**
+(+0.335 against +0.369) with a much wider seed spread — it was compensating for the handicap,
+not improving the real model. `struct_film_chem` remains the submitted model. The confound and
+the full sweep are recorded as a negative result in
+[docs/ARCHITECTURES.md §Family F](docs/ARCHITECTURES.md#family-f--injecting-where-a-mutation-sits-relative-to-the-binding-site).
+
 | | |
 | --- | --- |
 | **The submitted model, `struct_film_chem`, specified in full** | [docs/DETAILS.md](docs/DETAILS.md#struct_film_chem) |
 | **The model this superseded, specified in full** | [docs/MODEL.md](docs/MODEL.md) |
 | **Why each choice was made** | [docs/JUSTIFICATIONS.md](docs/JUSTIFICATIONS.md) |
 | **What I would do next, and why** | [docs/FUTURE_WORK.md](docs/FUTURE_WORK.md) |
-| **Every architecture tried (45 runs, plus the structural-injection sweep that followed)** | [docs/ARCHITECTURES.md](docs/ARCHITECTURES.md) |
+| **Every architecture tried (45 runs, the structural-injection sweep, and the mutation-projection sweep)** | [docs/ARCHITECTURES.md](docs/ARCHITECTURES.md) |
 | **Error analysis** | [ERROR_ANALYSIS.md](ERROR_ANALYSIS.md) |
 | **AI prompt history** | [AI_PROMPTS.md](AI_PROMPTS.md) |
 | Results · Running it · Hardware · Limitations | below |
@@ -90,9 +103,10 @@ below reports per-complex Spearman on whatever split produced it, and this docum
 establish the two splits are identical) — read as a second, independent cluster-holdout
 measurement, not a replacement number for that table.
 
-The full bias/error-analysis battery in [ERROR_ANALYSIS.md](ERROR_ANALYSIS.md) has not been
-re-run against the new model; those numbers there still describe `cat128_reg2_l1` and are
-flagged as pending an update, not silently carried over.
+The full bias/error-analysis battery in [ERROR_ANALYSIS.md](ERROR_ANALYSIS.md) Part IV has
+been re-run against this model (six models including its ESM-IF1 variant and the gated-fusion
+runner-up); Parts I–III still describe `cat128_reg2_l1` and are kept as history, not silently
+carried over.
 
 `ens` averages the seeds then scores once — what you would ship. `per seed` scores each seed
 separately — what one training run gives you. **`spread` is max − min across seeds, and it is
@@ -104,7 +118,7 @@ GELU, LayerNorm the mutant and wild-type projections SEPARATELY, then:
     LN(mt) - LN(wt)  ->  Linear(64->64)  ->  GELU  ->  sum over the mutated residues
     summed over ab and ag                                                       z_seq   64
 
-ProteinMPNN encoder_h_V, per side  -> Linear(128->64), own map        -> GELU -> LayerNorm
+ProteinMPNN encoder_h_V, per side  -> Linear(128->64), ONE map shared ab/ag -> GELU -> LayerNorm
     mean-pooled at the mutated residues, summed over ab and ag                  z_st    64
 gamma, beta = Linear(64->128)(z_st).chunk(2)          <- FiLM, not concatenation
 z_seq = (1 + gamma) * z_seq + beta
@@ -113,23 +127,28 @@ z = [ z_seq ; chem + interface geometry + ESM/ProteinMPNN zero-shot scores ]    
     Linear(103->128) -> GELU -> Dropout(0.35) -> Linear(128->1)
 ```
 
-**The fusion, and one weight-sharing decision that matters.** Sequence and structure each get
-**their own** first linear layer, and each of those is separate again per side (antibody,
-antigen) — four independent `Linear(128 → 64)` maps in total, never one shared across
-modalities. The wild-type/mutant pair within one side's sequence DOES share a map, and that
-sharing is necessary — the subtraction only means anything if both land in one space. Sharing
-*across* modalities would not be: ESM-2 and ProteinMPNN are never subtracted from one another,
-and forcing them through one map buys nothing while costing the ability to scale each
-modality independently.
+**The fusion, and two weight-sharing decisions, one intentional and one not.** Sequence's first
+linear layer is split per side (antibody, antigen) — two independent `Linear(128 → 64)` maps,
+never shared across ab/ag. The wild-type/mutant pair within one side's sequence DOES share a
+map, and that sharing is necessary — the subtraction only means anything if both land in one
+space (§Family F below found this generalises less than it looks like it should: splitting
+mt/wt, unlike splitting ab/ag, is a regression, not an improvement). **Structure's first linear
+layer is ONE map shared across ab and ag** — the intended design split it too, matching
+sequence, but the code that would have done that had a latent bug that went unnoticed for a
+full architecture generation; when the bug was found and fixed, the split version scored 0.015
+*worse* (`struct_film_chem_splitstruct`, +0.354 against +0.369 — see
+[docs/ARCHITECTURES.md §Family F](docs/ARCHITECTURES.md#family-f--injecting-where-a-mutation-sits-relative-to-the-binding-site)),
+so the model that ships keeps the accidental, unsplit version.
 
-This is not a hypothetical. An earlier draft submitted a gated-fusion model that scored +0.300,
-and it turned out to be sharing one projection between the two encoders — its config requested
-a separate structure projection and the model silently ignored it. Fixing the bug and testing
-gating properly was flagged here as "a next step, not a result"; it has since been done.
+This is not the only such case. An earlier draft submitted a gated-fusion model that scored
++0.300, and it turned out to be sharing one projection between the two encoders — its config
+requested a separate structure projection and the model silently ignored it. Fixing the bug and
+testing gating properly was flagged here as "a next step, not a result"; it has since been done.
 **`gated_cg_clusterscale`, the corrected version, reaches +0.344** — ahead of plain
 concatenation's +0.293, and briefly the best network in the project before the FiLM sweep
-below found something better still. The lesson was not "gating doesn't help"; it was that the
-first measurement of it was measuring a bug.
+below found something better still. That fix helped; the structure-projection fix above did
+not. The lesson both times was the same — measure the fix, don't assume its direction — and it
+cut both ways.
 
 **Three representation decisions that matter more than the fusion does:**
 
