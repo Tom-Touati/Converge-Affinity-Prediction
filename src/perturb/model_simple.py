@@ -185,6 +185,21 @@ def _make_fusion(c, w: int) -> Fusion:
     return {"multiply": MultiplyFusion, "add": AddFusion, "concat": ConcatFusion}[fm]()
 
 
+def _proj_stack(in_w: int, w: int, depth: int) -> nn.Module:
+    """Like _mlp_stack, but bias=False throughout -- proj_side's own existing convention
+    ("one per side... Linear(seq_in, c.proj, bias=False)"), preserved exactly at depth=1 so
+    proj_depth_ab/proj_depth_ag=1 (the default) is byte-identical to the pre-existing
+    single-Linear projection, not merely equivalent.
+    """
+    if depth <= 1:
+        return nn.Linear(in_w, w, bias=False)
+    layers: list[nn.Module] = [nn.Linear(in_w, w, bias=False), nn.GELU()]
+    for _ in range(depth - 2):
+        layers += [nn.Linear(w, w, bias=False), nn.GELU()]
+    layers.append(nn.Linear(w, w, bias=False))
+    return nn.Sequential(*layers)
+
+
 def _mlp_stack(w: int, depth: int, in_w: int | None = None) -> nn.Module:
     """depth=1 -> a single Linear(in_w, w), matching every existing config exactly when
     in_w=w (nn.Linear and nn.Sequential are both plain callables, so callers never need to
@@ -906,6 +921,19 @@ class SiteTokenConfig:
     #: mutation is on, so it can learn e.g. "trust the ag branch less" as a fixed correction
     #: rather than a per-example one.
     mut_side_gate: bool = False
+    #: split_proj only. proj_side["ab"]/["ag"] are each a single bias-free Linear -- one
+    #: matrix has to map every antibody scaffold's ESM-2 embedding into the shared 64-d space,
+    #: same for antigen. The antibody side scores far better (pooled r +0.647 vs antigen's
+    #: +0.236), and antibody scaffolds repeat across this project's complexes far more than
+    #: antigens do (53 different protein families) -- so antigen may simply need more
+    #: nonlinear capacity to fold that diversity into the same width a single antibody-style
+    #: linear map handles fine. depth=1 (default) is exactly today's single Linear; depth>1
+    #: makes THAT side's own projection a depth-N bias-free MLP (_proj_stack), independent of
+    #: proj_depth_ag/proj_depth_ab -- set only proj_depth_ag>1 to test antigen-specific extra
+    #: capacity, or both to the same depth as the matched control that asks whether it is
+    #: antigen-specific or "more depth anywhere helps a bit."
+    proj_depth_ab: int = 1
+    proj_depth_ag: int = 1
     #: mut_pair_ffn only. tok_proj's first Linear is keyed by side (ab/ag) but NOT by
     #: mutant-vs-wild-type -- LN(mt) and LN(wt) both come out of the SAME map before being
     #: subtracted. That is the identical weight-sharing this project's own rule (never
@@ -1206,10 +1234,13 @@ class PerturbSiteToken(nn.Module):
             seq_in = self.gr_seq.out_dim
         w = c.proj or seq_in
         if c.proj and c.split_proj:
-            # one per side: the antibody and the antigen get their own first layer
+            # one per side: the antibody and the antigen get their own first layer, each
+            # optionally its own depth (proj_depth_ab/proj_depth_ag, both 1 by default --
+            # a single Linear, exactly as before either flag existed).
             self.proj = None
+            depth = {"ab": getattr(c, "proj_depth_ab", 1), "ag": getattr(c, "proj_depth_ag", 1)}
             self.proj_side = nn.ModuleDict(
-                {k: nn.Linear(seq_in, c.proj, bias=False) for k in ("ab", "ag")})
+                {k: _proj_stack(seq_in, c.proj, depth[k]) for k in ("ab", "ag")})
         else:
             self.proj = nn.Linear(seq_in, c.proj, bias=False) if c.proj else None
             self.proj_side = None
