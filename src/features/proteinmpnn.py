@@ -135,6 +135,15 @@ def _log_probs(model, structure, chain_group: str, device: str):
 # paper needs, shared backbone coordinate noise, we add ourselves before calling forward (with
 # augment_eps=0 the model contributes none of its own), which is behaviourally identical to their
 # ``fix_backbone_noise`` argument without touching the model class at all.
+#
+# The two monomer terms (f(A), f(B)) are the bound-complex backbone with the partner MASKED out
+# of ProteinMPNN's own ``mask`` argument (the padding mechanism ``ProteinFeatures._dist`` already
+# uses to exclude positions from the k-nearest-neighbour graph) -- never a separately modelled
+# apo structure, and never a separately re-featurized smaller PDB. All three systems (complex,
+# ab-alone, ag-alone) and both sequences (wild-type, mutant) share ONE X tensor and ONE
+# (decoding_order, backbone_noise) draw per Monte Carlo trial -- six forward passes, one shared
+# source of randomness, not three independent ones. This is not a style choice: the paper reports
+# per-interface Spearman moves from ~0.30 to ~0.45 on this alone.
 # ---------------------------------------------------------------------------------------------
 
 STAB_MC_SAMPLES = 20            # the paper's own default ensemble size
@@ -188,11 +197,22 @@ def _seq_ids(seq: str) -> np.ndarray:
     return np.array([AA_IDX.get(a, AA_IDX["X"]) for a in seq], dtype=np.int64)
 
 
-def _featurize_stab(structure, chain_group: str, device: str):
-    """Like ``_featurize``, but also returns the wild-type sequence as ProteinMPNN token ids:
-    ``unconditional_probs`` never needed ``S`` as an input, StaB's teacher-forced score does."""
+def _featurize_stab(structure, ab: str, ag: str, device: str):
+    """ONE complex-sized tensor for ALL THREE systems (complex, ab-alone, ag-alone) -- the
+    paper's rigid-backbone assumption taken literally. The two monomer terms are the SAME
+    backbone with the partner's positions masked out of ProteinMPNN's own ``mask`` argument
+    (the mechanism ``ProteinFeatures._dist`` already uses to exclude padding from the k-nearest-
+    neighbour graph), never a separately modelled apo structure -- there is exactly one X here,
+    reused for every one of the six forward passes in ``_stab_trial``.
+
+    Chain-local ``residue_idx``/``chain_encoding`` numbering (``100*c_i + arange(n)``, one block
+    per chain in ``ab+ag`` order) makes this safe: a chain's own relative offsets are identical
+    whether its partner is masked in or out, so masking never perturbs the positional encoding
+    the way concatenating a *different* set of chains would.
+    """
     xs, seqs, res_idx, chain_enc, offsets = [], [], [], [], {}
     cursor = 0
+    chain_group = ab + ag
     for c_i, cid in enumerate(chain_group):
         ch = structure.chains.get(cid)
         if ch is None:
@@ -207,10 +227,20 @@ def _featurize_stab(structure, chain_group: str, device: str):
 
     X = np.concatenate(xs, 0)[None]
     S = np.concatenate(seqs, 0)[None]
-    finite = np.isfinite(X).all(axis=(2, 3))
+    L = X.shape[1]
+    finite = np.isfinite(X).all(axis=(2, 3)).astype(np.float32)   # (1, L): real residue vs gap
     X = np.nan_to_num(X, nan=0.0)
+
+    is_ab = np.zeros((1, L), dtype=np.float32)
+    for cid in ab:
+        if cid in offsets:
+            n = len(structure.chains[cid].seq)
+            is_ab[0, offsets[cid]:offsets[cid] + n] = 1.0
+    masks_np = {"complex": finite, "ab_alone": finite * is_ab, "ag_alone": finite * (1.0 - is_ab)}
+
     t = lambda a, d: torch.as_tensor(a, dtype=d, device=device)
-    return (t(X, torch.float32), t(S, torch.long), t(finite.astype(np.float32), torch.float32),
+    return (t(X, torch.float32), t(S, torch.long),
+            {name: t(m, torch.float32) for name, m in masks_np.items()},
             t(np.concatenate(res_idx)[None], torch.long),
             t(np.concatenate(chain_enc)[None], torch.long), offsets)
 
@@ -218,14 +248,10 @@ def _featurize_stab(structure, chain_group: str, device: str):
 @torch.no_grad()
 def _stab_logp(model, X, S, mask, residue_idx, chain_enc, decoding_order, backbone_noise):
     """StaB-ddG's f(s): the teacher-forced sequence log-likelihood log p(S | noised backbone),
-    decomposed along ONE FIXED decoding order, under ONE FIXED backbone-coordinate noise draw.
-
-    Fixing both here (rather than letting ``ProteinMPNN.forward`` draw its own, as it does by
-    default) is what makes the wild-type/mutant PAIR in ``_stab_trial`` antithetic variates: the
-    two forward passes below differ ONLY in which sequence (``S``) goes in, so the common
-    decoding-order and geometry-noise draw cancels in ``f(mut) - f(wt)`` instead of contributing
-    two independent draws' variance to it. The paper reports this is where the signal comes
-    from -- shared noise instead of independent noise drops per-interface Spearman 0.45 -> 0.30.
+    restricted to ``mask``'s positions, decomposed along ONE FIXED decoding order, under ONE
+    FIXED backbone-coordinate noise draw shared across every call in a trial (see
+    ``_stab_trial``) -- the paper reports this is where the signal comes from: without shared
+    randomness, per-interface Spearman drops from ~0.45 to ~0.30.
     """
     chain_M = torch.ones_like(mask)               # nothing is "given"; every position is scored
     randn_dummy = torch.zeros_like(mask)           # unused: use_input_decoding_order=True below
@@ -235,10 +261,10 @@ def _stab_logp(model, X, S, mask, residue_idx, chain_enc, decoding_order, backbo
     return (ll * mask).sum(dim=1)                                  # (B,)
 
 
-def _mutate(S_wt: torch.Tensor, structure, chain_group: str, offsets: dict, mutations) -> torch.Tensor:
+def _mutate(S_wt: torch.Tensor, structure, offsets: dict, mutations) -> torch.Tensor:
     S_mut = S_wt.clone()
     for m in mutations:
-        if m.chain not in chain_group:
+        if m.chain not in offsets:
             continue
         pos = offsets[m.chain] + structure.chains[m.chain].index[m.key]
         S_mut[0, pos] = AA_IDX[m.mut]
@@ -248,16 +274,18 @@ def _mutate(S_wt: torch.Tensor, structure, chain_group: str, offsets: dict, muta
 def _stab_trial(model, structure, ab: str, ag: str, mutations, device: str,
                 noise_level: float, gen: torch.Generator) -> dict:
     """One Monte Carlo trial of StaB-ddG's cycle: b(s) = f(AB) - f(A) - f(B), for both the
-    wild-type and the mutant sequence, on the SAME backbone coordinates for all three systems
-    (the paper's rigid-backbone assumption -- one structure, three chain subsets read off it).
-    Six forward passes total. Returns all six f(...) terms plus this trial's binding ddG.
+    wild-type and the mutant sequence. ONE decoding permutation and ONE backbone-noise draw are
+    sampled here and reused across ALL SIX forward passes below (not just within a wt/mut pair)
+    -- mandatory, per the paper: this is the variance-reduction mechanism the reported
+    Spearman ~0.45 depends on, not an optional refinement.
     """
+    X, S_wt, masks, residue_idx, chain_enc, offsets = _featurize_stab(structure, ab, ag, device)
+    S_mut = _mutate(S_wt, structure, offsets, mutations)
+    order = torch.argsort(torch.abs(torch.randn(masks["complex"].shape, generator=gen))).to(device)
+    noise = (noise_level * torch.randn(X.shape, generator=gen)).to(device)
+
     terms = {}
-    for name, group in (("complex", ab + ag), ("ab_alone", ab), ("ag_alone", ag)):
-        X, S_wt, mask, residue_idx, chain_enc, offsets = _featurize_stab(structure, group, device)
-        S_mut = _mutate(S_wt, structure, group, offsets, mutations)
-        order = torch.argsort(torch.abs(torch.randn(mask.shape, generator=gen))).to(device)
-        noise = (noise_level * torch.randn(X.shape, generator=gen)).to(device)
+    for name, mask in masks.items():                  # complex, ab_alone, ag_alone, in order
         f_wt = _stab_logp(model, X, S_wt, mask, residue_idx, chain_enc, order, noise)
         f_mut = _stab_logp(model, X, S_mut, mask, residue_idx, chain_enc, order, noise)
         terms[f"f_wt_{name}"] = float(f_wt.item())
@@ -376,12 +404,76 @@ def build(df: pd.DataFrame | None = None, verbose: bool = True) -> pd.DataFrame:
     return extract(verbose=verbose)
 
 
+def extract_stab(device: str = "auto", variant: str = "zeroshot",
+                 n_samples: int = STAB_MC_SAMPLES, noise_level: float = STAB_NOISE_LEVEL,
+                 seed: int = 0, n_rows: int | None = None, verbose: bool = True) -> pd.DataFrame:
+    """Writes ``data/features/stab_ddg.parquet``: the seven StaB-ddG columns (six per-system
+    f(...) terms, kept separate -- see ``_stab_trial`` -- plus the assembled ``stab_ddg``
+    double-difference) for every row, alongside ``unit`` so a downstream consumer can tell
+    log-likelihood (zero-shot) from kcal/mol (stability_finetuned) apart. ``n_rows`` truncates
+    the dataset for a quick run (the smoke test uses it); omit it for the full extraction.
+    """
+    paths.ensure_dirs()
+    device = resolve_device(device)
+    df = pd.read_parquet(paths.DATASET)
+    if n_rows is not None:
+        df = df.head(n_rows)
+    structures = load_structures(df["pdb"].unique())
+    _load_stab_model(device, variant)          # loaded once here; stab_ddg() reuses it via cache
+    if verbose:
+        print(f"StaB-ddG {variant}: n_samples={n_samples} noise_level={noise_level} "
+              f"device={device}", flush=True)
+
+    rows = []
+    t0 = time.perf_counter()
+    for n, (row_id, pdb, ab, ag, muts) in enumerate(
+        zip(df["row_id"], df["pdb"], df["ab_chains"], df["ag_chains"], df["mutations"])
+    ):
+        st = structures[pdb]
+        mutations = parse_mutations(muts)
+        out = stab_ddg(st, ab, ag, mutations, device=device, variant=variant,
+                       n_samples=n_samples, noise_level=noise_level, seed=seed)
+        rows.append({"row_id": row_id, **{f"stab__{k}": v for k, v in out.items() if k != "unit"},
+                    "stab__unit": out["unit"]})
+        if verbose and (n + 1) % 10 == 0:
+            print(f"  {n+1}/{len(df)} rows  {time.perf_counter()-t0:.0f}s", flush=True)
+
+    # row_id stays a plain COLUMN (not the index) -- matches chem_perturb_v2.parquet's own
+    # on-disk convention, which experiments/protattba_repro/_perturb_v2_colab.py's Cache reads
+    # via ``pd.read_parquet(f).set_index("row_id")``, not by assuming an index is already there.
+    # stab__unit is a genuine per-row string column, not a DataFrame.attrs sidecar -- attrs is
+    # not guaranteed to round-trip through every parquet engine/version, and the unit distinction
+    # (log-likelihood vs kcal/mol) is exactly the kind of thing that must not go missing silently.
+    block = pd.DataFrame(rows)
+    num_cols = [c for c in block.columns if c not in ("row_id", "stab__unit")]
+    block[num_cols] = block[num_cols].astype(np.float32)
+    suffix = "" if variant == "zeroshot" else f"_{variant}"
+    out_path = paths.FEATURES / f"stab_ddg{suffix}.parquet"
+    block.to_parquet(out_path, index=False)
+    if verbose:
+        print(f"wrote {out_path.relative_to(paths.ROOT)}  {block.shape}  unit={unit}  "
+              f"in {time.perf_counter()-t0:.1f}s")
+    return block
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--device", default="auto", help="auto | cpu | cuda")
     p.add_argument("--weights", default=DEFAULT_WEIGHTS)
+    p.add_argument("--stab", action="store_true",
+                   help="extract StaB-ddG's 7 columns (data/features/stab_ddg.parquet) instead "
+                        "of the unconditional_probs block")
+    p.add_argument("--stab-variant", default="zeroshot", choices=sorted(STAB_VARIANTS))
+    p.add_argument("--stab-mc-samples", type=int, default=STAB_MC_SAMPLES)
+    p.add_argument("--stab-noise-level", type=float, default=STAB_NOISE_LEVEL)
+    p.add_argument("--stab-seed", type=int, default=0)
+    p.add_argument("--stab-n-rows", type=int, default=None)
     a = p.parse_args()
-    extract(a.device, a.weights)
+    if a.stab:
+        extract_stab(a.device, a.stab_variant, a.stab_mc_samples, a.stab_noise_level,
+                    a.stab_seed, a.stab_n_rows)
+    else:
+        extract(a.device, a.weights)
 
 
 if __name__ == "__main__":
