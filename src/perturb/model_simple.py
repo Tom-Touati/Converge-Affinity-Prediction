@@ -862,6 +862,14 @@ class SiteTokenConfig:
     #: the only one of the four that widens the head's input (d += w), since it is the only
     #: one that does not collapse z_st back to w dimensions before the head.
     fuse_mode: str = "film"
+    #: film_site only. Zeroes z_seq before it reaches the fusion mechanism (structure pooling,
+    #: the chem block and the head are all untouched) -- the "sequence alone" number this
+    #: project has always had is `mut_pair_ffn_sub` with no structure at all; the symmetric
+    #: "structure alone" number, chem block included exactly as it is for the shipped model,
+    #: has never been priced directly until this flag. With fuse_mode="film" the output is
+    #: exactly `beta(z_st)`, since `(1+gamma)*0 + beta == beta` -- a real forward pass through
+    #: the actual FiLM projection, not a stand-in head.
+    struct_only: bool = False
     #: film_site + fuse_mode="film" only. Concatenates the ITW (wild-type) complex's
     #: ProteinMPNN log-probability (mpnn__logp_wt_complex -- how favourable the model finds
     #: the wild-type residue at the mutated position, in complex context; a proxy for how
@@ -1770,6 +1778,8 @@ class PerturbSiteToken(nn.Module):
                 z_st = z_st + site_mean(st, batch[f"site_{side}"])
             if self.struct_extra_mlp is not None:
                 z_st = self.struct_extra_mlp(z_st)
+            if getattr(c, "struct_only", False):
+                z_seq = z_seq * 0
             z = self.fusion(z_seq, z_st, batch.get("chem"))
             if c.bsite_extra != "none":
                 return self._bsite_extra(batch, px, z)
