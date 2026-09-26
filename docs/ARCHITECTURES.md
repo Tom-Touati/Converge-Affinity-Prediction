@@ -737,3 +737,30 @@ not fixing it. Tied initialisation fixes the SYMPTOM the earlier ablation measur
 ensemble number) more than the CAUSE (mt and wt still drift into different spaces over
 training); worth the second look, not yet worth trusting as a replacement for the shared
 projection.
+
+### G.6 The submitted recipe under the homology-cluster split, and a seq-depth-2 variant that loses on both splits
+
+Two follow-ups on `kendall_soft` (the training-objective addition selected in §G.2):
+does its generalisation gap under the harder homology-cluster split match the plain
+leader's, and does giving the sequence branch its own extra pre-fuse layer
+(`seq_mlp_depth=2`, §G.3's `arch_seq2_film` but now trained WITH the ranking-loss
+addition) help once combined with it. Both checks run on the same 4-fold cluster split
+used throughout this document (`data/cluster_folds.csv`), 3 seeds/fold:
+
+| run | ens (cluster) | ens (standard split) | retention |
+| --- | --- | --- | --- |
+| `struct_film_chem` (plain MSE) | +0.272 | +0.369 | 74% |
+| `struct_film_chem_kendall` (`kendall_soft` addition) | +0.258 | +0.391 | 66% |
+| `+seq_mlp_depth=2` on top of `kendall_soft` | +0.215 | +0.354 | 61% |
+
+The plain-MSE leader's cluster number reproduces its historical +0.272 exactly on the
+current, decoupled architecture (`split_struct` refactor confirmed neutral). Against that,
+`kendall_soft` retains less of its own standard-split gain under the cluster split (66%
+vs. 74%) — a modest generalisation cost that comes with the ranking-loss addition,
+disclosed honestly in [DETAILS.md](DETAILS.md#struct_film_chem) rather than left out.
+Adding a second sequence-branch layer on top makes both numbers worse, not just the
+cluster one — it loses on the standard split alone (+0.354 vs. `kendall_soft`'s +0.391,
+consistent with §G.3's `arch_seq2_film` losing to the depth-1 leader there too) and
+loses by a wider margin under the cluster split (+0.215, worst of the three, and the
+lowest retention). Extra sequence-branch depth does not help this model on either split;
+not pursued further.

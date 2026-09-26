@@ -121,18 +121,46 @@ unchanged from before.
 **Now measured on a real homology-cluster split** (17 clusters from 53 complexes,
 `data/cluster_folds.csv`, 4 folds greedily balanced by row count — `experiments/protattba_repro/
 _perturb_v2_colab.py --fold-map`): ensemble **+0.272**, 74% of the standard-split score, seed
-spread 0.034. `gated_cg_clusterscale` was run the same way for comparison: +0.214, 62%
-retained, spread 0.113 — `struct_film_chem` degrades less under the harder split, not just
-scores higher on the easier one. This is a **different cluster assignment and a different
-metric convention** (ensemble Pearson here; the "Generalisation under a homology split" table
-below reports per-complex Spearman on whatever split produced it, and this document does not
-establish the two splits are identical) — read as a second, independent cluster-holdout
-measurement, not a replacement number for that table.
+spread 0.034 — reproduced exactly on the current, decoupled architecture (`split_struct:
+false`) before trusting the comparison below. `gated_cg_clusterscale` was run the same way for
+comparison: +0.214, 62% retained, spread 0.113 — `struct_film_chem` degrades less under the
+harder split, not just scores higher on the easier one. This is a **different cluster
+assignment and a different metric convention** (ensemble Pearson here; the "Generalisation
+under a homology split" table below reports per-complex Spearman on whatever split produced
+it, and this document does not establish the two splits are identical) — read as a second,
+independent cluster-holdout measurement, not a replacement number for that table.
 
-The full bias/error-analysis battery in [ERROR_ANALYSIS.md](ERROR_ANALYSIS.md) Part IV has
-been re-run against this model (six models including its ESM-IF1 variant and the gated-fusion
-runner-up); Parts I–III still describe `cat128_reg2_l1` and are kept as history, not silently
-carried over.
+**The `kendall_soft` training-objective addition retains LESS under the cluster split than
+plain MSE does** — +0.258 ens, **66%** of its own standard-split score, against the plain
+version's 74%. The ranking term's advantage on the standard split (+0.391 vs +0.369, or +0.379
+vs +0.368 at 8 seeds) does not fully carry over to the harder, homology-controlled test; some
+of what it is learning to rank correctly may be complex-identity-correlated signal the cluster
+split is specifically designed to remove. Reported as a genuine caveat on the current
+recipe, not smoothed over — the standard-split edge is real (§ above), but it is measured on
+the easier split, and the harder one likes it slightly less than it likes the plain model.
+
+**A seq-branch-depth-2 variant on top of `kendall_soft` loses on both splits, not just one.**
+Giving the sequence delta its own extra pre-fuse MLP layer (`seq_mlp_depth=2`) scored +0.354
+ens standard-split (worse than `kendall_soft` alone's +0.391) and **+0.215 ens cluster-split**
+— worse than both `kendall_soft` (+0.258) and the plain leader (+0.272), and the lowest
+retention of the three (61%, vs 66% and 74%). Extra sequence-branch depth was already a loser
+on the standard split alone (§Family G's factorial sweep, `arch_seq2_film` +0.360 against the
+depth-1 leader's +0.369); combining it with the ranking-loss addition does not change that, on
+either split. Not pursued further — see
+[docs/ARCHITECTURES.md §G.6](docs/ARCHITECTURES.md#g6-the-submitted-recipe-under-the-homology-cluster-split-and-a-seq-depth-2-variant-that-loses-on-both-splits)
+for the full comparison table.
+
+The full bias/error-analysis battery in [ERROR_ANALYSIS.md](ERROR_ANALYSIS.md) Part IV was run
+against the plain-MSE version of this model (six models including its ESM-IF1 variant and the
+gated-fusion runner-up); Parts I–III still describe `cat128_reg2_l1` and are kept as history,
+not silently carried over. The `kendall_soft` addition has been run through `bias_analysis.py`,
+`class_separation.py` and `error_drivers.py` separately (not yet folded into Part IV's own
+table): it fails on almost exactly the same rows as the plain version (0.950 error
+correlation, the highest of any pair measured), with slightly DAMPENED versions of the same
+structure-correlated biases (e.g. `n_contacts` signed-error correlation −0.331 vs −0.339) and
+a small pooled class-separation loss (AUC stab|dest 0.831 vs 0.841) alongside a small
+within-complex ranking gain (0.770 vs 0.758) — consistent with a genuine but modest effect on
+the same underlying model, not a different failure mode.
 
 `ens` averages the seeds then scores once — what you would ship. `per seed` scores each seed
 separately — what one training run gives you. **`spread` is max − min across seeds, and it is

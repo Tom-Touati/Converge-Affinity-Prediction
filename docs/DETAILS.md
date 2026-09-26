@@ -531,19 +531,37 @@ mean against +0.281, same seed spread (0.217) either way — see
 for the two other candidates from that sweep that did NOT survive the same check. Small and
 honestly reported as small; the architecture above is completely unchanged.
 
-**What has not yet been done for this model**, honestly listed rather than implied:
-the homology-cluster-split retention number and the full bias/error-analysis battery
-in `ERROR_ANALYSIS.md` were run against the plain-MSE version (README §1,
-`ERROR_ANALYSIS.md` Part IV) and have not yet been re-run with the ranking-loss addition
-above. A later sweep of ten features describing a mutation's position relative to the
+**Cluster-split and error-analysis, re-run for the ranking-loss addition.** Both have now
+been checked directly against `struct_film_chem_kendall` rather than left describing the
+plain-MSE version:
+
+- **Homology-cluster split**: +0.258 ens (4-fold, 3 seeds/fold), i.e. **66%** of this
+  model's own standard-split number (+0.391), against the plain-MSE leader's 74%
+  retention (+0.272 of +0.369). The ranking-loss addition generalizes somewhat worse
+  under the harder split than plain MSE does — a real, if modest, caveat on the
+  addition, not on the architecture (the plain-MSE leader's cluster number was also
+  re-measured this round and reproduced its historical +0.272 exactly, confirming the
+  decoupled `split_struct` refactor changed nothing).
+- **Bias/error-analysis battery** (`bias_analysis.py`, `class_separation.py`,
+  `error_drivers.py`): run locally against `struct_film_chem_kendall`. Errors correlate
+  0.950 with the plain-MSE version's, and the same complex-imbalance and mutation-type
+  biases from `ERROR_ANALYSIS.md` Part IV show up dampened rather than removed
+  (pooled stab|dest AUC 0.831 vs. plain's 0.841; within-complex 0.770 vs. 0.758). These
+  findings are summarized in README.md but **not yet folded into `ERROR_ANALYSIS.md`'s
+  own Part IV tables**, which still describe the plain-MSE version only.
+
+A separately-tried variant that gives the sequence delta its own extra pre-fuse MLP
+layer (`seq_mlp_depth=2`, structure unchanged) scored worse than the ranking-loss
+addition alone on BOTH splits: +0.354 ens standard-split (vs. +0.391) and +0.215 ens
+cluster-split (vs. +0.258, the worst cluster number and worst retention — 61% — of
+the three variants compared in
+[ARCHITECTURES.md §G.6](ARCHITECTURES.md#g6-the-submitted-recipe-under-the-homology-cluster-split-and-a-seq-depth-2-variant-that-loses-on-both-splits)).
+Not pursued further.
+
+A later sweep of ten features describing a mutation's position relative to the
 binding site, injected into the mutation's own projection, did not beat this model once
 measured correctly (a confound in an early comparison made one of them look competitive;
 see
 [ARCHITECTURES.md §Family F](ARCHITECTURES.md#family-f--injecting-where-a-mutation-sits-relative-to-the-binding-site)
 for the full account). `struct_film_chem` (now trained with the ranking-loss addition)
 remains the submitted model.
-
-**What has not yet been done for this model**, honestly listed rather than implied:
-the homology-cluster-split retention number and the full bias/error-analysis battery
-in `ERROR_ANALYSIS.md` — both still describe `struct_film_chem`, the model this
-superseded.
