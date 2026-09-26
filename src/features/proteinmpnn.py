@@ -225,6 +225,9 @@ def _featurize_stab(structure, ab: str, ag: str, device: str):
         offsets[cid] = cursor
         cursor += n
 
+    if not xs:
+        raise ValueError(f"none of {ab+ag!r} found in structure {structure.pdb!r}'s chains "
+                         f"({sorted(structure.chains)})")
     X = np.concatenate(xs, 0)[None]
     S = np.concatenate(seqs, 0)[None]
     L = X.shape[1]
@@ -271,25 +274,79 @@ def _mutate(S_wt: torch.Tensor, structure, offsets: dict, mutations) -> torch.Te
     return S_mut
 
 
+def _stab_trial_chunk(model, X, S_wt, S_mut, masks, residue_idx, chain_enc, device,
+                      noise_level, gen, n: int) -> dict:
+    """``n`` Monte Carlo trials as ONE batch (batch size ``n``) per system/sequence -- six
+    forward passes total, not ``6 * n``. Raises ``torch.OutOfMemoryError`` for the caller to
+    catch and retry smaller; does not catch it itself, so it never hides a real failure.
+    """
+    L = X.shape[1]
+    order = torch.stack([torch.argsort(torch.abs(torch.randn(L, generator=gen)))
+                         for _ in range(n)]).to(device)
+    noise = (noise_level * torch.randn((n,) + X.shape[1:], generator=gen)).to(device)
+    Xb = X.repeat(n, 1, 1, 1)
+    ridxb = residue_idx.repeat(n, 1)
+    ceb = chain_enc.repeat(n, 1)
+    Swtb = S_wt.repeat(n, 1)
+    Smutb = S_mut.repeat(n, 1)
+
+    sums = {}
+    for name, mask in masks.items():                  # complex, ab_alone, ag_alone, in order
+        maskb = mask.repeat(n, 1)
+        f_wt = _stab_logp(model, Xb, Swtb, maskb, ridxb, ceb, order, noise)     # (n,)
+        f_mut = _stab_logp(model, Xb, Smutb, maskb, ridxb, ceb, order, noise)   # (n,)
+        sums[f"f_wt_{name}"] = float(f_wt.sum().item())
+        sums[f"f_mut_{name}"] = float(f_mut.sum().item())
+    return sums
+
+
 def _stab_trial(model, structure, ab: str, ag: str, mutations, device: str,
-                noise_level: float, gen: torch.Generator) -> dict:
-    """One Monte Carlo trial of StaB-ddG's cycle: b(s) = f(AB) - f(A) - f(B), for both the
-    wild-type and the mutant sequence. ONE decoding permutation and ONE backbone-noise draw are
-    sampled here and reused across ALL SIX forward passes below (not just within a wt/mut pair)
-    -- mandatory, per the paper: this is the variance-reduction mechanism the reported
-    Spearman ~0.45 depends on, not an optional refinement.
+                noise_level: float, gen: torch.Generator, n_samples: int = 1) -> dict:
+    """``n_samples`` Monte Carlo trials of StaB-ddG's cycle, BATCHED along a batch dimension
+    rather than run as a Python loop. Each trial still draws its OWN decoding permutation and
+    backbone-noise, shared across that trial's own six forward passes (wt/mut x complex/ab-
+    alone/ag-alone) -- mandatory, per the paper, for the variance reduction the reported
+    Spearman ~0.45 depends on. What changes is that all ``n_samples`` trials' six passes are
+    each ONE batched ``model()`` call (batch size ``n_samples``) instead of ``n_samples``
+    separate batch-size-1 calls: six forward passes total per row regardless of ``n_samples``,
+    not ``6 * n_samples``. ProteinMPNN at batch size 1 is latency- not compute-bound on a GPU
+    (a ~1.7M-parameter model barely touches a T4's width), so this is a real wall-clock win, not
+    just a smaller Python loop.
+
+    Mathematically identical to averaging ``n_samples`` separately-run trials: every quantity
+    here (the six f-terms, and ``stab_ddg`` itself) is linear in the per-position log-probs, and
+    mean-then-combine equals combine-then-mean. ``n_samples=1`` reproduces the original
+    single-trial call exactly -- the batch dimension is a no-op, not an approximation.
+
+    **Memory-adaptive.** A full-``n_samples`` batch's memory scales with the complex's residue
+    count, and a large enough complex (general SKEMPI has some far bigger than any antibody-
+    antigen one this project was tuned against) can exceed the GPU's memory at batch size 20 --
+    measured directly: the first, naive version of this function OOM'd partway through a
+    4541-row extraction. Rather than pick one conservative chunk size that wastes GPU on every
+    small complex to survive the rare large one, this starts at ``n_samples`` and halves on
+    ``torch.OutOfMemoryError`` until it fits (floor of 1, i.e. the pre-batching behaviour) --
+    the fast path costs nothing extra, and no complex can crash the run.
     """
     X, S_wt, masks, residue_idx, chain_enc, offsets = _featurize_stab(structure, ab, ag, device)
     S_mut = _mutate(S_wt, structure, offsets, mutations)
-    order = torch.argsort(torch.abs(torch.randn(masks["complex"].shape, generator=gen))).to(device)
-    noise = (noise_level * torch.randn(X.shape, generator=gen)).to(device)
 
-    terms = {}
-    for name, mask in masks.items():                  # complex, ab_alone, ag_alone, in order
-        f_wt = _stab_logp(model, X, S_wt, mask, residue_idx, chain_enc, order, noise)
-        f_mut = _stab_logp(model, X, S_mut, mask, residue_idx, chain_enc, order, noise)
-        terms[f"f_wt_{name}"] = float(f_wt.item())
-        terms[f"f_mut_{name}"] = float(f_mut.item())
+    chunk = n_samples
+    totals = None
+    remaining = n_samples
+    while remaining > 0:
+        n = min(chunk, remaining)
+        try:
+            sums = _stab_trial_chunk(model, X, S_wt, S_mut, masks, residue_idx, chain_enc,
+                                     device, noise_level, gen, n)
+        except torch.cuda.OutOfMemoryError:
+            if chunk <= 1:
+                raise
+            chunk = max(1, chunk // 2)
+            torch.cuda.empty_cache()
+            continue
+        totals = sums if totals is None else {k: totals[k] + v for k, v in sums.items()}
+        remaining -= n
+    terms = {k: v / n_samples for k, v in totals.items()}
 
     b_wt = terms["f_wt_complex"] - terms["f_wt_ab_alone"] - terms["f_wt_ag_alone"]
     b_mut = terms["f_mut_complex"] - terms["f_mut_ab_alone"] - terms["f_mut_ag_alone"]
@@ -304,10 +361,10 @@ def _stab_trial(model, structure, ab: str, ag: str, mutations, device: str,
 def stab_ddg(structure, ab: str, ag: str, mutations, *, device: str = "auto",
             variant: str = "zeroshot", n_samples: int = STAB_MC_SAMPLES,
             noise_level: float = STAB_NOISE_LEVEL, seed: int = 0) -> dict:
-    """StaB-ddG's binding ddG for one mutation, averaged over ``n_samples`` antithetic Monte
-    Carlo trials. Returns the six per-system f(...) terms (also averaged over trials -- our own
-    head may recombine them better than the fixed b = f(AB) - f(A) - f(B) cycle does), the final
-    ``stab_ddg`` scalar, and ``unit`` ("log-likelihood" for zero-shot, "kcal/mol" for
+    """StaB-ddG's binding ddG for one mutation, averaged over ``n_samples`` Monte Carlo trials
+    (batched -- see ``_stab_trial``). Returns the six per-system f(...) terms (also averaged --
+    our own head may recombine them better than the fixed b = f(AB) - f(A) - f(B) cycle does),
+    the final ``stab_ddg`` scalar, and ``unit`` ("log-likelihood" for zero-shot, "kcal/mol" for
     stability_finetuned -- branch on this downstream rather than assuming one scale).
 
     Cached by every argument that changes the answer: a complex is scored by many mutations, and
@@ -323,9 +380,7 @@ def stab_ddg(structure, ab: str, ag: str, mutations, *, device: str = "auto",
 
     model = _load_stab_model(device, variant)
     gen = torch.Generator().manual_seed(seed)
-    trials = [_stab_trial(model, structure, ab, ag, mutations, device, noise_level, gen)
-             for _ in range(n_samples)]
-    out = {k: float(np.mean([t[k] for t in trials])) for k in trials[0]}
+    out = _stab_trial(model, structure, ab, ag, mutations, device, noise_level, gen, n_samples)
     out["unit"] = "log-likelihood" if variant == "zeroshot" else "kcal/mol"
     _stab_cache[key] = out
     return out
@@ -426,9 +481,13 @@ def extract_stab(device: str = "auto", variant: str = "zeroshot",
 
     rows = []
     t0 = time.perf_counter()
-    for n, (row_id, pdb, ab, ag, muts) in enumerate(
-        zip(df["row_id"], df["pdb"], df["ab_chains"], df["ag_chains"], df["mutations"])
+    for n, (row_id, key, pdb, abc, agc, muts) in enumerate(
+        zip(df["row_id"], df["#Pdb"], df["pdb"], df["ab_chains"], df["ag_chains"], df["mutations"])
     ):
+        # ab_chains/ag_chains are blank on 38 of 940 rows (e.g. 1DVF_AB_CD) -- extract()'s own
+        # fallback, parsing the chain groups back out of "#Pdb" instead.
+        ab = abc or key.split("_")[1]
+        ag = agc or key.split("_")[2]
         st = structures[pdb]
         mutations = parse_mutations(muts)
         out = stab_ddg(st, ab, ag, mutations, device=device, variant=variant,
@@ -451,8 +510,8 @@ def extract_stab(device: str = "auto", variant: str = "zeroshot",
     out_path = paths.FEATURES / f"stab_ddg{suffix}.parquet"
     block.to_parquet(out_path, index=False)
     if verbose:
-        print(f"wrote {out_path.relative_to(paths.ROOT)}  {block.shape}  unit={unit}  "
-              f"in {time.perf_counter()-t0:.1f}s")
+        print(f"wrote {out_path.relative_to(paths.ROOT)}  {block.shape}  "
+              f"unit={block['stab__unit'].iloc[0]}  in {time.perf_counter()-t0:.1f}s")
     return block
 
 

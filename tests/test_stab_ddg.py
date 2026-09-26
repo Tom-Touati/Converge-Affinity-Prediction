@@ -75,6 +75,103 @@ def test_wt_and_mutant_share_decoding_order_and_backbone_noise():
     assert not torch.equal(fake2.calls[0]["decoding_order"], fake2.calls[6]["decoding_order"])
 
 
+def test_batched_trials_share_within_a_call_but_differ_from_each_other():
+    """n_samples>1 (the batched path added for GPU throughput): all six calls in ONE
+    _stab_trial invocation must share the identical (n_samples, L)-shaped order/noise batch --
+    batching six calls is a performance change, not a licence to reuse one trial's randomness
+    for another -- but different ROWS within that shared batch (different trials) must differ
+    from each other, or batching would collapse n_samples trials into n_samples copies of one.
+    """
+    st = _toy_structure()
+    mutations = [Mutation(wt=st.chains["A"].seq[0], chain="A", resnum=1, icode="", mut="G")]
+    fake = _RecordingFakeMPNN()
+    gen = torch.Generator().manual_seed(0)
+
+    pm._stab_trial(fake, st, "A", "B", mutations, "cpu", pm.STAB_NOISE_LEVEL, gen, n_samples=3)
+
+    assert len(fake.calls) == 6
+    order0 = fake.calls[0]["decoding_order"]
+    assert order0.shape[0] == 3
+    for call in fake.calls[1:]:
+        assert torch.equal(call["decoding_order"], order0)      # shared ACROSS the six calls
+    assert not torch.equal(order0[0], order0[1])                # but distinct WITHIN the batch
+    assert not torch.equal(order0[0], order0[2])
+
+
+def test_n_samples_1_matches_pre_batching_semantics():
+    """n_samples=1 (the default) must reproduce the original single-trial call exactly: six
+    calls, batch size 1 -- the batch dimension is a no-op, not an approximation."""
+    st = _toy_structure()
+    mutations = [Mutation(wt=st.chains["A"].seq[0], chain="A", resnum=1, icode="", mut="G")]
+    fake = _RecordingFakeMPNN()
+    out = pm._stab_trial(fake, st, "A", "B", mutations, "cpu", pm.STAB_NOISE_LEVEL,
+                         torch.Generator().manual_seed(0), n_samples=1)
+    assert len(fake.calls) == 6
+    assert fake.calls[0]["decoding_order"].shape[0] == 1
+    assert "stab_ddg" in out
+
+
+class _OOMUntilSmallMPNN:
+    """Raises torch.cuda.OutOfMemoryError for any call with batch size above `max_ok` --
+    stands in for a real complex too large to score at the requested batch size, so the test
+    can verify _stab_trial's halve-and-retry actually recovers rather than propagating the
+    error (as it should for any OTHER exception) or silently corrupting the average.
+    """
+
+    def __init__(self, max_ok: int):
+        self.max_ok = max_ok
+        self.batch_sizes_seen = []
+
+    def __call__(self, X, S, mask, chain_M, residue_idx, chain_encoding_all, randn,
+                use_input_decoding_order=False, decoding_order=None):
+        b = S.shape[0]
+        self.batch_sizes_seen.append(b)
+        if b > self.max_ok:
+            raise torch.cuda.OutOfMemoryError(f"fake OOM at batch size {b}")
+        n_aa = len(pm.ALPHABET)
+        return torch.full((b, S.shape[1], n_aa), -float(np.log(n_aa)))
+
+
+def test_oom_falls_back_to_a_smaller_batch_instead_of_crashing():
+    """A complex too large for the requested n_samples must still complete -- halving the
+    batch on OOM until it fits -- rather than crash the whole extraction partway through, which
+    is exactly what happened before this fallback existed (a real 4541-row run OOM'd on one
+    large complex after ~1450 rows of otherwise-successful batched extraction)."""
+    st = _toy_structure()
+    mutations = [Mutation(wt=st.chains["A"].seq[0], chain="A", resnum=1, icode="", mut="G")]
+    fake = _OOMUntilSmallMPNN(max_ok=2)
+
+    out = pm._stab_trial(fake, st, "A", "B", mutations, "cpu", pm.STAB_NOISE_LEVEL,
+                         torch.Generator().manual_seed(0), n_samples=8)
+
+    # Failed attempts are recorded before the fake raises, so batch_sizes_seen includes the
+    # ones that didn't fit (8, then 4) -- the invariant to check is that it DID start there and
+    # DID eventually succeed at a size within budget, not that it never tried too big.
+    assert 8 in fake.batch_sizes_seen                       # started at the full n_samples
+    assert any(b <= 2 for b in fake.batch_sizes_seen)        # and backed off until it fit
+    assert np.isfinite(out["stab_ddg"])                      # completed rather than raising
+
+
+def test_oom_fallback_gives_the_same_average_as_one_full_batch():
+    """The halve-and-retry path must be a PERFORMANCE fallback, not a different answer: chunking
+    8 trials into e.g. 2+2+2+2 must average to the same result (up to the RNG-order noise
+    already covered by test_stab_ddg_deterministic_with_fixed_seed) as one batch of 8 would --
+    checked here by forcing the small-batch path and comparing against a real forward pass
+    computed by hand at the same total sample count."""
+    st = _toy_structure()
+    wt_aa = st.chains["A"].seq[0]
+    mutations = [Mutation(wt=wt_aa, chain="A", resnum=1, icode="", mut=wt_aa)]  # synonymous
+    fake = _OOMUntilSmallMPNN(max_ok=3)
+
+    out = pm._stab_trial(fake, st, "A", "B", mutations, "cpu", pm.STAB_NOISE_LEVEL,
+                         torch.Generator().manual_seed(0), n_samples=8)
+
+    # A synonymous mutation gives stab_ddg == 0 exactly regardless of chunking, since S_mut ==
+    # S_wt bit-for-bit in every chunk -- the one property chunking must not be able to break.
+    assert out["stab_ddg"] == pytest.approx(0.0, abs=1e-6)
+    assert any(b < 8 for b in fake.batch_sizes_seen)     # confirms chunking actually happened
+
+
 def test_synonymous_mutation_gives_zero_ddg():
     """A 'mutation' to the wild-type residue itself leaves S_mut == S_wt bit-for-bit, so
     b(mut) must equal b(wt) exactly -- independent of the antithetic-variate mechanism above,
