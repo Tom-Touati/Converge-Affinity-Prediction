@@ -89,6 +89,113 @@ def site_mean(x: torch.Tensor, site: torch.Tensor) -> torch.Tensor:
     return (x * w).sum(1) / w.sum(1).clamp(min=1.0)
 
 
+class DualProjection(nn.Module):
+    """A no-bias Linear(in_w, out_w) -- ONE shared across ab/ag when split=False, or an
+    independent copy PER SIDE when split=True. This project's own rule (never share the
+    first linear layer between two genuinely different distributions) is a per-call-site
+    choice, not a fixed one, which is why this takes `split` rather than hard-coding it --
+    the same class backs both sequence's per-side projection and structure's (split_proj /
+    split_struct), which before this were two separately hand-rolled copies of the exact
+    same "shared Linear vs ModuleDict-by-side" branch.
+    """
+
+    def __init__(self, in_w: int, out_w: int, split: bool):
+        super().__init__()
+        self.split = split
+        self.proj = (nn.ModuleDict({side: nn.Linear(in_w, out_w, bias=False)
+                                    for side in ("ab", "ag")})
+                    if split else nn.Linear(in_w, out_w, bias=False))
+
+    def forward(self, x: torch.Tensor, side: str) -> torch.Tensor:
+        return self.proj[side](x) if self.split else self.proj(x)
+
+
+class Fusion(nn.Module):
+    """How z_seq and z_st combine into one vector once both are fully pooled -- film_site's
+    fuse_mode axis. One interface, four interchangeable strategies (ARCHITECTURES.md's
+    fuse_mode sweep): struct_film_chem's own FiLM gate is the only one with parameters of
+    its own; the other three are fixed, parameter-free combining rules kept only to
+    separate the fusion MECHANISM from the depth questions seq_mlp_depth/struct_mlp_depth
+    ask. `chem` is accepted by every strategy so the caller need not know which one it has;
+    only FiLMFusion (struct_bind_feat) reads it.
+    """
+
+    def out_width(self, w: int) -> int:
+        return w
+
+    def forward(self, z_seq: torch.Tensor, z_st: torch.Tensor,
+               chem: torch.Tensor | None = None) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class MultiplyFusion(Fusion):
+    def forward(self, z_seq, z_st, chem=None):
+        return z_seq * z_st
+
+
+class AddFusion(Fusion):
+    def forward(self, z_seq, z_st, chem=None):
+        return z_seq + z_st
+
+
+class ConcatFusion(Fusion):
+    def out_width(self, w):
+        return w * 2
+
+    def forward(self, z_seq, z_st, chem=None):
+        return torch.cat([z_seq, z_st], dim=-1)
+
+
+class FiLMFusion(Fusion):
+    """z = (1+gamma)*z_seq + beta, gamma/beta from Linear(w[+1], 2w) of z_st. The +1 and
+    the chem read are struct_bind_feat: the ITW (wild-type) complex's ProteinMPNN
+    log-probability (column 25 of chem_perturb_v2's fixed 39-column layout, a proxy for how
+    strong the wild-type binding already is), concatenated onto z_st before it drives FiLM
+    -- reaching the structure branch directly rather than only the tail chem concat every
+    other column uses.
+    """
+
+    def __init__(self, w: int, struct_bind_feat: bool = False):
+        super().__init__()
+        self.struct_bind_feat = struct_bind_feat
+        self.film = nn.Linear(w + 1 if struct_bind_feat else w, 2 * w)
+
+    def forward(self, z_seq, z_st, chem=None):
+        if self.struct_bind_feat:
+            assert chem is not None and chem.shape[-1] == 39, \
+                "struct_bind_feat needs chem_perturb_v2 (39 cols)"
+            z_st = torch.cat([z_st, chem[:, 25:26]], dim=-1)
+        gamma, beta = self.film(z_st).chunk(2, dim=-1)
+        return (1 + gamma) * z_seq + beta
+
+
+def _make_fusion(c, w: int) -> Fusion:
+    fm = getattr(c, "fuse_mode", "film")
+    bind = getattr(c, "struct_bind_feat", False)
+    if fm == "film":
+        return FiLMFusion(w, bind)
+    if bind:
+        raise ValueError("struct_bind_feat needs fuse_mode='film'")
+    return {"multiply": MultiplyFusion, "add": AddFusion, "concat": ConcatFusion}[fm]()
+
+
+def _mlp_stack(w: int, depth: int, in_w: int | None = None) -> nn.Module:
+    """depth=1 -> a single Linear(in_w, w), matching every existing config exactly when
+    in_w=w (nn.Linear and nn.Sequential are both plain callables, so callers never need to
+    know which they got). depth>1 -> Linear(in_w,w)-GELU-Linear(w,w)-...-Linear(w,w), GELU
+    between layers only. `in_w` (default w) lets the FIRST layer reduce a wider input --
+    e.g. mut_pair_op="concat"'s 2w-wide [mt;wt] -- down to w before any later layer.
+    """
+    in_w = w if in_w is None else in_w
+    if depth <= 1:
+        return nn.Linear(in_w, w)
+    layers: list[nn.Module] = [nn.Linear(in_w, w), nn.GELU()]
+    for _ in range(depth - 2):
+        layers += [nn.Linear(w, w), nn.GELU()]
+    layers.append(nn.Linear(w, w))
+    return nn.Sequential(*layers)
+
+
 class PerturbSimple(nn.Module):
     def __init__(self, cfg: SimpleConfig | None = None):
         super().__init__()
@@ -718,10 +825,48 @@ class SiteTokenConfig:
     #: ``sub``  LN(mt) - LN(wt). Restores the zero invariant (mt==wt -> exactly zero) and
     #:          has no dead-gradient direction -- d(u-v)/du = 1 everywhere, independent of
     #:          the other side's value.
+    #: ``concat`` [LN(mt); LN(wt)], 2w-wide, reduced back to w by pair_ffn's OWN first
+    #:          layer (Linear(2w, w) instead of sub/mul's Linear(w, w)) rather than by a
+    #:          fixed combining rule chosen in advance. Loses the zero invariant like
+    #:          ``mul`` does (mt==wt is not a distinguished input to a plain concat), but
+    #:          unlike ``mul`` it has no dead-gradient direction: d(reduce([u;v]))/du is
+    #:          the reduction weights, independent of v's value. Costs w*w more parameters
+    #:          than ``sub``/``mul`` (2w*w vs w*w for the first layer) for the chance to
+    #:          learn a combining rule richer than a fixed subtraction.
     mut_pair_op: str = "mul"
     #: GELU on pair_ffn's OWN output, before the sum -- off by default (the mul variant
     #: was asked to stay linear there), on for the sub variant by request.
     mut_pair_act: bool = False
+    #: Depth of pair_ffn, the shared linear layer applied to LN(mt)-LN(wt). 1 (default) is
+    #: struct_film_chem's own single Linear(w,w); N>1 makes it an N-layer MLP
+    #: (Linear-GELU-...-Linear, GELU between layers only, same width throughout) --
+    #: deepening the sequence-delta representation before it reaches FiLM, rather than
+    #: adding capacity anywhere else.
+    seq_mlp_depth: int = 1
+    #: film_site only. Depth of an EXTRA MLP applied to z_st (the pooled, summed structure
+    #: representation) right before it drives the fusion -- 1 (default) adds nothing, N>1
+    #: is an N-layer Linear-GELU-...-Linear stack, same width (w), mirroring
+    #: seq_mlp_depth's construction for the structure side.
+    struct_mlp_depth: int = 1
+    #: film_site only. "film" (default) is struct_film_chem's own FiLM gate
+    #: (z = (1+gamma)*z_seq + beta) -- the only mode with its own learned projection of
+    #: z_st; the other three are plain, parameter-free combining rules, to separate the
+    #: fusion MECHANISM from the depth questions seq_mlp_depth/struct_mlp_depth ask.
+    #: "multiply": z_seq * z_st. "add": z_seq + z_st. "concat": [z_seq; z_st], 2w-wide --
+    #: the only one of the four that widens the head's input (d += w), since it is the only
+    #: one that does not collapse z_st back to w dimensions before the head.
+    fuse_mode: str = "film"
+    #: film_site + fuse_mode="film" only. Concatenates the ITW (wild-type) complex's
+    #: ProteinMPNN log-probability (mpnn__logp_wt_complex -- how favourable the model finds
+    #: the wild-type residue at the mutated position, in complex context; a proxy for how
+    #: strong the wild-type binding already is) onto z_st, the pooled structure
+    #: representation, right before it drives FiLM. Every other feature in chem_dim only
+    #: reaches the model at the very end, concatenated onto the FiLM OUTPUT; this lets the
+    #: structure branch itself read it. Column 25 of chem_perturb_v2's fixed 39-column
+    #: layout -- requires chem_dim == 39 and CHEM_TABLE=chem_perturb_v2, asserted at
+    #: forward time rather than assumed silently. Not supported with fuse_mode="multiply"
+    #: (z_st's width would no longer match z_seq's).
+    struct_bind_feat: bool = False
     #: mut_pair_ffn only. tok_proj's first Linear is keyed by side (ab/ag) but NOT by
     #: mutant-vs-wild-type -- LN(mt) and LN(wt) both come out of the SAME map before being
     #: subtracted. That is the identical weight-sharing this project's own rule (never
@@ -731,6 +876,34 @@ class SiteTokenConfig:
     #: their own Linear per side (4 total: ab_mt, ab_wt, ag_mt, ag_wt) instead of sharing
     #: tok_proj's map.
     split_mutwt: bool = False
+    #: split_mutwt only. split_mutwt on its own measured as a clear regression (+0.294 vs
+    #: +0.369, seed spread more than doubled -- ARCHITECTURES.md sF.1): independently random
+    #: init starts mt's and wt's projections in unrelated subspaces, so LN(mt)-LN(wt) is not
+    #: a meaningful "what changed" signal until training happens to pull them back together,
+    #: if it ever does. This starts each side's mt/wt pair TIED instead -- wt's weight
+    #: initialised as a COPY of mt's (per side, so ab_mt/ab_wt start identical and ag_mt/
+    #: ag_wt start identical, ab vs ag remains independently random as it always has been) --
+    #: so at step 0 the split architecture computes the SAME subtraction the shared-weight
+    #: leader does. A small independent Gaussian perturbation (std 0.02) is then added to
+    #: EACH copy so the two are not held exactly equal during training (no gradient tying,
+    #: just a shared starting point) -- free to diverge if that earns something, without the
+    #: cold-random-start that made the plain split a regression.
+    split_mutwt_tied_init: bool = False
+    #: mut_pair_ffn only. WHEN structure enters the sequence computation, relative to the
+    #: per-residue mt-wt delta -- an early/mid/late fusion ablation on the leader itself.
+    #: "late" (default): struct_film_chem's own behaviour, completely unchanged -- the
+    #: sequence branch (LN(mt)-LN(wt) -> pair_ffn -> sum) never sees structure at all;
+    #: mut_pair_struct_inject's separate mechanism (typically "film_site") combines the two
+    #: only after BOTH are fully pooled into one vector each. "early": the wild-type
+    #: structure embedding at each residue is ADDED to p_mt and p_wt BEFORE LayerNorm and
+    #: the subtraction -- structure shapes what "the same" means at that residue before any
+    #: delta is computed. "mid": structure is added to h = pair_ffn(comb), the per-residue
+    #: delta AFTER subtraction, but before summing over the mutated sites -- structure
+    #: reweights an already-computed "what changed" signal, one residue at a time, rather
+    #: than reshaping the residues going into it. "early"/"mid" both require
+    #: mut_pair_struct_inject="none" (the late mechanism would otherwise double-count
+    #: structure on top of an already-fused sequence term).
+    fusion_stage: str = "late"
     #: mut_pair_ffn only. Injects one more feature INTO the mutation's own projection --
     #: added to p_mt, before LN and the mt-wt subtraction -- rather than pooled and
     #: concatenated after the whole backbone the way bsite_extra's modes are. The
@@ -1041,11 +1214,20 @@ class PerturbSiteToken(nn.Module):
             return
         if c.mut_pair_ffn:
             self.pair_ln = nn.LayerNorm(w, elementwise_affine=False)  # no params, so one
-            self.pair_ffn = nn.Linear(w, w)                           # instance is fine
+            pair_in = 2 * w if c.mut_pair_op == "concat" else w
+            self.pair_ffn = _mlp_stack(w, getattr(c, "seq_mlp_depth", 1), in_w=pair_in)
             self.proj_mutwt = (
                 nn.ModuleDict({f"{side}_{which}": nn.Linear(seq_in, c.proj, bias=False)
                                for side in ("ab", "ag") for which in ("mt", "wt")})
                 if getattr(c, "split_mutwt", False) else None)
+            if self.proj_mutwt is not None and getattr(c, "split_mutwt_tied_init", False):
+                with torch.no_grad():
+                    for side in ("ab", "ag"):
+                        base = self.proj_mutwt[f"{side}_mt"].weight.clone()
+                        self.proj_mutwt[f"{side}_mt"].weight.add_(
+                            0.02 * torch.randn_like(base))
+                        self.proj_mutwt[f"{side}_wt"].weight.copy_(
+                            base + 0.02 * torch.randn_like(base))
             mf = getattr(c, "mut_feat", "none")
             if mf == "nearest_partner_struct":
                 self.mut_feat_proj = self._make_struct_proj(c, seq_in, w)
@@ -1068,13 +1250,18 @@ class PerturbSiteToken(nn.Module):
                                            rope=True, rope_base=c.rope_base)
                 d = w * 2                       # sequence term concat structure term
             mode = c.mut_pair_struct_inject
-            if mode != "none":
+            fusion_stage = getattr(c, "fusion_stage", "late")
+            if mode != "none" or fusion_stage in ("early", "mid"):
                 self.mpnn_proj = self._make_struct_proj(c, seq_in, w)
                 self.struct_ln = nn.LayerNorm(w, elementwise_affine=False)
+            if mode != "none":
                 if mode in ("site_concat", "crop_concat", "nn_diff_concat"):
                     d = w * 2
                 elif mode == "film_site":
-                    self.film = nn.Linear(w, 2 * w)                 # -> gamma, beta
+                    self.fusion = _make_fusion(c, w)
+                    self.struct_extra_mlp = (
+                        _mlp_stack(w, c.struct_mlp_depth)
+                        if getattr(c, "struct_mlp_depth", 1) > 1 else None)
                     bx = c.bsite_extra
                     if bx != "none":
                         self.bsite_mpnn_proj = self._make_struct_proj(c, seq_in, w)
@@ -1096,6 +1283,10 @@ class PerturbSiteToken(nn.Module):
                         d = w + 2                # one scalar per side
                     elif bx in ("min_dist_crop", "mean_dist_crop", "mut_dist_to_site"):
                         d = w + 1                # one scalar, both sides combined
+                    # z itself may be wider than w before any bx addition above (which
+                    # assumes a w-wide z), so the fusion's own delta is added on top here,
+                    # not overwritten -- 0 for every strategy except ConcatFusion (+w).
+                    d += self.fusion.out_width(w) - w
                 elif mode == "gated_site":
                     self.gate = nn.Linear(2 * w, w)
                     self.gate_val = nn.Linear(w, w, bias=False)
@@ -1221,9 +1412,14 @@ class PerturbSiteToken(nn.Module):
     def _mut_pair_ffn(self, batch, px, tok_proj) -> torch.Tensor:
         """At each mutated residue: GELU(proj) -> LN(mt) combine LN(wt) -> Linear, summed."""
         c = self.cfg
+        stage = getattr(c, "fusion_stage", "late")
+        gelu = torch.nn.functional.gelu
         acc = 0
         for side in ("ab", "ag"):
             site = batch[f"site_{side}"].unsqueeze(-1)
+            st = None
+            if stage in ("early", "mid"):
+                st = self.struct_pool(px(batch[f"struct_{side}"]), side)
             # the activation sits on the INITIAL projection, not on pair_ffn's output --
             # local to this check, not on the shared proj_side every other architecture
             # in this file reads unactivated
@@ -1235,16 +1431,31 @@ class PerturbSiteToken(nn.Module):
             else:
                 p_mt = torch.nn.functional.gelu(tok_proj(px(batch[f"seq_{side}_mt"]), side))
                 p_wt = torch.nn.functional.gelu(tok_proj(px(batch[f"seq_{side}_wt"]), side))
+            if stage == "early":
+                # Structure shapes what "the same" means at this residue BEFORE any delta
+                # is computed -- both mt and wt get it, the wild-type backbone being the
+                # only structure this project ever has for either.
+                p_mt = p_mt + st
+                p_wt = p_wt + st
             if getattr(c, "mut_feat", "none") != "none":
                 # Added to p_mt ONLY (not p_wt): this is a property of where the mutated
                 # residue sits, not of the wild-type sequence, so it has no business
                 # shifting the comparison's other side.
                 p_mt = p_mt + self._mut_feat_bias(batch, px, side)
             n_mt, n_wt = self.pair_ln(p_mt), self.pair_ln(p_wt)
-            comb = (n_mt - n_wt) if c.mut_pair_op == "sub" else (n_mt * n_wt)
+            if c.mut_pair_op == "sub":
+                comb = n_mt - n_wt
+            elif c.mut_pair_op == "concat":
+                comb = torch.cat([n_mt, n_wt], dim=-1)
+            else:
+                comb = n_mt * n_wt
             h = self.pair_ffn(comb)
             if c.mut_pair_act:
                 h = torch.nn.functional.gelu(h)
+            if stage == "mid":
+                # Structure reweights an ALREADY-COMPUTED "what changed" signal, one residue
+                # at a time, rather than reshaping the residues that feed it.
+                h = h + st
             acc = acc + (h * site).sum(1)
         return acc
 
@@ -1263,7 +1474,8 @@ class PerturbSiteToken(nn.Module):
             feat = torch.gather(st_other, 1,
                                 nn_idx.unsqueeze(-1).expand(-1, -1, st_other.shape[-1]))
             proj = self.mut_feat_proj
-            raw = proj[side](feat) if isinstance(proj, nn.ModuleDict) else proj(feat)
+            raw = (proj(feat, side) if isinstance(proj, DualProjection)
+                  else proj[side](feat) if isinstance(proj, nn.ModuleDict) else proj(feat))
             return gate * raw
         return gate * self.mut_feat_proj(self._mut_feat_scalar(batch, side).unsqueeze(-1))
 
@@ -1344,13 +1556,23 @@ class PerturbSiteToken(nn.Module):
         """
         dim = c.struct_pca_dim or seq_in
         split = c.split_proj if getattr(c, "split_struct", None) is None else c.split_struct
-        if split:
-            return nn.ModuleDict({k: nn.Linear(dim, w, bias=False) for k in ("ab", "ag")})
-        return nn.Linear(dim, w, bias=False)
+        return DualProjection(dim, w, split)
 
     def struct_proj(self, x, side):
         p = self.mpnn_proj
+        if isinstance(p, DualProjection):
+            return p(x, side)
+        # pre-DualProjection construction sites (a bare Linear or ModuleDict built outside
+        # _make_struct_proj, e.g. the cross_attn/gated_fusion family's own self.mpnn_proj) --
+        # unchanged so they keep working exactly as before.
         return p[side](x) if isinstance(p, nn.ModuleDict) else p(x)
+
+    def struct_pool(self, x, side):
+        """LN(GELU(struct_proj(x, side))) -- the read pattern repeated at every film_site-
+        family call site, over the SAME self.mpnn_proj/self.struct_ln weights other methods
+        still access directly when they need the bare projection (no activation, no norm)
+        or a different activation than GELU."""
+        return self.struct_ln(torch.nn.functional.gelu(self.struct_proj(x, side)))
 
     def _bsite_extra(self, batch, px, z) -> torch.Tensor:
         """Add ONE binding-site (whole-crop) term to the site-FiLM'd vector z. Ten modes,
@@ -1362,9 +1584,10 @@ class PerturbSiteToken(nn.Module):
 
         def crop_struct(side):
             st = px(batch[f"struct_{side}"])
-            return self.bsite_ln(gelu(self.bsite_mpnn_proj[side](st)
-                                      if isinstance(self.bsite_mpnn_proj, nn.ModuleDict)
-                                      else self.bsite_mpnn_proj(st)))
+            p = self.bsite_mpnn_proj
+            raw = (p(st, side) if isinstance(p, DualProjection)
+                  else p[side](st) if isinstance(p, nn.ModuleDict) else p(st))
+            return self.bsite_ln(gelu(raw))
 
         if bx in ("crop_size", "min_dist_crop", "mean_dist_crop"):
             dist = batch["dist"]                                  # (B, Lab, Lag), pad=99.0
@@ -1524,17 +1747,18 @@ class PerturbSiteToken(nn.Module):
             key = "site" if mode == "site_concat" else "mask"
             z_st = 0
             for side in ("ab", "ag"):
-                st = self.struct_ln(gelu(self.struct_proj(px(batch[f"struct_{side}"]), side)))
+                st = self.struct_pool(px(batch[f"struct_{side}"]), side)
                 z_st = z_st + site_mean(st, batch[f"{key}_{side}"])
             return torch.cat([z_seq, z_st], dim=-1)
 
         if mode == "film_site":
             z_st = 0
             for side in ("ab", "ag"):
-                st = self.struct_ln(gelu(self.struct_proj(px(batch[f"struct_{side}"]), side)))
+                st = self.struct_pool(px(batch[f"struct_{side}"]), side)
                 z_st = z_st + site_mean(st, batch[f"site_{side}"])
-            gamma, beta = self.film(z_st).chunk(2, dim=-1)
-            z = (1 + gamma) * z_seq + beta
+            if self.struct_extra_mlp is not None:
+                z_st = self.struct_extra_mlp(z_st)
+            z = self.fusion(z_seq, z_st, batch.get("chem"))
             if c.bsite_extra != "none":
                 return self._bsite_extra(batch, px, z)
             return z
@@ -1542,7 +1766,7 @@ class PerturbSiteToken(nn.Module):
         if mode == "gated_site":
             z_st = 0
             for side in ("ab", "ag"):
-                st = self.struct_ln(gelu(self.struct_proj(px(batch[f"struct_{side}"]), side)))
+                st = self.struct_pool(px(batch[f"struct_{side}"]), side)
                 z_st = z_st + site_mean(st, batch[f"site_{side}"])
             g = torch.sigmoid(self.gate(torch.cat([z_seq, z_st], dim=-1)))
             return z_seq + g * self.gate_val(z_st)
@@ -1551,8 +1775,8 @@ class PerturbSiteToken(nn.Module):
             # symmetric: an ag residue paired with its nearest ab, AND the reverse, each
             # pooled at ITS OWN side's mutated positions -- a mutation on either side
             # reaches a real term, unlike a one-directional version would.
-            st_ab = self.struct_ln(gelu(self.struct_proj(px(batch["struct_ab"]), "ab")))
-            st_ag = self.struct_ln(gelu(self.struct_proj(px(batch["struct_ag"]), "ag")))
+            st_ab = self.struct_pool(px(batch["struct_ab"]), "ab")
+            st_ag = self.struct_pool(px(batch["struct_ag"]), "ag")
             nn_for_ag = dist.argmin(dim=1, keepdim=True).squeeze(1).unsqueeze(-1)  # (B,Lag,1)
             nn_for_ab = dist.argmin(dim=2, keepdim=True)                          # (B,Lab,1)
             diff_ag = st_ag - torch.gather(st_ab, 1, nn_for_ag.expand(-1, -1, st_ab.shape[-1]))
@@ -1589,7 +1813,7 @@ class PerturbSiteToken(nn.Module):
             # mutated residues -- "wild type site means the binding site")
             z_st = 0
             for side in ("ab", "ag"):
-                st = self.struct_ln(gelu(self.struct_proj(px(batch[f"struct_{side}"]), side)))
+                st = self.struct_pool(px(batch[f"struct_{side}"]), side)
                 z_st = z_st + site_mean(st, batch[f"mask_{side}"])
             u, v = self.bilin_struct(z_st), self.bilin_seq(z_seq)
             z_cc = u * v                    # each projected separately, THEN multiplied

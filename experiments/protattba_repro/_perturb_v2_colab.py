@@ -61,6 +61,17 @@ AA_INDEX = {a: i for i, a in enumerate(AA)}
 # ran on that, and validation Pearson barely tracked test Pearson (fold 2: val +0.245 ->
 # test +0.461; fold 1: val +0.641 -> test +0.266). 0.20 roughly doubles it.
 BATCH, LR, WD, PATIENCE, VAL_FRACTION = 32, 3e-4, 1e-2, 10, 0.20
+#: Weight on pairwise_rank_loss, added to the regression loss: MSE + RANK_WEIGHT * rank.
+#: 0 (default) is plain regression, matching every run before this option existed.
+RANK_WEIGHT = 0.0
+#: "none" keeps RANK_WEIGHT driving the original pairwise_rank_loss (unchanged, already
+#: verified against a weight=0 control). Any other value routes RANK_WEIGHT through
+#: rank_term(RANK_METHOD, ...) instead -- see rank_term's own docstring for the 10 methods.
+RANK_METHOD = "none"
+RANK_MARGIN = 0.5      # kcal/mol; pairs closer than this are dropped, see pairwise_rank_loss
+#: Weight on within_group_corr_loss, added the same way RANK_WEIGHT is. 0 (default) is off.
+CORR_WEIGHT = 0.0
+CORR_MIN_GROUP = 3
 #: Gradient-norm clip. It sat at 5.0 while the measured norm was 5.0-5.3, so about
 #: half of all steps were rescaled and half were not -- the most intermittent
 #: setting available, and the one where clipping distorts AdamW's m/sqrt(v) most.
@@ -494,6 +505,231 @@ def pear(a, b):
     return float(np.corrcoef(a, b)[0, 1])
 
 
+def pairwise_rank_loss(pred, y, groups, margin_sd=0.5):
+    """Within-complex pairwise logistic loss (AbRank-style; ported from
+    src/fusion_v2.py::pairwise_rank_loss, which this project measured once already --
+    JUSTIFICATIONS.md sA1b -- and rejected as a training objective on the pre-correction
+    997-row set with an older backbone. Only pairs inside a complex are compared, which is
+    what per-complex Pearson measures; pairs closer than margin_sd kcal/mol are dropped,
+    since measurement noise is around 0.5 and their ordering is close to random.
+    """
+    total, n = pred.new_zeros(()), 0
+    for gid in torch.unique(groups):
+        m = groups == gid
+        if m.sum() < 2:
+            continue
+        p, t = pred[m], y[m]
+        dp = p.unsqueeze(0) - p.unsqueeze(1)
+        dt = t.unsqueeze(0) - t.unsqueeze(1)
+        keep = dt.abs() > margin_sd
+        if not keep.any():
+            continue
+        total = total + torch.nn.functional.softplus(-torch.sign(dt[keep]) * dp[keep]).sum()
+        n += int(keep.sum())
+    if n == 0:
+        return pred.sum() * 0.0        # keeps the graph attached; see fusion_v2's own note
+    return total / n
+
+
+def within_group_corr_loss(pred, y, groups, min_group=3):
+    """1 - Pearson correlation, computed WITHIN each group and averaged, rather than
+    pairwise_rank_loss's pairwise logistic term -- a direct differentiable surrogate for the
+    per-complex correlation this project reports as its headline metric, instead of a
+    ranking-margin objective. `groups` is deliberately generic: the ideal grouping is the
+    17 homology CLUSTERS (data/cluster_folds.csv's own source), not the 53 complexes, since a
+    cluster is the unit that actually shares structural similarity and a correlation the model
+    can already exploit within one complex says less about generalisation than one that holds
+    across a whole cluster. Building the raw cluster id needs SKEMPI2_PDBs.tgz (sequence
+    identity for clustering), which is not present in this environment -- callers pass
+    complex-level groups (group_ids) here instead, same grouping pairwise_rank_loss uses.
+    Like the rank loss, this constrains shape/order only, never scale: added to the regression
+    loss, never used alone.
+    """
+    total, n = pred.new_zeros(()), 0
+    for gid in torch.unique(groups):
+        m = groups == gid
+        if int(m.sum()) < min_group:
+            continue
+        p, t = pred[m], y[m]
+        pc, tc = p - p.mean(), t - t.mean()
+        denom = pc.norm() * tc.norm()
+        if denom < 1e-6:
+            continue
+        total = total + (1.0 - (pc * tc).sum() / denom)
+        n += 1
+    if n == 0:
+        return pred.sum() * 0.0
+    return total / n
+
+
+#: The 5 relation bins classification-style ranking methods discretise dt = t_i - t_j into.
+#: "<<"/"<"/"="/">"/">>" at +-0.5 and +-1.5 kcal/mol -- 0.5 matches pairwise_rank_loss's own
+#: noise-floor margin, 1.5 is roughly the label's own sd (1.79), so "large" means a gap
+#: comparable to the spread of ddG itself, not an arbitrary round number.
+RANK_EDGES = (-1.5, -0.5, 0.5, 1.5)
+
+
+def _pairs(pred, y, gid_mask):
+    p, t = pred[gid_mask], y[gid_mask]
+    return p.unsqueeze(0) - p.unsqueeze(1), t.unsqueeze(0) - t.unsqueeze(1)
+
+
+def rank_term(method, pred, y, groups, weight_by_severity=False):
+    """Dispatch across 10 within-group ranking methods, all pure functions of
+    (pred, y, groups) -- no extra learned parameters, so every one drops into the training
+    loop the same way pairwise_rank_loss and within_group_corr_loss already do: added to the
+    regression loss, weighted by --rank-weight, never replacing it. `method` selects one of:
+
+    binary        pairwise_rank_loss itself (AbRank-style logistic), the existing baseline.
+    hinge         the same pairs, a HINGE margin (max(0, 0.5 - sign(dt)*dp)) instead of the
+                  softplus logistic -- a different loss SHAPE, same pair selection.
+    severity      binary's logistic loss, weighted by |dt| so large true gaps count for more
+                  than barely-significant ones -- emphasises getting the big calls right.
+    equal_attract binary's loss on the ORDERED pairs (|dt| > 0.5), PLUS an attraction term on
+                  the "=" pairs (|dt| <= 0.5) that penalises |dp| directly -- the only method
+                  that gives the "=" bin its own loss term rather than just excluding it.
+    kendall_soft  tanh(dp / margin) * sign(dt), averaged and negated -- a smooth concordance
+                  measure (soft Kendall-tau-b) rather than a logistic surrogate.
+    class5_ord    the classification-labels-as-ranking-metric method: dt binned into 5 ordinal
+                  classes at RANK_EDGES, BCE on 4 cumulative thresholds applied directly to dp
+                  (same cumulative-threshold construction model_simple.py's own ordinal head
+                  uses, just for a PAIR's relation instead of one row's class).
+    class5_ce     the same 5 bins, but a parameter-free RBF-style softmax over 5 fixed
+                  prototype centres (-2,-1,0,1,2) compared to dp, cross-entropy against the
+                  true bin -- a genuinely different classifier shape than class5_ord's ordinal
+                  one, both answering "does the classification label predict the ranking".
+    spearman_soft 1 - a soft-rank Spearman correlation within each group (soft-argsort via a
+                  temperature-scaled pairwise sigmoid), rather than within_group_corr_loss's
+                  Pearson -- robust to the outlier ddG values Pearson is not.
+    listmle       ListMLE: negative log-likelihood of the group's true descending order under
+                  a Plackett-Luce model built from predicted scores -- listwise, not pairwise.
+    triplet       per group: the most-stabilising and most-destabilising row as a fixed pair,
+                  every other row the third point of a margin triplet against whichever of the
+                  two it is truly closer to -- a listwise-via-triplets compromise between
+                  pairwise cost and ListMLE's full permutation.
+    """
+    total, n = pred.new_zeros(()), 0
+    for gid in torch.unique(groups):
+        m = groups == gid
+        gn = int(m.sum())
+        if gn < 2:
+            continue
+        p, t = pred[m], y[m]
+
+        if method in ("binary", "hinge", "severity", "equal_attract", "kendall_soft",
+                     "class5_ord", "class5_ce"):
+            dp, dt = _pairs(pred, y, m)
+            iu = torch.triu_indices(gn, gn, offset=1, device=pred.device)
+            dp, dt = dp[iu[0], iu[1]], dt[iu[0], iu[1]]
+            if dp.numel() == 0:
+                continue
+            ordered = dt.abs() > 0.5
+
+            if method == "binary":
+                if not ordered.any():
+                    continue
+                term = torch.nn.functional.softplus(-torch.sign(dt[ordered]) * dp[ordered])
+                total = total + term.sum(); n += int(ordered.sum())
+
+            elif method == "hinge":
+                if not ordered.any():
+                    continue
+                term = (0.5 - torch.sign(dt[ordered]) * dp[ordered]).clamp(min=0)
+                total = total + term.sum(); n += int(ordered.sum())
+
+            elif method == "severity":
+                if not ordered.any():
+                    continue
+                term = (torch.nn.functional.softplus(-torch.sign(dt[ordered]) * dp[ordered])
+                        * dt[ordered].abs())
+                total = total + term.sum(); n += int(ordered.sum())
+
+            elif method == "equal_attract":
+                parts = []
+                if ordered.any():
+                    parts.append(torch.nn.functional.softplus(
+                        -torch.sign(dt[ordered]) * dp[ordered]))
+                eq = ~ordered
+                if eq.any():
+                    parts.append(dp[eq].abs())
+                if not parts:
+                    continue
+                term = torch.cat(parts)
+                total = total + term.sum(); n += int(term.numel())
+
+            elif method == "kendall_soft":
+                if not ordered.any():
+                    continue
+                term = 1.0 - torch.tanh(dp[ordered] / 0.5) * torch.sign(dt[ordered])
+                total = total + term.sum(); n += int(ordered.sum())
+
+            elif method == "class5_ord":
+                edges = torch.tensor(RANK_EDGES, device=pred.device)
+                targets = (dt.unsqueeze(-1) > edges).float()          # (P, 4) cumulative
+                logits = dp.unsqueeze(-1) - edges
+                term = torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits, targets, reduction="none").sum(-1)
+                total = total + term.sum(); n += int(term.numel())
+
+            elif method == "class5_ce":
+                centres = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], device=pred.device)
+                bins = torch.bucketize(dt, torch.tensor(RANK_EDGES, device=pred.device))
+                logits = -((dp.unsqueeze(-1) - centres) ** 2) / 2.0    # (P, 5) RBF logits
+                term = torch.nn.functional.cross_entropy(logits, bins, reduction="none")
+                total = total + term.sum(); n += int(term.numel())
+
+        elif method == "spearman_soft":
+            # soft rank: rank(x)_i ~= sum_j sigmoid((x_i - x_j) / tau) -- a smooth stand-in for
+            # argsort's hard rank, differentiable everywhere.
+            tau = 0.1
+            rp = torch.sigmoid((p.unsqueeze(0) - p.unsqueeze(1)) / tau).sum(-1)
+            rt = torch.sigmoid((t.unsqueeze(0) - t.unsqueeze(1)) / tau).sum(-1)
+            rpc, rtc = rp - rp.mean(), rt - rt.mean()
+            denom = rpc.norm() * rtc.norm()
+            if denom < 1e-6:
+                continue
+            total = total + (1.0 - (rpc * rtc).sum() / denom); n += 1
+
+        elif method == "listmle":
+            order = torch.argsort(t, descending=True)
+            p_ord = p[order]
+            # log-sum-exp of the suffix, subtracted running-max for stability -- standard
+            # ListMLE: -sum_i [ s_i - logsumexp(s_i, s_{i+1}, ..., s_last) ]
+            rev = torch.flip(p_ord, dims=[0])
+            lse_rev = torch.logcumsumexp(rev, dim=0)
+            lse = torch.flip(lse_rev, dims=[0])
+            total = total + (lse - p_ord).sum(); n += gn
+
+        elif method == "triplet":
+            # The group's two true extremes anchor a hinge margin against every other row:
+            # p_max should exceed p_i, and p_i should exceed p_min, by >= 0.5 each -- the
+            # true order max > i > min is known for free (i is neither extreme), so this
+            # is two clean hinge terms per middle row rather than a same/other-side branch.
+            i_max, i_min = int(torch.argmax(t)), int(torch.argmin(t))
+            if i_max == i_min:
+                continue
+            p_max, p_min = p[i_max], p[i_min]
+            for i in range(gn):
+                if i in (i_max, i_min):
+                    continue
+                total = total + (0.5 - (p_max - p[i])).clamp(min=0)
+                total = total + (0.5 - (p[i] - p_min)).clamp(min=0)
+                n += 2
+        else:
+            raise ValueError(f"unknown rank method: {method!r}")
+
+    if n == 0:
+        return pred.sum() * 0.0
+    return total / n
+
+
+def group_ids(row_ids: list[str]) -> torch.Tensor:
+    """Integer complex-id per row, for pairwise_rank_loss's `groups` argument."""
+    keys = [r.rsplit("|", 1)[0] for r in row_ids]
+    uniq = {k: i for i, k in enumerate(sorted(set(keys)))}
+    return torch.tensor([uniq[k] for k in keys], dtype=torch.long)
+
+
 def history(exp, row):
     p = OUT / f"perturb_{exp}" / "history.csv"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -707,7 +943,23 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
         gstat = {}
         for b in tr:
             x = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
-            loss = lf(model(x), b["y"].to(device))
+            y_dev = b["y"].to(device)
+            z = model(x)
+            loss = lf(z, y_dev)
+            if RANK_WEIGHT > 0:
+                # MSE (or the ordinal loss) is the only anchor on output SCALE; the rank
+                # term constrains order only, so it is ADDED to the regression loss, never
+                # used alone -- pure ranking was measured (JUSTIFICATIONS.md sA1b) to let the
+                # model drift anywhere order-preserving, RMSE 4.20 against ~1.5.
+                groups = group_ids(b["row_id"]).to(device)
+                if RANK_METHOD == "none":
+                    loss = loss + RANK_WEIGHT * pairwise_rank_loss(z, y_dev, groups, RANK_MARGIN)
+                else:
+                    loss = loss + RANK_WEIGHT * rank_term(RANK_METHOD, z, y_dev, groups)
+            if CORR_WEIGHT > 0:
+                groups = group_ids(b["row_id"]).to(device)
+                loss = loss + CORR_WEIGHT * within_group_corr_loss(z, y_dev, groups,
+                                                                    CORR_MIN_GROUP)
             opt.zero_grad(); loss.backward()
             for gk, gv in grad_report(model, GRAD_CLIP).items():
                 gstat[gk] = gstat.get(gk, 0.0) + gv
@@ -818,6 +1070,28 @@ def main():
     ap.add_argument("--general-val", action="store_true",
                     help="do not restrict early-stopping validation to is_abag rows -- for "
                          "a full-SKEMPI pretrain stage, where the point is the general task")
+    ap.add_argument("--rank-weight", type=float, default=0.0,
+                    help="weight on an AbRank-style within-complex pairwise rank loss, "
+                         "ADDED to the regression loss (never replacing it -- rank alone has "
+                         "no anchor on output scale). 0 (default) is plain regression.")
+    ap.add_argument("--rank-margin", type=float, default=0.5,
+                    help="kcal/mol; pairs closer than this in true ddG are dropped from the "
+                         "rank loss, since measurement noise is ~0.5 and their order is close "
+                         "to random")
+    ap.add_argument("--corr-weight", type=float, default=0.0,
+                    help="weight on a within-group (1 - Pearson correlation) loss, ADDED to "
+                         "the regression loss like --rank-weight. Grouped by COMPLEX -- the "
+                         "ideal grouping is the homology CLUSTER, but that needs "
+                         "SKEMPI2_PDBs.tgz to build, not present in this environment.")
+    ap.add_argument("--corr-min-group", type=int, default=3,
+                    help="a group scores 0 correlation terms below this size within a batch")
+    ap.add_argument("--rank-method", default="none",
+                    choices=["none", "binary", "hinge", "severity", "equal_attract",
+                            "kendall_soft", "class5_ord", "class5_ce", "spearman_soft",
+                            "listmle", "triplet"],
+                    help="which of rank_term's 10 within-group ranking methods --rank-weight "
+                         "drives; 'none' keeps --rank-weight on the original "
+                         "pairwise_rank_loss unchanged")
     ap.add_argument("--clip", type=float, default=4.0,
                     help="clip |ddG| to this, in training and in scoring; 0 disables")
     a = ap.parse_args()
@@ -872,6 +1146,12 @@ def main():
         print(f"clipped |ddG| to {a.clip}: {n} of {len(rows)} rows "
               f"({100 * n / len(rows):.1f}%)", flush=True)
     global LR, WD, PATIENCE, GRAD_CLIP, CHEM_SCALE, CLUSTER_OF, CURRICULUM, PCA_ROWS
+    global RANK_WEIGHT, RANK_MARGIN, CORR_WEIGHT, CORR_MIN_GROUP, RANK_METHOD
+    RANK_WEIGHT = a.rank_weight
+    RANK_MARGIN = a.rank_margin
+    CORR_WEIGHT = a.corr_weight
+    CORR_MIN_GROUP = a.corr_min_group
+    RANK_METHOD = a.rank_method
     if a.wd is not None:
         WD = a.wd
     if a.lr is not None:
