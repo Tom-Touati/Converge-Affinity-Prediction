@@ -43,6 +43,7 @@ def synthetic_batch(seed: int) -> dict:
 #: One representative config per axis this refactor must preserve exactly.
 CONFIGS = {
     "leader": dict(mut_pair_struct_inject="film_site"),
+    "input_noise": dict(mut_pair_struct_inject="film_site", input_noise=0.25, feature_dropout=0.25),
     "split_proj_false": dict(mut_pair_struct_inject="film_site", split_proj=False),
     "split_struct_true": dict(mut_pair_struct_inject="film_site", split_struct=True),
     "mul_op": dict(mut_pair_struct_inject="film_site", mut_pair_op="mul"),

@@ -1963,26 +1963,33 @@ class PerturbSiteToken(nn.Module):
         # the structure 128, and every configuration that reads structure -- attention or
         # FiLM -- died on the mismatch. A plain no-PCA run never touched it, so this
         # surfaced only once cross-attention was asked for without the PCA.
-        draws: dict[int, tuple] = {}
+        draws: dict[tuple, tuple] = {}
 
         def px(x):
             # The feature-dropout mask is drawn once per width and reused, so WT and MUT
-            # lose the same columns and it cancels in their difference.
+            # lose the same columns and it cancels in their difference. The Gaussian noise
+            # used to only share its SCALE this way, not the actual draw -- `torch.randn_like`
+            # was called fresh on every px() invocation, so WT and MUT got independent noise
+            # realisations that compound by root-2 in the edit instead of cancelling (README,
+            # "The Gaussian noise is the one that misbehaves"). Caching the full noise tensor,
+            # keyed by shape rather than width alone (so ab and ag, same width but different
+            # length, never share a draw meant for a wt/mut pair), fixes both at once.
             if not (self.training and (c.input_noise > 0 or c.feature_dropout > 0)):
                 return x
-            w = x.shape[-1]
-            if w not in draws:
-                n = (c.input_noise * x.std(dim=(0, 1), keepdim=True)
+            key = x.shape
+            if key not in draws:
+                n = (torch.randn_like(x) * (c.input_noise * x.std(dim=(0, 1), keepdim=True))
                      if c.input_noise > 0 else None)
                 m = None
                 if c.feature_dropout > 0:
+                    w = x.shape[-1]
                     keep = (torch.rand(x.shape[0], 1, w, device=x.device, dtype=x.dtype)
                             >= c.feature_dropout)
                     m = keep.to(x.dtype) / (1.0 - c.feature_dropout)
-                draws[w] = (n, m)
-            n, m = draws[w]
+                draws[key] = (n, m)
+            n, m = draws[key]
             if n is not None:
-                x = x + torch.randn_like(x) * n
+                x = x + n
             if m is not None:
                 x = x * m
             return x
