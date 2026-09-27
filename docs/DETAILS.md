@@ -491,10 +491,14 @@ already-fused difference, not a raw single-modality input), GELU, then **sum ove
 mutated residues only**. Summed across both sides into one 64-d vector, `z_seq`.
 
 **Structure term (FiLM).** Per side: project the wild-type ProteinMPNN embedding with
-its own linear layer, GELU, LayerNorm, then mean-pool at the **mutated** residues
-(tight site pool, not the whole crop). Summed across sides into one 64-d vector,
-`z_st`. `z_st` is fed through one `Linear(64 → 128)`, split into two 64-d halves
-`gamma, beta`, and modulates the sequence term:
+**one linear layer shared between ab and ag** ([this was corrected after being
+mis-stated here](ARCHITECTURES.md#family-f--injecting-where-a-mutation-sits-relative-to-the-binding-site)
+as split — splitting it was tried directly, `struct_film_chem_splitstruct`, and cost
+0.015 ens; the 50,497 parameters below are only reachable with it shared), GELU,
+LayerNorm, then mean-pool at the **mutated** residues (tight site pool, not the whole
+crop). Summed across sides into one 64-d vector, `z_st`. `z_st` is fed through one
+`Linear(64 → 128)`, split into two 64-d halves `gamma, beta`, and modulates the
+sequence term:
 
 ```
 z = (1 + gamma) * z_seq + beta
@@ -516,7 +520,59 @@ on the seed mean. The 39 columns add +0.029 on top.
 **Head.** `Linear(103 → 128) → GELU → Dropout(0.35) → Linear(128 → 1)`. 50,497
 parameters total. No attention, no RoPE, no cross-molecule pairing.
 
-**What has not yet been done for this model**, honestly listed rather than implied:
-the homology-cluster-split retention number (§ the earlier section on the cluster
-split), and the full bias/error-analysis battery in `ERROR_ANALYSIS.md` — both still
-describe `cat128_reg2_l1`, the previously-best net.
+**Training objective.** MSE plus a small soft-Kendall-tau-style ranking term, within each
+complex: `tanh(Δpred / 0.5) · sign(Δtrue)`, averaged over ordered pairs (|Δtrue| > 0.5
+kcal/mol) and subtracted from 1, weighted at 1.0 and ADDED to the MSE loss (never replacing
+it — pure ranking has no anchor on output scale, JUSTIFICATIONS.md §A1b). The only change,
+out of dozens tried in the same later session, that survived being re-measured at 8 seeds
+matched against plain MSE on the identical seeds: +0.379 ens against +0.368, +0.290 per-seed
+mean against +0.281, same seed spread (0.217) either way — see
+[ARCHITECTURES.md §G.2](ARCHITECTURES.md#g2-ten-ranking-methods-at-a-fixed-weight-and-a-re-measurement-that-mattered)
+for the two other candidates from that sweep that did NOT survive the same check. Small and
+honestly reported as small; the architecture above is completely unchanged.
+
+**Cluster-split and error-analysis, re-run for the ranking-loss addition.** Both have now
+been checked directly against `struct_film_chem_kendall` rather than left describing the
+plain-MSE version:
+
+- **Homology-cluster split**: +0.258 ens (4-fold, 3 seeds/fold), i.e. **66%** of this
+  model's own standard-split number (+0.391), against the plain-MSE leader's 74%
+  retention (+0.272 of +0.369). The ranking-loss addition generalizes somewhat worse
+  under the harder split than plain MSE does — a real, if modest, caveat on the
+  addition, not on the architecture (the plain-MSE leader's cluster number was also
+  re-measured this round and reproduced its historical +0.272 exactly, confirming the
+  decoupled `split_struct` refactor changed nothing).
+- **Bias/error-analysis battery** (`bias_analysis.py`, `class_separation.py`,
+  `error_drivers.py`): run locally against `struct_film_chem_kendall`. Errors correlate
+  0.950 with the plain-MSE version's, and the same complex-imbalance and mutation-type
+  biases from `ERROR_ANALYSIS.md` Part IV show up dampened rather than removed
+  (pooled stab|dest AUC 0.831 vs. plain's 0.841; within-complex 0.770 vs. 0.758). These
+  findings are summarized in README.md but **not yet folded into `ERROR_ANALYSIS.md`'s
+  own Part IV tables**, which still describe the plain-MSE version only.
+
+A separately-tried variant that gives the sequence delta its own extra pre-fuse MLP
+layer (`seq_mlp_depth=2`, structure unchanged) scored worse than the ranking-loss
+addition alone on BOTH splits: +0.354 ens standard-split (vs. +0.391) and +0.215 ens
+cluster-split (vs. +0.258, the worst cluster number and worst retention — 61% — of
+the three variants compared in
+[ARCHITECTURES.md §G.6](ARCHITECTURES.md#g6-the-submitted-recipe-under-the-homology-cluster-split-and-a-seq-depth-2-variant-that-loses-on-both-splits)).
+Not pursued further.
+
+A later sweep of ten features describing a mutation's position relative to the
+binding site, injected into the mutation's own projection, did not beat this model once
+measured correctly (a confound in an early comparison made one of them look competitive;
+see
+[ARCHITECTURES.md §Family F](ARCHITECTURES.md#family-f--injecting-where-a-mutation-sits-relative-to-the-binding-site)
+for the full account). `struct_film_chem` (now trained with the ranking-loss addition)
+remains the submitted model.
+
+A still later, 12-variant sweep targeting the model's own antigen/antibody performance gap
+(antibody ρ +0.629 vs. antigen ρ +0.252, pooled Spearman within side) — per-side identity
+signals, extra projection depth, antigen-row oversampling, a genuine structure-PCA
+inconsistency fix, and combinations of these — found nothing that survives scrutiny; see
+[ARCHITECTURES.md §H](ARCHITECTURES.md#h-the-antigenantibody-gap-an-11-variant-sweep). A
+separate, verified limitation in the reverse-mutation augmentation's structural input (it
+cannot reflect FoldX's mutant structures, since ProteinMPNN's encoder reads backbone
+geometry only and FoldX leaves the backbone unchanged across mutations of a complex) is
+documented in [ARCHITECTURES.md §I](ARCHITECTURES.md#i-a-verified-structure-input-limitation-for-the-reverse-mutation-augmentation).
+Neither changes the architecture or training objective above.

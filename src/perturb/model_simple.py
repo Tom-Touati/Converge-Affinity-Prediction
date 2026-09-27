@@ -89,6 +89,134 @@ def site_mean(x: torch.Tensor, site: torch.Tensor) -> torch.Tensor:
     return (x * w).sum(1) / w.sum(1).clamp(min=1.0)
 
 
+class DualProjection(nn.Module):
+    """A no-bias Linear(in_w, out_w) -- ONE shared across ab/ag when split=False, or an
+    independent copy PER SIDE when split=True. This project's own rule (never share the
+    first linear layer between two genuinely different distributions) is a per-call-site
+    choice, not a fixed one, which is why this takes `split` rather than hard-coding it --
+    the same class backs both sequence's per-side projection and structure's (split_proj /
+    split_struct), which before this were two separately hand-rolled copies of the exact
+    same "shared Linear vs ModuleDict-by-side" branch.
+    """
+
+    def __init__(self, in_w: int, out_w: int, split: bool):
+        super().__init__()
+        self.split = split
+        self.proj = (nn.ModuleDict({side: nn.Linear(in_w, out_w, bias=False)
+                                    for side in ("ab", "ag")})
+                    if split else nn.Linear(in_w, out_w, bias=False))
+
+    def forward(self, x: torch.Tensor, side: str) -> torch.Tensor:
+        return self.proj[side](x) if self.split else self.proj(x)
+
+
+class Fusion(nn.Module):
+    """How z_seq and z_st combine into one vector once both are fully pooled -- film_site's
+    fuse_mode axis. One interface, four interchangeable strategies (ARCHITECTURES.md's
+    fuse_mode sweep): struct_film_chem's own FiLM gate is the only one with parameters of
+    its own; the other three are fixed, parameter-free combining rules kept only to
+    separate the fusion MECHANISM from the depth questions seq_mlp_depth/struct_mlp_depth
+    ask. `chem` is accepted by every strategy so the caller need not know which one it has;
+    only FiLMFusion (struct_bind_feat) reads it.
+    """
+
+    def out_width(self, w: int) -> int:
+        return w
+
+    def forward(self, z_seq: torch.Tensor, z_st: torch.Tensor,
+               chem: torch.Tensor | None = None) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class MultiplyFusion(Fusion):
+    def forward(self, z_seq, z_st, chem=None):
+        return z_seq * z_st
+
+
+class AddFusion(Fusion):
+    def forward(self, z_seq, z_st, chem=None):
+        return z_seq + z_st
+
+
+class ConcatFusion(Fusion):
+    def out_width(self, w):
+        return w * 2
+
+    def forward(self, z_seq, z_st, chem=None):
+        return torch.cat([z_seq, z_st], dim=-1)
+
+
+class FiLMFusion(Fusion):
+    """z = (1+gamma)*z_seq + beta, gamma/beta from Linear(w[+1], 2w) of z_st. The +1 and
+    the chem read are struct_bind_feat/struct_stab_feat: a single extra scalar from
+    chem_perturb_v2's fixed 39-column layout, concatenated onto z_st before it drives FiLM
+    -- reaching the structure branch directly rather than only the tail chem concat every
+    other column uses. struct_bind_feat reads column 25 (mpnn__logp_wt_complex, the ITW
+    wild-type complex's ProteinMPNN log-probability -- a proxy for how strong the wild-type
+    binding already is). struct_stab_feat reads column 23 (mpnn__llr_alone, ProteinMPNN's
+    log-likelihood-ratio computed on the ISOLATED chain, no partner present -- a proxy for
+    the mutation's effect on folding stability rather than binding). At most one may be set.
+    """
+
+    def __init__(self, w: int, struct_bind_feat: bool = False, struct_stab_feat: bool = False):
+        super().__init__()
+        assert not (struct_bind_feat and struct_stab_feat), \
+            "struct_bind_feat and struct_stab_feat are mutually exclusive"
+        self.extra_col = 25 if struct_bind_feat else (23 if struct_stab_feat else None)
+        self.film = nn.Linear(w + 1 if self.extra_col is not None else w, 2 * w)
+
+    def forward(self, z_seq, z_st, chem=None):
+        if self.extra_col is not None:
+            assert chem is not None and chem.shape[-1] == 39, \
+                "struct_bind_feat/struct_stab_feat need chem_perturb_v2 (39 cols)"
+            z_st = torch.cat([z_st, chem[:, self.extra_col:self.extra_col + 1]], dim=-1)
+        gamma, beta = self.film(z_st).chunk(2, dim=-1)
+        return (1 + gamma) * z_seq + beta
+
+
+def _make_fusion(c, w: int) -> Fusion:
+    fm = getattr(c, "fuse_mode", "film")
+    bind = getattr(c, "struct_bind_feat", False)
+    stab = getattr(c, "struct_stab_feat", False)
+    if fm == "film":
+        return FiLMFusion(w, bind, stab)
+    if bind or stab:
+        raise ValueError("struct_bind_feat/struct_stab_feat need fuse_mode='film'")
+    return {"multiply": MultiplyFusion, "add": AddFusion, "concat": ConcatFusion}[fm]()
+
+
+def _proj_stack(in_w: int, w: int, depth: int) -> nn.Module:
+    """Like _mlp_stack, but bias=False throughout -- proj_side's own existing convention
+    ("one per side... Linear(seq_in, c.proj, bias=False)"), preserved exactly at depth=1 so
+    proj_depth_ab/proj_depth_ag=1 (the default) is byte-identical to the pre-existing
+    single-Linear projection, not merely equivalent.
+    """
+    if depth <= 1:
+        return nn.Linear(in_w, w, bias=False)
+    layers: list[nn.Module] = [nn.Linear(in_w, w, bias=False), nn.GELU()]
+    for _ in range(depth - 2):
+        layers += [nn.Linear(w, w, bias=False), nn.GELU()]
+    layers.append(nn.Linear(w, w, bias=False))
+    return nn.Sequential(*layers)
+
+
+def _mlp_stack(w: int, depth: int, in_w: int | None = None) -> nn.Module:
+    """depth=1 -> a single Linear(in_w, w), matching every existing config exactly when
+    in_w=w (nn.Linear and nn.Sequential are both plain callables, so callers never need to
+    know which they got). depth>1 -> Linear(in_w,w)-GELU-Linear(w,w)-...-Linear(w,w), GELU
+    between layers only. `in_w` (default w) lets the FIRST layer reduce a wider input --
+    e.g. mut_pair_op="concat"'s 2w-wide [mt;wt] -- down to w before any later layer.
+    """
+    in_w = w if in_w is None else in_w
+    if depth <= 1:
+        return nn.Linear(in_w, w)
+    layers: list[nn.Module] = [nn.Linear(in_w, w), nn.GELU()]
+    for _ in range(depth - 2):
+        layers += [nn.Linear(w, w), nn.GELU()]
+    layers.append(nn.Linear(w, w))
+    return nn.Sequential(*layers)
+
+
 class PerturbSimple(nn.Module):
     def __init__(self, cfg: SimpleConfig | None = None):
         super().__init__()
@@ -718,10 +846,175 @@ class SiteTokenConfig:
     #: ``sub``  LN(mt) - LN(wt). Restores the zero invariant (mt==wt -> exactly zero) and
     #:          has no dead-gradient direction -- d(u-v)/du = 1 everywhere, independent of
     #:          the other side's value.
+    #: ``concat`` [LN(mt); LN(wt)], 2w-wide, reduced back to w by pair_ffn's OWN first
+    #:          layer (Linear(2w, w) instead of sub/mul's Linear(w, w)) rather than by a
+    #:          fixed combining rule chosen in advance. Loses the zero invariant like
+    #:          ``mul`` does (mt==wt is not a distinguished input to a plain concat), but
+    #:          unlike ``mul`` it has no dead-gradient direction: d(reduce([u;v]))/du is
+    #:          the reduction weights, independent of v's value. Costs w*w more parameters
+    #:          than ``sub``/``mul`` (2w*w vs w*w for the first layer) for the chance to
+    #:          learn a combining rule richer than a fixed subtraction.
     mut_pair_op: str = "mul"
     #: GELU on pair_ffn's OWN output, before the sum -- off by default (the mul variant
     #: was asked to stay linear there), on for the sub variant by request.
     mut_pair_act: bool = False
+    #: Depth of pair_ffn, the shared linear layer applied to LN(mt)-LN(wt). 1 (default) is
+    #: struct_film_chem's own single Linear(w,w); N>1 makes it an N-layer MLP
+    #: (Linear-GELU-...-Linear, GELU between layers only, same width throughout) --
+    #: deepening the sequence-delta representation before it reaches FiLM, rather than
+    #: adding capacity anywhere else.
+    seq_mlp_depth: int = 1
+    #: film_site only. Depth of an EXTRA MLP applied to z_st (the pooled, summed structure
+    #: representation) right before it drives the fusion -- 1 (default) adds nothing, N>1
+    #: is an N-layer Linear-GELU-...-Linear stack, same width (w), mirroring
+    #: seq_mlp_depth's construction for the structure side.
+    struct_mlp_depth: int = 1
+    #: film_site only. "film" (default) is struct_film_chem's own FiLM gate
+    #: (z = (1+gamma)*z_seq + beta) -- the only mode with its own learned projection of
+    #: z_st; the other three are plain, parameter-free combining rules, to separate the
+    #: fusion MECHANISM from the depth questions seq_mlp_depth/struct_mlp_depth ask.
+    #: "multiply": z_seq * z_st. "add": z_seq + z_st. "concat": [z_seq; z_st], 2w-wide --
+    #: the only one of the four that widens the head's input (d += w), since it is the only
+    #: one that does not collapse z_st back to w dimensions before the head.
+    fuse_mode: str = "film"
+    #: film_site only. Zeroes z_seq before it reaches the fusion mechanism (structure pooling,
+    #: the chem block and the head are all untouched) -- the "sequence alone" number this
+    #: project has always had is `mut_pair_ffn_sub` with no structure at all; the symmetric
+    #: "structure alone" number, chem block included exactly as it is for the shipped model,
+    #: has never been priced directly until this flag. With fuse_mode="film" the output is
+    #: exactly `beta(z_st)`, since `(1+gamma)*0 + beta == beta` -- a real forward pass through
+    #: the actual FiLM projection, not a stand-in head.
+    struct_only: bool = False
+    #: film_site + fuse_mode="film" only. Concatenates the ITW (wild-type) complex's
+    #: ProteinMPNN log-probability (mpnn__logp_wt_complex -- how favourable the model finds
+    #: the wild-type residue at the mutated position, in complex context; a proxy for how
+    #: strong the wild-type binding already is) onto z_st, the pooled structure
+    #: representation, right before it drives FiLM. Every other feature in chem_dim only
+    #: reaches the model at the very end, concatenated onto the FiLM OUTPUT; this lets the
+    #: structure branch itself read it. Column 25 of chem_perturb_v2's fixed 39-column
+    #: layout -- requires chem_dim == 39 and CHEM_TABLE=chem_perturb_v2, asserted at
+    #: forward time rather than assumed silently. Not supported with fuse_mode="multiply"
+    #: (z_st's width would no longer match z_seq's).
+    struct_bind_feat: bool = False
+    #: film_site + fuse_mode="film" only. Same mechanism as struct_bind_feat, but reads
+    #: column 23 (mpnn__llr_alone) instead of column 25: ProteinMPNN's log-likelihood-ratio
+    #: for the mutation computed on the ISOLATED chain, no binding partner present -- a
+    #: proxy for the mutation's effect on folding stability rather than on binding.
+    #: Mutually exclusive with struct_bind_feat.
+    struct_stab_feat: bool = False
+    #: mut_pair_ffn only. The antigen side scores far worse than the antibody side (pooled
+    #: Pearson +0.236 against +0.647, struct_film_chem_kendall) despite z_seq's own
+    #: construction giving the network no explicit signal for WHICH side a mutation is on --
+    #: ab and ag contributions are just summed, unweighted (see mut_side_gate for the other
+    #: half of this pair). This adds a 3-way category (ab-only / ag-only / both, derived
+    #: directly from which side's site mask is nonzero -- no new data column, so it is exactly
+    #: consistent with however the crop defines "the mutated residues" everywhere else) and a
+    #: learned nn.Embedding(3, w) added to z_seq before fusion. Mutually exclusive in principle
+    #: with mut_side_gate, though nothing stops running both; the ablation runs them separately.
+    mut_side_embed: bool = False
+    #: mut_pair_ffn only. Where mut_side_embed adds a location signal AFTER ab and ag are
+    #: already summed, this changes the SUM itself: instead of z_seq = h_ab + h_ag (fixed,
+    #: unweighted), a small embedding of the same 3-way mut_side category is projected to two
+    #: FiLM-style (1+delta) gates and z_seq = gate_ab * h_ab + gate_ag * h_ag. The projection is
+    #: the only
+    #: new mechanism -- the gate never sees h_ab/h_ag's own content, only which side the
+    #: mutation is on, so it can learn e.g. "trust the ag branch less" as a fixed correction
+    #: rather than a per-example one.
+    mut_side_gate: bool = False
+    #: split_proj only. proj_side["ab"]/["ag"] are each a single bias-free Linear -- one
+    #: matrix has to map every antibody scaffold's ESM-2 embedding into the shared 64-d space,
+    #: same for antigen. The antibody side scores far better (pooled r +0.647 vs antigen's
+    #: +0.236), and antibody scaffolds repeat across this project's complexes far more than
+    #: antigens do (53 different protein families) -- so antigen may simply need more
+    #: nonlinear capacity to fold that diversity into the same width a single antibody-style
+    #: linear map handles fine. depth=1 (default) is exactly today's single Linear; depth>1
+    #: makes THAT side's own projection a depth-N bias-free MLP (_proj_stack), independent of
+    #: proj_depth_ag/proj_depth_ab -- set only proj_depth_ag>1 to test antigen-specific extra
+    #: capacity, or both to the same depth as the matched control that asks whether it is
+    #: antigen-specific or "more depth anywhere helps a bit."
+    proj_depth_ab: int = 1
+    proj_depth_ag: int = 1
+    #: mut_pair_ffn only. A per-side (ab=0/ag=1) identity, CONCATENATED onto the mt-wt delta
+    #: before the SHARED pair_ffn -- see the constructor comment for how this differs from
+    #: mut_side_embed/gate (which act once, after pooling). side_tag_dim sets its width.
+    side_tag_concat: bool = False
+    side_tag_dim: int = 8
+    #: mut_pair_ffn only. The same per-side identity, ADDED to h (per-residue) before the site
+    #: mask pools it -- masked out exactly like the real signal for whichever side has no
+    #: mutated residue this row.
+    side_tag_add: bool = False
+    #: mut_pair_ffn only. tok_proj's first Linear is keyed by side (ab/ag) but NOT by
+    #: mutant-vs-wild-type -- LN(mt) and LN(wt) both come out of the SAME map before being
+    #: subtracted. That is the identical weight-sharing this project's own rule (never
+    #: share the first linear layer between modalities) already argues against for ab/ag
+    #: and for structure; mutant and wild-type are arguably just as separate a modality
+    #: pair (before- and after-mutation), just never split. When True, mt and wt each get
+    #: their own Linear per side (4 total: ab_mt, ab_wt, ag_mt, ag_wt) instead of sharing
+    #: tok_proj's map.
+    split_mutwt: bool = False
+    #: split_mutwt only. split_mutwt on its own measured as a clear regression (+0.294 vs
+    #: +0.369, seed spread more than doubled -- ARCHITECTURES.md sF.1): independently random
+    #: init starts mt's and wt's projections in unrelated subspaces, so LN(mt)-LN(wt) is not
+    #: a meaningful "what changed" signal until training happens to pull them back together,
+    #: if it ever does. This starts each side's mt/wt pair TIED instead -- wt's weight
+    #: initialised as a COPY of mt's (per side, so ab_mt/ab_wt start identical and ag_mt/
+    #: ag_wt start identical, ab vs ag remains independently random as it always has been) --
+    #: so at step 0 the split architecture computes the SAME subtraction the shared-weight
+    #: leader does. A small independent Gaussian perturbation (std 0.02) is then added to
+    #: EACH copy so the two are not held exactly equal during training (no gradient tying,
+    #: just a shared starting point) -- free to diverge if that earns something, without the
+    #: cold-random-start that made the plain split a regression.
+    split_mutwt_tied_init: bool = False
+    #: mut_pair_ffn only. WHEN structure enters the sequence computation, relative to the
+    #: per-residue mt-wt delta -- an early/mid/late fusion ablation on the leader itself.
+    #: "late" (default): struct_film_chem's own behaviour, completely unchanged -- the
+    #: sequence branch (LN(mt)-LN(wt) -> pair_ffn -> sum) never sees structure at all;
+    #: mut_pair_struct_inject's separate mechanism (typically "film_site") combines the two
+    #: only after BOTH are fully pooled into one vector each. "early": the wild-type
+    #: structure embedding at each residue is ADDED to p_mt and p_wt BEFORE LayerNorm and
+    #: the subtraction -- structure shapes what "the same" means at that residue before any
+    #: delta is computed. "mid": structure is added to h = pair_ffn(comb), the per-residue
+    #: delta AFTER subtraction, but before summing over the mutated sites -- structure
+    #: reweights an already-computed "what changed" signal, one residue at a time, rather
+    #: than reshaping the residues going into it. "early"/"mid" both require
+    #: mut_pair_struct_inject="none" (the late mechanism would otherwise double-count
+    #: structure on top of an already-fused sequence term).
+    fusion_stage: str = "late"
+    #: mut_pair_ffn only. Injects one more feature INTO the mutation's own projection --
+    #: added to p_mt, before LN and the mt-wt subtraction -- rather than pooled and
+    #: concatenated after the whole backbone the way bsite_extra's modes are. The
+    #: subtraction only ever saw "what changed" between mt and wt; this lets the mutated
+    #: residue's own local environment shape that comparison directly. Every mode below is
+    #: computed from tensors already in the batch (the crop's Ca distance matrix, site/mask
+    #: flags, residue indices) -- no new precomputation.
+    #:
+    #:   dist_to_site       the mutated residue's own minimum Ca distance to the nearest
+    #:                      residue on the OTHER side -- 0 at the interface, large if buried
+    #:   contacts_8a        count of partner-chain residues within 8A -- local contact
+    #:                      density AT the mutation, hard cutoff
+    #:   contacts_soft      sum of exp(-dist/4) over partner-chain residues -- the same idea
+    #:                      without a hard cutoff, so nearer contacts count more smoothly
+    #:   rel_seq_pos        the mutated residue's fractional position along its OWN chain
+    #:                      (original residue index, min-max normalised within the crop) --
+    #:                      N-terminal vs C-terminal vs mid-chain
+    #:   burial_rank        percentile rank of dist_to_site among all same-side crop
+    #:                      residues -- normalises away how large or tight this particular
+    #:                      interface is, which the raw distance conflates
+    #:   dist_delta_mean    dist_to_site MINUS the crop-wide mean ab-ag Ca distance -- is
+    #:                      this mutation closer to the interface than "typical" for this
+    #:                      complex, not just closer in absolute terms
+    #:   local_seq_density  count of same-side crop residues within +-5 sequence positions
+    #:                      -- a loop (sparse crop, low density) vs a densely-sampled
+    #:                      alanine-scan region
+    #:   nearest_partner_struct  the actual ProteinMPNN embedding of the single nearest
+    #:                      partner-chain residue, projected and added -- not just HOW close
+    #:                      the interface is but WHAT is there
+    #:   is_at_interface    smooth sigmoid((8 - dist_to_site) / 2) -- a differentiable
+    #:                      "is this basically a contact residue," softer than contacts_8a
+    #:   n_mut_row          how many residues are mutated simultaneously in this row --
+    #:                      lets the projection condition on single- vs multi-point before
+    #:                      the sites are summed, not just implicitly via the sum itself
+    mut_feat: str = "none"
     #: Extends mut_pair_ffn (meant for mut_pair_op="sub") with a structural cross-
     #: attention term, concatenated with the sequence term before the mlp.
     #:
@@ -776,6 +1069,48 @@ class SiteTokenConfig:
     #:                      (a raw number, not an embedding of one)
     mut_pair_struct_inject: str = "none"
 
+    #: Ten ways to add BINDING-SITE information -- the whole crop, not just the mutated
+    #: residue -- on top of mut_pair_struct_inject="film_site". Each computes the same
+    #: site-level FiLM first (unchanged), then combines a crop-level term into it. "none"
+    #: is plain film_site, no addition.
+    #:
+    #: LEARNED, from the crop's structural embeddings:
+    #:   crop_concat   structure pooled over the whole crop (mask, not site), projected,
+    #:                 concatenated after the FiLM output
+    #:   crop_film2    a SECOND FiLM stage, gamma2/beta2 from crop-pooled structure,
+    #:                 applied to the site-FiLM'd vector: two nested gates, mutated-site
+    #:                 then binding-site
+    #:   crop_gate     a learned sigmoid gate from crop-pooled structure scales an
+    #:                 additive crop-pooled term, added post-FiLM (gated concat, not FiLM)
+    #:   crop_xattn    the FiLM'd vector, as a length-1 query, cross-attends over every
+    #:                 crop structural token (not just the mutated ones); RoPE'd. Output
+    #:                 concatenated
+    #:   crop_wpool    structure pooled over the crop, but distance-WEIGHTED toward the
+    #:                 mutated residue (inverse-distance softmax) rather than uniform --
+    #:                 a smooth interpolation between site_mean and a flat crop mean
+    #:   crop_std      the STANDARD DEVIATION of structural embeddings across the crop,
+    #:                 concatenated -- how variable the local environment is, not just
+    #:                 its mean
+    #:   nn_diff_crop  the ag-vs-nearest-ab structural difference (the same nearest-
+    #:                 neighbour pairing nn_diff_concat uses), mean-pooled over the WHOLE
+    #:                 crop instead of only the mutated residues
+    #:
+    #: PURE GEOMETRY, from the crop's own Ca distance matrix, no learned embedding:
+    #:   crop_size     scalar per side: how many residues are in the crop -- how large
+    #:                 this binding site is
+    #:   min_dist_crop scalar: the tightest ab-ag contact anywhere in the crop, not just
+    #:                 at the mutated residue
+    #:   mean_dist_crop scalar: the average ab-ag Ca distance over the whole crop -- how
+    #:                 tight the interface is overall
+    #:   mut_dist_to_site scalar: the mutated residue's OWN distance to the binding site --
+    #:                 the minimum Ca distance from the mutated residue (whichever side it
+    #:                 is on) to the nearest residue on the OTHER side. min_dist_crop asks
+    #:                 how tight the interface is anywhere in the crop; this asks where the
+    #:                 mutation sits relative to it -- 0 if the mutation IS the contact
+    #:                 residue, large if it is buried away from the interface even though
+    #:                 the crop itself has a tight contact elsewhere.
+    bsite_extra: str = "none"
+
     #: Give each input its OWN first linear layer instead of one shared map.
     #:
     #: A shared projection forces the antibody, the antigen and ProteinMPNN into a single
@@ -788,6 +1123,15 @@ class SiteTokenConfig:
     #: Structure additionally used to FALL BACK to the sequence projection whenever
     #: mpnn_proj was unset, which is the same violation by another route.
     split_proj: bool = True
+    #: Overrides split_proj for STRUCTURE's first linear layer only (_make_struct_proj),
+    #: leaving sequence's proj_side exactly as split_proj already sets it. None (default)
+    #: defers to split_proj, so every existing config is unaffected. Exists because
+    #: splitting sequence and splitting structure turned out to be two independent
+    #: findings, not one -- splitting sequence's projection is neutral-to-positive
+    #: everywhere it's been tried, but splitting structure's alone cost struct_film_chem
+    #: +0.015 ens (struct_film_chem_splitstruct, +0.354 vs +0.369) -- and split_proj had
+    #: been silently coupling both together since the day structure's split was added.
+    split_struct: bool | None = None
     input_noise: float = 0.0
     feature_dropout: float = 0.0
 
@@ -899,10 +1243,13 @@ class PerturbSiteToken(nn.Module):
             seq_in = self.gr_seq.out_dim
         w = c.proj or seq_in
         if c.proj and c.split_proj:
-            # one per side: the antibody and the antigen get their own first layer
+            # one per side: the antibody and the antigen get their own first layer, each
+            # optionally its own depth (proj_depth_ab/proj_depth_ag, both 1 by default --
+            # a single Linear, exactly as before either flag existed).
             self.proj = None
+            depth = {"ab": getattr(c, "proj_depth_ab", 1), "ag": getattr(c, "proj_depth_ag", 1)}
             self.proj_side = nn.ModuleDict(
-                {k: nn.Linear(seq_in, c.proj, bias=False) for k in ("ab", "ag")})
+                {k: _proj_stack(seq_in, c.proj, depth[k]) for k in ("ab", "ag")})
         else:
             self.proj = nn.Linear(seq_in, c.proj, bias=False) if c.proj else None
             self.proj_side = None
@@ -946,7 +1293,51 @@ class PerturbSiteToken(nn.Module):
             return
         if c.mut_pair_ffn:
             self.pair_ln = nn.LayerNorm(w, elementwise_affine=False)  # no params, so one
-            self.pair_ffn = nn.Linear(w, w)                           # instance is fine
+            tag_dim = getattr(c, "side_tag_dim", 8) if getattr(c, "side_tag_concat", False) else 0
+            pair_in = (2 * w if c.mut_pair_op == "concat" else w) + tag_dim
+            self.pair_ffn = _mlp_stack(w, getattr(c, "seq_mlp_depth", 1), in_w=pair_in)
+            if c.side_tag_concat:
+                # A per-side identity CONCATENATED onto the mt-wt delta before the shared
+                # pair_ffn sees it -- unlike mut_side_embed/gate (added AFTER pooling, once
+                # per row), this reaches every layer of the shared transformation itself, so
+                # pair_ffn can in principle learn side-conditional behaviour despite sharing
+                # its weights across ab and ag. Zero-initialised: pair_ffn's extra input
+                # columns start multiplying an all-zero tag regardless of side, so this is a
+                # no-op at initialisation like every other addition this session.
+                self.side_tag_emb = nn.Embedding(2, tag_dim)   # 0=ab, 1=ag
+                nn.init.zeros_(self.side_tag_emb.weight)
+                # NOT a no-op at initialisation, unlike side_tag_add below: pair_ffn's first
+                # layer is genuinely wider (in_w includes tag_dim), so its OWN random init
+                # draws a different weight matrix (and, under fan-in-scaled init, a different
+                # SCALE) than the unwidened leader's, even though the tag itself starts at
+                # zero. This is the same situation mut_pair_op="concat" is already in.
+            self.proj_mutwt = (
+                nn.ModuleDict({f"{side}_{which}": nn.Linear(seq_in, c.proj, bias=False)
+                               for side in ("ab", "ag") for which in ("mt", "wt")})
+                if getattr(c, "split_mutwt", False) else None)
+            if self.proj_mutwt is not None and getattr(c, "split_mutwt_tied_init", False):
+                with torch.no_grad():
+                    for side in ("ab", "ag"):
+                        base = self.proj_mutwt[f"{side}_mt"].weight.clone()
+                        self.proj_mutwt[f"{side}_mt"].weight.add_(
+                            0.02 * torch.randn_like(base))
+                        self.proj_mutwt[f"{side}_wt"].weight.copy_(
+                            base + 0.02 * torch.randn_like(base))
+            mf = getattr(c, "mut_feat", "none")
+            if mf == "nearest_partner_struct":
+                self.mut_feat_proj = self._make_struct_proj(c, seq_in, w)
+            elif mf != "none":
+                self.mut_feat_proj = nn.Linear(1, w)
+            if mf != "none":
+                # A brand-new signal added straight into p_mt starts with the SAME
+                # magnitude as the rest of the projection on step one -- effectively a
+                # random perturbation to an otherwise-working representation, before the
+                # network has any evidence the feature helps. A learned sigmoid gate,
+                # initialised at -4 (sigmoid(-4) = 0.018), starts the model at
+                # approximately the ungated baseline and lets gradient descent open the
+                # gate only if the feature earns it, rather than forcing that decision at
+                # init.
+                self.mut_feat_gate = nn.Parameter(torch.tensor(-4.0))
             d = w
             if c.mut_pair_struct_xattn:
                 self.mpnn_proj = self._make_struct_proj(c, seq_in, w)
@@ -954,13 +1345,43 @@ class PerturbSiteToken(nn.Module):
                                            rope=True, rope_base=c.rope_base)
                 d = w * 2                       # sequence term concat structure term
             mode = c.mut_pair_struct_inject
-            if mode != "none":
+            fusion_stage = getattr(c, "fusion_stage", "late")
+            if mode != "none" or fusion_stage in ("early", "mid"):
                 self.mpnn_proj = self._make_struct_proj(c, seq_in, w)
                 self.struct_ln = nn.LayerNorm(w, elementwise_affine=False)
+            if mode != "none":
                 if mode in ("site_concat", "crop_concat", "nn_diff_concat"):
                     d = w * 2
                 elif mode == "film_site":
-                    self.film = nn.Linear(w, 2 * w)                 # -> gamma, beta
+                    self.fusion = _make_fusion(c, w)
+                    self.struct_extra_mlp = (
+                        _mlp_stack(w, c.struct_mlp_depth)
+                        if getattr(c, "struct_mlp_depth", 1) > 1 else None)
+                    bx = c.bsite_extra
+                    if bx != "none":
+                        self.bsite_mpnn_proj = self._make_struct_proj(c, seq_in, w)
+                        self.bsite_ln = nn.LayerNorm(w, elementwise_affine=False)
+                    if bx in ("crop_concat", "crop_wpool", "crop_std", "nn_diff_crop"):
+                        d = w * 2
+                    elif bx == "crop_film2":
+                        self.film2 = nn.Linear(w, 2 * w)
+                    elif bx == "crop_gate":
+                        self.bsite_gate = nn.Linear(2 * w, w)
+                        self.bsite_gate_val = nn.Linear(w, w, bias=False)
+                    elif bx == "crop_xattn":
+                        # no RoPE: the query is the pooled, site-FiLM'd vector, which has
+                        # no single residue position of its own -- CrossAttn's own rule is
+                        # both sides carry a position or neither does
+                        self.bsite_attn = CrossAttn(w, c.n_heads, c.dropout)
+                        d = w * 2
+                    elif bx == "crop_size":
+                        d = w + 2                # one scalar per side
+                    elif bx in ("min_dist_crop", "mean_dist_crop", "mut_dist_to_site"):
+                        d = w + 1                # one scalar, both sides combined
+                    # z itself may be wider than w before any bx addition above (which
+                    # assumes a w-wide z), so the fusion's own delta is added on top here,
+                    # not overwritten -- 0 for every strategy except ConcatFusion (+w).
+                    d += self.fusion.out_width(w) - w
                 elif mode == "gated_site":
                     self.gate = nn.Linear(2 * w, w)
                     self.gate_val = nn.Linear(w, w, bias=False)
@@ -990,6 +1411,32 @@ class PerturbSiteToken(nn.Module):
                 # training step with "no attribute ord_b0" -- the head was never built
                 self.ord_b0 = nn.Parameter(torch.zeros(1))
                 self.ord_gap = nn.Parameter(torch.full((c.ordinal - 1,), 0.5))
+            if c.mut_side_embed:
+                # Same early-return trap as ordinal above: this branch (mut_pair_ffn=True,
+                # every config in this project) returns before the fall-through construction
+                # at the bottom of __init__ ever runs, so building these there is dead code.
+                self.mut_side_emb = nn.Embedding(3, w)      # 0=ab-only, 1=ag-only, 2=both
+                nn.init.zeros_(self.mut_side_emb.weight)     # starts a no-op
+            if c.mut_side_gate:
+                self.mut_side_emb2 = nn.Embedding(3, 8)
+                nn.init.zeros_(self.mut_side_emb2.weight)
+                self.mut_side_gate_proj = nn.Linear(8, 2)
+                nn.init.zeros_(self.mut_side_gate_proj.weight)
+                nn.init.zeros_(self.mut_side_gate_proj.bias)  # both gates start at 1+0=1 exactly
+            if c.side_tag_add:
+                # A per-side identity ADDED to h, the per-residue "what changed" vector,
+                # BEFORE (h * site).sum(1) -- masked out exactly like the real signal is for
+                # the side that has no mutated residue this row, never introducing a constant
+                # per-side baseline the way adding it to the already-pooled vector
+                # unconditionally would. Built here (not next to pair_ffn/side_tag_concat
+                # above) for the same reason mut_side_embed/gate are: this is a plain
+                # nn.Embedding with no effect on any OTHER layer's shape, so it is the one
+                # tag mechanism that CAN be an exact no-op at initialisation -- but only if
+                # building it doesn't shift the RNG draws every later-constructed layer's own
+                # random init consumes. Building it last, right before return, means nothing
+                # is constructed after it in this branch to shift.
+                self.side_tag_emb2 = nn.Embedding(2, w)        # 0=ab, 1=ag
+                nn.init.zeros_(self.side_tag_emb2.weight)
             return
         pw = c.pool_proj or w
         self.pool_proj = (nn.Linear(seq_in, c.pool_proj, bias=False)
@@ -1082,25 +1529,175 @@ class PerturbSiteToken(nn.Module):
             # something the optimiser is merely encouraged to discover.
             self.ord_b0 = nn.Parameter(torch.zeros(1))
             self.ord_gap = nn.Parameter(torch.full((c.ordinal - 1,), 0.5))
+        # mut_side_embed/mut_side_gate are mut_pair_ffn-only (see their docstrings) and are
+        # built inside that branch above, which returns before reaching here -- not repeated
+        # in this fall-through path, unlike ordinal, since neither has a defined meaning
+        # outside mut_pair_ffn's own per-side pooling.
+
+    def _mut_side_idx(self, batch) -> torch.Tensor:
+        """(B,) 0=ab-only, 1=ag-only, 2=both -- derived directly from which side's site mask
+        is nonzero, not from a stored column, so it is exactly consistent with however the
+        crop defines "the mutated residues" everywhere else in this file (mut_side_embed,
+        mut_side_gate)."""
+        has_ab = batch["site_ab"].sum(1) > 0
+        has_ag = batch["site_ag"].sum(1) > 0
+        idx = torch.where(has_ab & has_ag, 2, torch.where(has_ag, 1, 0))
+        return idx.long()
 
     def _mut_pair_ffn(self, batch, px, tok_proj) -> torch.Tensor:
         """At each mutated residue: GELU(proj) -> LN(mt) combine LN(wt) -> Linear, summed."""
         c = self.cfg
-        acc = 0
+        stage = getattr(c, "fusion_stage", "late")
+        gelu = torch.nn.functional.gelu
+        pooled = {}
         for side in ("ab", "ag"):
             site = batch[f"site_{side}"].unsqueeze(-1)
+            st = None
+            if stage in ("early", "mid"):
+                st = self.struct_pool(px(batch[f"struct_{side}"]), side)
             # the activation sits on the INITIAL projection, not on pair_ffn's output --
             # local to this check, not on the shared proj_side every other architecture
             # in this file reads unactivated
-            p_mt = torch.nn.functional.gelu(tok_proj(px(batch[f"seq_{side}_mt"]), side))
-            p_wt = torch.nn.functional.gelu(tok_proj(px(batch[f"seq_{side}_wt"]), side))
+            if self.proj_mutwt is not None:
+                p_mt = torch.nn.functional.gelu(
+                    self.proj_mutwt[f"{side}_mt"](px(batch[f"seq_{side}_mt"])))
+                p_wt = torch.nn.functional.gelu(
+                    self.proj_mutwt[f"{side}_wt"](px(batch[f"seq_{side}_wt"])))
+            else:
+                p_mt = torch.nn.functional.gelu(tok_proj(px(batch[f"seq_{side}_mt"]), side))
+                p_wt = torch.nn.functional.gelu(tok_proj(px(batch[f"seq_{side}_wt"]), side))
+            if stage == "early":
+                # Structure shapes what "the same" means at this residue BEFORE any delta
+                # is computed -- both mt and wt get it, the wild-type backbone being the
+                # only structure this project ever has for either.
+                p_mt = p_mt + st
+                p_wt = p_wt + st
+            if getattr(c, "mut_feat", "none") != "none":
+                # Added to p_mt ONLY (not p_wt): this is a property of where the mutated
+                # residue sits, not of the wild-type sequence, so it has no business
+                # shifting the comparison's other side.
+                p_mt = p_mt + self._mut_feat_bias(batch, px, side)
             n_mt, n_wt = self.pair_ln(p_mt), self.pair_ln(p_wt)
-            comb = (n_mt - n_wt) if c.mut_pair_op == "sub" else (n_mt * n_wt)
+            if c.mut_pair_op == "sub":
+                comb = n_mt - n_wt
+            elif c.mut_pair_op == "concat":
+                comb = torch.cat([n_mt, n_wt], dim=-1)
+            else:
+                comb = n_mt * n_wt
+            if c.side_tag_concat:
+                side_idx = comb.new_tensor(0 if side == "ab" else 1, dtype=torch.long)
+                tag = self.side_tag_emb(side_idx)                        # (tag_dim,)
+                tag = tag.view(1, 1, -1).expand(comb.shape[0], comb.shape[1], -1)
+                comb = torch.cat([comb, tag], dim=-1)
             h = self.pair_ffn(comb)
             if c.mut_pair_act:
                 h = torch.nn.functional.gelu(h)
-            acc = acc + (h * site).sum(1)
+            if stage == "mid":
+                # Structure reweights an ALREADY-COMPUTED "what changed" signal, one residue
+                # at a time, rather than reshaping the residues that feed it.
+                h = h + st
+            if c.side_tag_add:
+                side_idx = h.new_tensor(0 if side == "ab" else 1, dtype=torch.long)
+                h = h + self.side_tag_emb2(side_idx)   # (w,), broadcasts over (B, L, w)
+            pooled[side] = (h * site).sum(1)
+        if c.mut_side_gate:
+            # The projection IS the mechanism: two (1 + delta) gates -- FiLM's own "starts as
+            # a no-op" convention (docs: "keeps gamma(0) == 0, so a null edit is zero"), not a
+            # sigmoid -- from a category embedding that never sees h_ab/h_ag's own content, so
+            # this can only learn a fixed per-location correction (e.g. "trust the ag branch
+            # less everywhere"), not a per-example reweighting -- that would need the gate to
+            # read pooled itself, a different, larger change this config deliberately does not
+            # make. Zero-initialised weight and bias make BOTH gates exactly 1.0 at the start
+            # of training, exactly reproducing the plain sum below -- a sigmoid gate would
+            # start at 0.5 and immediately halve every mutation's contribution.
+            idx = self._mut_side_idx(batch)
+            gate = 1.0 + self.mut_side_gate_proj(self.mut_side_emb2(idx))  # (B, 2)
+            acc = gate[:, 0:1] * pooled["ab"] + gate[:, 1:2] * pooled["ag"]
+        else:
+            acc = pooled["ab"] + pooled["ag"]
+        if c.mut_side_embed:
+            acc = acc + self.mut_side_emb(self._mut_side_idx(batch))
         return acc
+
+    def _mut_feat_bias(self, batch, px, side: str) -> torch.Tensor:
+        """(B, L, w) bias for p_mt, from SiteTokenConfig.mut_feat -- see its docstring.
+        Scaled by a learned gate that starts near zero (see mut_feat_gate's comment)."""
+        c = self.cfg
+        gate = torch.sigmoid(self.mut_feat_gate)
+        if c.mut_feat == "nearest_partner_struct":
+            other = "ag" if side == "ab" else "ab"
+            dist = batch["dist"]                                  # (B, Lab, Lag)
+            valid = dist < 90.0
+            masked = torch.where(valid, dist, torch.full_like(dist, 1e4))
+            nn_idx = masked.argmin(dim=2) if side == "ab" else masked.argmin(dim=1)
+            st_other = px(batch[f"struct_{other}"])                # (B, L_other, struct_dim)
+            feat = torch.gather(st_other, 1,
+                                nn_idx.unsqueeze(-1).expand(-1, -1, st_other.shape[-1]))
+            proj = self.mut_feat_proj
+            raw = (proj(feat, side) if isinstance(proj, DualProjection)
+                  else proj[side](feat) if isinstance(proj, nn.ModuleDict) else proj(feat))
+            return gate * raw
+        return gate * self.mut_feat_proj(self._mut_feat_scalar(batch, side).unsqueeze(-1))
+
+    def _mut_feat_scalar(self, batch, side: str) -> torch.Tensor:
+        """(B, L) scalar feature per residue on `side`. Meaningful only at site positions;
+        the caller's site mask zeroes out everywhere else at aggregation."""
+        mf = self.cfg.mut_feat
+        dist = batch["dist"]                                      # (B, Lab, Lag), pad=99.0
+        valid = dist < 90.0
+        masked = torch.where(valid, dist, torch.full_like(dist, 1e4))
+        d_to_other = masked.min(dim=2).values if side == "ab" else masked.min(dim=1).values
+
+        if mf == "dist_to_site":
+            return d_to_other
+
+        if mf in ("contacts_8a", "contacts_soft"):
+            d_full = masked if side == "ab" else masked.transpose(1, 2)     # (B, L, L_other)
+            valid_full = valid if side == "ab" else valid.transpose(1, 2)
+            if mf == "contacts_8a":
+                return ((d_full < 8.0) & valid_full).float().sum(dim=2)
+            w_ = torch.where(valid_full, torch.exp(-d_full / 4.0), torch.zeros_like(d_full))
+            return w_.sum(dim=2)
+
+        if mf == "rel_seq_pos":
+            res = batch[f"res_{side}"].float()
+            mask = batch[f"mask_{side}"].bool()
+            lo = torch.where(mask, res, torch.full_like(res, 1e9)).min(dim=1, keepdim=True).values
+            hi = torch.where(mask, res, torch.full_like(res, -1e9)).max(dim=1, keepdim=True).values
+            return ((res - lo) / (hi - lo).clamp(min=1.0)).clamp(0, 1)
+
+        if mf == "burial_rank":
+            mask = batch[f"mask_{side}"].bool()
+            d_masked = torch.where(mask, d_to_other, torch.full_like(d_to_other, 1e9))
+            order = d_masked.argsort(dim=1)
+            ranks = torch.zeros_like(d_to_other)
+            arangev = torch.arange(d_to_other.shape[1],
+                                   device=d_to_other.device).float().unsqueeze(0)
+            ranks.scatter_(1, order, arangev.expand_as(order))
+            n = mask.float().sum(dim=1, keepdim=True)
+            return (ranks / (n - 1).clamp(min=1)).clamp(0, 1)
+
+        if mf == "dist_delta_mean":
+            denom = valid.reshape(valid.shape[0], -1).sum(1, keepdim=True).clamp(min=1)
+            mean_d = (dist * valid).reshape(dist.shape[0], -1).sum(1, keepdim=True) / denom
+            return d_to_other - mean_d
+
+        if mf == "local_seq_density":
+            res = batch[f"res_{side}"].float()
+            mask = batch[f"mask_{side}"].bool()
+            diff = (res.unsqueeze(-1) - res.unsqueeze(1)).abs()             # (B, L, L)
+            near = (diff <= 5.0) & mask.unsqueeze(1) & mask.unsqueeze(-1)
+            return near.float().sum(dim=2) - 1.0                            # exclude self
+
+        if mf == "is_at_interface":
+            return torch.sigmoid((8.0 - d_to_other) / 2.0)
+
+        if mf == "n_mut_row":
+            total = batch["site_ab"].sum(dim=1, keepdim=True).float() + \
+                    batch["site_ag"].sum(dim=1, keepdim=True).float()
+            return total.expand(-1, d_to_other.shape[1])
+
+        raise ValueError(f"unknown mut_feat: {mf!r}")
 
     def _make_struct_proj(self, c, seq_in, w):
         """The structure encoder's first linear layer -- split per side when split_proj is
@@ -1109,15 +1706,153 @@ class PerturbSiteToken(nn.Module):
         embeddings through ONE shared map -- the same weight-sharing split_proj exists to
         prevent, just missed on the structure side because sequence was the branch that
         had a proj_side pattern to copy from.
+
+        Measured afterwards (struct_film_chem_splitstruct, +0.354 vs the shared-projection
+        leader's +0.369): splitting structure's projection alone is a net loss for THIS
+        architecture, unlike splitting sequence's. split_struct decouples the two so a
+        config can keep split_proj's sequence behaviour while choosing structure
+        independently -- None (the default) defers to split_proj, preserving every
+        existing config's behaviour exactly; True/False overrides just this layer.
         """
         dim = c.struct_pca_dim or seq_in
-        if c.split_proj:
-            return nn.ModuleDict({k: nn.Linear(dim, w, bias=False) for k in ("ab", "ag")})
-        return nn.Linear(dim, w, bias=False)
+        split = c.split_proj if getattr(c, "split_struct", None) is None else c.split_struct
+        return DualProjection(dim, w, split)
 
     def struct_proj(self, x, side):
         p = self.mpnn_proj
+        if isinstance(p, DualProjection):
+            return p(x, side)
+        # pre-DualProjection construction sites (a bare Linear or ModuleDict built outside
+        # _make_struct_proj, e.g. the cross_attn/gated_fusion family's own self.mpnn_proj) --
+        # unchanged so they keep working exactly as before.
         return p[side](x) if isinstance(p, nn.ModuleDict) else p(x)
+
+    def struct_pool(self, x, side):
+        """LN(GELU(struct_proj(x, side))) -- the read pattern repeated at every film_site-
+        family call site, over the SAME self.mpnn_proj/self.struct_ln weights other methods
+        still access directly when they need the bare projection (no activation, no norm)
+        or a different activation than GELU."""
+        return self.struct_ln(torch.nn.functional.gelu(self.struct_proj(x, side)))
+
+    def _bsite_extra(self, batch, px, z) -> torch.Tensor:
+        """Add ONE binding-site (whole-crop) term to the site-FiLM'd vector z. Ten modes,
+        see SiteTokenConfig.bsite_extra. z is already (1+gamma)*z_seq + beta.
+        """
+        c = self.cfg
+        bx = c.bsite_extra
+        gelu = torch.nn.functional.gelu
+
+        def crop_struct(side):
+            st = px(batch[f"struct_{side}"])
+            p = self.bsite_mpnn_proj
+            raw = (p(st, side) if isinstance(p, DualProjection)
+                  else p[side](st) if isinstance(p, nn.ModuleDict) else p(st))
+            return self.bsite_ln(gelu(raw))
+
+        if bx in ("crop_size", "min_dist_crop", "mean_dist_crop"):
+            dist = batch["dist"]                                  # (B, Lab, Lag), pad=99.0
+            valid = dist < 90.0
+            if bx == "crop_size":
+                n_ab = batch["mask_ab"].sum(1, keepdim=True)
+                n_ag = batch["mask_ag"].sum(1, keepdim=True)
+                return torch.cat([z, n_ab, n_ag], dim=-1)
+            big = torch.full_like(dist, 1e4)
+            masked = torch.where(valid, dist, big)
+            if bx == "min_dist_crop":
+                stat = masked.reshape(masked.shape[0], -1).min(dim=1, keepdim=True).values
+            else:
+                denom = valid.reshape(valid.shape[0], -1).sum(1, keepdim=True).clamp(min=1)
+                stat = (dist * valid).reshape(dist.shape[0], -1).sum(1, keepdim=True) / denom
+            return torch.cat([z, stat], dim=-1)
+
+        if bx == "mut_dist_to_site":
+            # Not "how tight is the interface anywhere in this crop" (min_dist_crop) but
+            # "how close is THIS mutation to it" -- the mutated residue's own minimum Ca
+            # distance to the nearest residue on the other side. A mutation can sit right at
+            # a tight interface or be buried elsewhere in a crop that happens to contact
+            # tightly somewhere else; min_dist_crop cannot tell those apart, this can.
+            dist = batch["dist"]                                  # (B, Lab, Lag), pad=99.0
+            valid = dist < 90.0
+            big = torch.full_like(dist, 1e4)
+            masked = torch.where(valid, dist, big)
+            site_ab, site_ag = batch["site_ab"].bool(), batch["site_ag"].bool()
+            d_ab_to_ag = masked.min(dim=2).values                 # (B, Lab) nearest ag contact
+            d_ag_to_ab = masked.min(dim=1).values                 # (B, Lag) nearest ab contact
+            min_ab = torch.where(site_ab, d_ab_to_ag,
+                                  torch.full_like(d_ab_to_ag, 1e4)).min(dim=1, keepdim=True).values
+            min_ag = torch.where(site_ag, d_ag_to_ab,
+                                  torch.full_like(d_ag_to_ab, 1e4)).min(dim=1, keepdim=True).values
+            stat = torch.minimum(min_ab, min_ag)                  # every row has >=1 mutation
+            return torch.cat([z, stat], dim=-1)
+
+        if bx == "crop_concat":
+            z_crop = 0
+            for side in ("ab", "ag"):
+                z_crop = z_crop + site_mean(crop_struct(side), batch[f"mask_{side}"])
+            return torch.cat([z, z_crop], dim=-1)
+
+        if bx == "crop_film2":
+            z_crop = 0
+            for side in ("ab", "ag"):
+                z_crop = z_crop + site_mean(crop_struct(side), batch[f"mask_{side}"])
+            gamma2, beta2 = self.film2(z_crop).chunk(2, dim=-1)
+            return (1 + gamma2) * z + beta2
+
+        if bx == "crop_gate":
+            z_crop = 0
+            for side in ("ab", "ag"):
+                z_crop = z_crop + site_mean(crop_struct(side), batch[f"mask_{side}"])
+            g = torch.sigmoid(self.bsite_gate(torch.cat([z, z_crop], dim=-1)))
+            return z + g * self.bsite_gate_val(z_crop)
+
+        if bx == "crop_xattn":
+            out_acc = 0
+            for side in ("ab", "ag"):
+                kv = crop_struct(side)
+                q = z.unsqueeze(1)                                # (B, 1, w) -- length-1 query
+                out = self.bsite_attn(q, kv, batch[f"mask_{side}"].bool())
+                out_acc = out_acc + out.squeeze(1)
+            return torch.cat([z, out_acc], dim=-1)
+
+        if bx == "crop_wpool":
+            z_wp = 0
+            for side in ("ab", "ag"):
+                st = crop_struct(side)                            # (B, L, w)
+                res = batch[f"res_{side}"].float()                # true residue index
+                site = batch[f"site_{side}"]                      # (B, L)
+                mask = batch[f"mask_{side}"]
+                has_site = (site.sum(1, keepdim=True) > 0)
+                # distance (in residues) from every crop position to the NEAREST mutated
+                # one on the same chain; site rows contribute 0, so they always win
+                site_res = torch.where(site.bool(), res, torch.full_like(res, 1e4))
+                d_to_site = (res.unsqueeze(-1) - site_res.unsqueeze(1)).abs().min(dim=-1).values
+                w_logits = torch.where(mask.bool(), -d_to_site / 10.0, torch.full_like(res, -1e9))
+                weights = torch.softmax(w_logits, dim=1).unsqueeze(-1)
+                pooled = (st * weights).sum(1)
+                z_wp = z_wp + pooled * has_site.float()
+            return torch.cat([z, z_wp], dim=-1)
+
+        if bx == "crop_std":
+            z_std = 0
+            for side in ("ab", "ag"):
+                st = crop_struct(side)
+                mask = batch[f"mask_{side}"].unsqueeze(-1)
+                n = mask.sum(1, keepdim=True).clamp(min=1.0)
+                mean = (st * mask).sum(1, keepdim=True) / n
+                var = ((st - mean) ** 2 * mask).sum(1) / n.squeeze(1)
+                z_std = z_std + var.clamp(min=1e-8).sqrt()
+            return torch.cat([z, z_std], dim=-1)
+
+        if bx == "nn_diff_crop":
+            dist = batch["dist"]
+            st_ab, st_ag = crop_struct("ab"), crop_struct("ag")
+            nn_for_ag = dist.argmin(dim=1, keepdim=True).squeeze(1).unsqueeze(-1)
+            nn_ab = torch.gather(st_ab, 1, nn_for_ag.expand(-1, -1, st_ab.shape[-1]))
+            diff = st_ag - nn_ab
+            z_diff = site_mean(diff, batch["mask_ag"])           # whole crop, not just site
+            return torch.cat([z, z_diff], dim=-1)
+
+        raise ValueError(f"unknown bsite_extra: {bx!r}")
 
     def _mut_pair_struct(self, batch, px, tok_proj) -> torch.Tensor:
         """ag-indexed structural diffs (ag minus nearest ab, geometry) as keys/values;
@@ -1172,22 +1907,28 @@ class PerturbSiteToken(nn.Module):
             key = "site" if mode == "site_concat" else "mask"
             z_st = 0
             for side in ("ab", "ag"):
-                st = self.struct_ln(gelu(self.struct_proj(px(batch[f"struct_{side}"]), side)))
+                st = self.struct_pool(px(batch[f"struct_{side}"]), side)
                 z_st = z_st + site_mean(st, batch[f"{key}_{side}"])
             return torch.cat([z_seq, z_st], dim=-1)
 
         if mode == "film_site":
             z_st = 0
             for side in ("ab", "ag"):
-                st = self.struct_ln(gelu(self.struct_proj(px(batch[f"struct_{side}"]), side)))
+                st = self.struct_pool(px(batch[f"struct_{side}"]), side)
                 z_st = z_st + site_mean(st, batch[f"site_{side}"])
-            gamma, beta = self.film(z_st).chunk(2, dim=-1)
-            return (1 + gamma) * z_seq + beta
+            if self.struct_extra_mlp is not None:
+                z_st = self.struct_extra_mlp(z_st)
+            if getattr(c, "struct_only", False):
+                z_seq = z_seq * 0
+            z = self.fusion(z_seq, z_st, batch.get("chem"))
+            if c.bsite_extra != "none":
+                return self._bsite_extra(batch, px, z)
+            return z
 
         if mode == "gated_site":
             z_st = 0
             for side in ("ab", "ag"):
-                st = self.struct_ln(gelu(self.struct_proj(px(batch[f"struct_{side}"]), side)))
+                st = self.struct_pool(px(batch[f"struct_{side}"]), side)
                 z_st = z_st + site_mean(st, batch[f"site_{side}"])
             g = torch.sigmoid(self.gate(torch.cat([z_seq, z_st], dim=-1)))
             return z_seq + g * self.gate_val(z_st)
@@ -1196,8 +1937,8 @@ class PerturbSiteToken(nn.Module):
             # symmetric: an ag residue paired with its nearest ab, AND the reverse, each
             # pooled at ITS OWN side's mutated positions -- a mutation on either side
             # reaches a real term, unlike a one-directional version would.
-            st_ab = self.struct_ln(gelu(self.struct_proj(px(batch["struct_ab"]), "ab")))
-            st_ag = self.struct_ln(gelu(self.struct_proj(px(batch["struct_ag"]), "ag")))
+            st_ab = self.struct_pool(px(batch["struct_ab"]), "ab")
+            st_ag = self.struct_pool(px(batch["struct_ag"]), "ag")
             nn_for_ag = dist.argmin(dim=1, keepdim=True).squeeze(1).unsqueeze(-1)  # (B,Lag,1)
             nn_for_ab = dist.argmin(dim=2, keepdim=True)                          # (B,Lab,1)
             diff_ag = st_ag - torch.gather(st_ab, 1, nn_for_ag.expand(-1, -1, st_ab.shape[-1]))
@@ -1234,7 +1975,7 @@ class PerturbSiteToken(nn.Module):
             # mutated residues -- "wild type site means the binding site")
             z_st = 0
             for side in ("ab", "ag"):
-                st = self.struct_ln(gelu(self.struct_proj(px(batch[f"struct_{side}"]), side)))
+                st = self.struct_pool(px(batch[f"struct_{side}"]), side)
                 z_st = z_st + site_mean(st, batch[f"mask_{side}"])
             u, v = self.bilin_struct(z_st), self.bilin_seq(z_seq)
             z_cc = u * v                    # each projected separately, THEN multiplied
@@ -1372,26 +2113,33 @@ class PerturbSiteToken(nn.Module):
         # the structure 128, and every configuration that reads structure -- attention or
         # FiLM -- died on the mismatch. A plain no-PCA run never touched it, so this
         # surfaced only once cross-attention was asked for without the PCA.
-        draws: dict[int, tuple] = {}
+        draws: dict[tuple, tuple] = {}
 
         def px(x):
             # The feature-dropout mask is drawn once per width and reused, so WT and MUT
-            # lose the same columns and it cancels in their difference.
+            # lose the same columns and it cancels in their difference. The Gaussian noise
+            # used to only share its SCALE this way, not the actual draw -- `torch.randn_like`
+            # was called fresh on every px() invocation, so WT and MUT got independent noise
+            # realisations that compound by root-2 in the edit instead of cancelling (README,
+            # "The Gaussian noise is the one that misbehaves"). Caching the full noise tensor,
+            # keyed by shape rather than width alone (so ab and ag, same width but different
+            # length, never share a draw meant for a wt/mut pair), fixes both at once.
             if not (self.training and (c.input_noise > 0 or c.feature_dropout > 0)):
                 return x
-            w = x.shape[-1]
-            if w not in draws:
-                n = (c.input_noise * x.std(dim=(0, 1), keepdim=True)
+            key = x.shape
+            if key not in draws:
+                n = (torch.randn_like(x) * (c.input_noise * x.std(dim=(0, 1), keepdim=True))
                      if c.input_noise > 0 else None)
                 m = None
                 if c.feature_dropout > 0:
+                    w = x.shape[-1]
                     keep = (torch.rand(x.shape[0], 1, w, device=x.device, dtype=x.dtype)
                             >= c.feature_dropout)
                     m = keep.to(x.dtype) / (1.0 - c.feature_dropout)
-                draws[w] = (n, m)
-            n, m = draws[w]
+                draws[key] = (n, m)
+            n, m = draws[key]
             if n is not None:
-                x = x + torch.randn_like(x) * n
+                x = x + n
             if m is not None:
                 x = x * m
             return x

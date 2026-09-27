@@ -7,7 +7,12 @@ Predicting how a mutation changes antibody–antigen binding free energy, from *
 embedding from the wild-type at the mutated residue, one shared linear layer, sum — modulated
 by a single FiLM gate built from pooled ProteinMPNN structure at that same site, with
 substitution chemistry and interface geometry concatenated on top. 50,497 trainable
-parameters, both encoders frozen.**
+parameters, both encoders frozen. Trained with the regression loss PLUS a small soft-Kendall-
+tau ranking term (`--rank-method kendall_soft --rank-weight 1.0`) — the only change out of
+dozens tried in a later session that survived being re-measured against the plain-regression
+version on a matched, larger seed count (README §1a; [docs/ARCHITECTURES.md §G.2](docs/ARCHITECTURES.md#g2-ten-ranking-methods-at-a-fixed-weight-and-a-re-measurement-that-mattered)).
+Architecture and parameter count are unchanged; only the training objective differs — see
+below for the evidence.**
 
 **The mechanism that won was a gate, not plain concatenation and not attention.** An earlier
 sweep of 45 configurations — cross-attention in five variants, antibody↔antigen attention
@@ -29,13 +34,47 @@ architectural differences in this problem are smaller than the noise. Establishi
 differences are real — and which of this project's own earlier claims did not survive that
 test — became the substance of the work.
 
+A later sweep tried 10 features describing a mutation's own position relative to the binding
+site — contact counts, chain position, rank of burial, the nearest partner residue's own
+embedding, and others — injected directly into the mutation's projection rather than
+concatenated after the backbone. The best of them (burial rank) appeared to tie
+`struct_film_chem`, but that comparison turned out to be against the wrong baseline: a config
+flag governing sequence's per-side projection had been silently coupled to structure's since an
+earlier fix, so the whole sweep ran on an architecture 0.015 worse than the true
+`struct_film_chem`. Re-measured on the correct, decoupled base, burial rank is a **regression**
+(+0.335 against +0.369) with a much wider seed spread — it was compensating for the handicap,
+not improving the real model. `struct_film_chem` remains the submitted model. The confound and
+the full sweep are recorded as a negative result in
+[docs/ARCHITECTURES.md §Family F](docs/ARCHITECTURES.md#family-f--injecting-where-a-mutation-sits-relative-to-the-binding-site).
+
+**The one change that DID survive.** A later sweep tried 10 ranking-loss terms added to the
+regression objective, at 3 seeds each; the best-looking one (`kendall_soft`, a smooth
+Kendall-tau-style concordance term) reached +0.391 ens with a TIGHTER seed spread than the
+leader's own 0.092 — exactly the kind of result this project has learned to distrust on sight.
+Re-measured at 8 seeds, matched against the leader on the identical seeds: the tight spread did
+not survive (both land at 0.217 — the leader's own 3-seed spread had never been a reliable
+estimate of it either), but a small edge did:
+
+| run | seeds | ens | per-seed mean | seed spread |
+| --- | --- | --- | --- | --- |
+| `struct_film_chem` + `kendall_soft` | 8 | **+0.379** | **+0.290** | 0.217 |
+| `struct_film_chem` (plain regression) | 8 | +0.368 | +0.281 | 0.217 |
+
+Two other 3-seed candidates that looked competitive (a depth-2 MLP on both branches, and a
+tied-initialisation fix for `split_mutwt`) were also re-measured at 8 seeds and did NOT survive
+— both scored below the plain leader once matched on the same seeds
+([docs/ARCHITECTURES.md §G.2–G.5](docs/ARCHITECTURES.md#g2-ten-ranking-methods-at-a-fixed-weight-and-a-re-measurement-that-mattered)
+has all three). `kendall_soft` is the only one out of everything tried in that later session
+that held up, which is why it is now part of the submitted training recipe rather than a
+recorded negative result — a small, honestly-small improvement, not a new architecture.
+
 | | |
 | --- | --- |
 | **The submitted model, `struct_film_chem`, specified in full** | [docs/DETAILS.md](docs/DETAILS.md#struct_film_chem) |
 | **The model this superseded, specified in full** | [docs/MODEL.md](docs/MODEL.md) |
 | **Why each choice was made** | [docs/JUSTIFICATIONS.md](docs/JUSTIFICATIONS.md) |
 | **What I would do next, and why** | [docs/FUTURE_WORK.md](docs/FUTURE_WORK.md) |
-| **Every architecture tried (45 runs, plus the structural-injection sweep that followed)** | [docs/ARCHITECTURES.md](docs/ARCHITECTURES.md) |
+| **Every architecture tried (45 runs, the structural-injection sweep, and the mutation-projection sweep)** | [docs/ARCHITECTURES.md](docs/ARCHITECTURES.md) |
 | **Error analysis** | [ERROR_ANALYSIS.md](ERROR_ANALYSIS.md) |
 | **AI prompt history** | [AI_PROMPTS.md](AI_PROMPTS.md) |
 | Results · Running it · Hardware · Limitations | below |
@@ -82,17 +121,50 @@ unchanged from before.
 **Now measured on a real homology-cluster split** (17 clusters from 53 complexes,
 `data/cluster_folds.csv`, 4 folds greedily balanced by row count — `experiments/protattba_repro/
 _perturb_v2_colab.py --fold-map`): ensemble **+0.272**, 74% of the standard-split score, seed
-spread 0.034. `gated_cg_clusterscale` was run the same way for comparison: +0.214, 62%
-retained, spread 0.113 — `struct_film_chem` degrades less under the harder split, not just
-scores higher on the easier one. This is a **different cluster assignment and a different
-metric convention** (ensemble Pearson here; the "Generalisation under a homology split" table
-below reports per-complex Spearman on whatever split produced it, and this document does not
-establish the two splits are identical) — read as a second, independent cluster-holdout
-measurement, not a replacement number for that table.
+spread 0.034 — reproduced exactly on the current, decoupled architecture (`split_struct:
+false`) before trusting the comparison below. `gated_cg_clusterscale` was run the same way for
+comparison: +0.214, 62% retained, spread 0.113 — `struct_film_chem` degrades less under the
+harder split, not just scores higher on the easier one. This is a **different cluster
+assignment and a different metric convention** (ensemble Pearson here; the "Generalisation
+under a homology split" table below reports per-complex Spearman on whatever split produced
+it, and this document does not establish the two splits are identical) — read as a second,
+independent cluster-holdout measurement, not a replacement number for that table.
 
-The full bias/error-analysis battery in [ERROR_ANALYSIS.md](ERROR_ANALYSIS.md) has not been
-re-run against the new model; those numbers there still describe `cat128_reg2_l1` and are
-flagged as pending an update, not silently carried over.
+**The `kendall_soft` training-objective addition retains LESS under the cluster split than
+plain MSE does** — +0.258 ens, **66%** of its own standard-split score, against the plain
+version's 74%. The ranking term's advantage on the standard split (+0.391 vs +0.369, or +0.379
+vs +0.368 at 8 seeds) does not fully carry over to the harder, homology-controlled test; some
+of what it is learning to rank correctly may be complex-identity-correlated signal the cluster
+split is specifically designed to remove. Reported as a genuine caveat on the current
+recipe, not smoothed over — the standard-split edge is real (§ above), but it is measured on
+the easier split, and the harder one likes it slightly less than it likes the plain model.
+
+**A seq-branch-depth-2 variant on top of `kendall_soft` loses on both splits, not just one.**
+Giving the sequence delta its own extra pre-fuse MLP layer (`seq_mlp_depth=2`) scored +0.354
+ens standard-split (worse than `kendall_soft` alone's +0.391) and **+0.215 ens cluster-split**
+— worse than both `kendall_soft` (+0.258) and the plain leader (+0.272), and the lowest
+retention of the three (61%, vs 66% and 74%). Extra sequence-branch depth was already a loser
+on the standard split alone (§Family G's factorial sweep, `arch_seq2_film` +0.360 against the
+depth-1 leader's +0.369); combining it with the ranking-loss addition does not change that, on
+either split. Not pursued further — see
+[docs/ARCHITECTURES.md §G.6](docs/ARCHITECTURES.md#g6-the-submitted-recipe-under-the-homology-cluster-split-and-a-seq-depth-2-variant-that-loses-on-both-splits)
+for the full comparison table.
+
+The full bias/error-analysis battery in [ERROR_ANALYSIS.md](ERROR_ANALYSIS.md) Parts I–IV
+describes `cat128_reg2_l1` (Parts I–III) and the plain-MSE `struct_film_chem` (Part IV).
+**[Part V](ERROR_ANALYSIS.md#part-v--the-training-objective-changed-kendall_soft-and-the-failures-mostly-didnt)**
+now covers `struct_film_chem_kendall`, the actually-submitted model, with `film_kendall` wired
+into `bias_analysis.py`/`class_separation.py`/`error_drivers.py`'s own `MODELS` dicts rather than
+patched in at runtime. It fails on almost exactly the same rows as the plain version (0.950
+error correlation, the highest of any pair measured in the project), a small pooled
+class-separation loss (AUC stab|dest 0.831 vs 0.841) alongside a small within-complex gain (0.770
+vs 0.758), and a small precision gain on large-effect rows. **Correcting an earlier, less
+careful readout of this same comparison**: the geometry-descriptor bias is NOT uniformly
+dampened — two of the three columns Part IV's §29 tracks got slightly *worse* under
+`kendall_soft` (`rsasa_bound` 0.331 vs 0.279, `min_dist_partner` 0.283 vs 0.267), only
+`n_contacts` moved the other way, and by less than run-to-run noise (−0.331 vs −0.339). Net
+read: a genuine but modest effect on the same underlying model, not a different failure mode —
+see Part V for the full, honest breakdown rather than the summary above.
 
 `ens` averages the seeds then scores once — what you would ship. `per seed` scores each seed
 separately — what one training run gives you. **`spread` is max − min across seeds, and it is
@@ -104,7 +176,7 @@ GELU, LayerNorm the mutant and wild-type projections SEPARATELY, then:
     LN(mt) - LN(wt)  ->  Linear(64->64)  ->  GELU  ->  sum over the mutated residues
     summed over ab and ag                                                       z_seq   64
 
-ProteinMPNN encoder_h_V, per side  -> Linear(128->64), own map        -> GELU -> LayerNorm
+ProteinMPNN encoder_h_V, per side  -> Linear(128->64), ONE map shared ab/ag -> GELU -> LayerNorm
     mean-pooled at the mutated residues, summed over ab and ag                  z_st    64
 gamma, beta = Linear(64->128)(z_st).chunk(2)          <- FiLM, not concatenation
 z_seq = (1 + gamma) * z_seq + beta
@@ -113,23 +185,28 @@ z = [ z_seq ; chem + interface geometry + ESM/ProteinMPNN zero-shot scores ]    
     Linear(103->128) -> GELU -> Dropout(0.35) -> Linear(128->1)
 ```
 
-**The fusion, and one weight-sharing decision that matters.** Sequence and structure each get
-**their own** first linear layer, and each of those is separate again per side (antibody,
-antigen) — four independent `Linear(128 → 64)` maps in total, never one shared across
-modalities. The wild-type/mutant pair within one side's sequence DOES share a map, and that
-sharing is necessary — the subtraction only means anything if both land in one space. Sharing
-*across* modalities would not be: ESM-2 and ProteinMPNN are never subtracted from one another,
-and forcing them through one map buys nothing while costing the ability to scale each
-modality independently.
+**The fusion, and two weight-sharing decisions, one intentional and one not.** Sequence's first
+linear layer is split per side (antibody, antigen) — two independent `Linear(128 → 64)` maps,
+never shared across ab/ag. The wild-type/mutant pair within one side's sequence DOES share a
+map, and that sharing is necessary — the subtraction only means anything if both land in one
+space (§Family F below found this generalises less than it looks like it should: splitting
+mt/wt, unlike splitting ab/ag, is a regression, not an improvement). **Structure's first linear
+layer is ONE map shared across ab and ag** — the intended design split it too, matching
+sequence, but the code that would have done that had a latent bug that went unnoticed for a
+full architecture generation; when the bug was found and fixed, the split version scored 0.015
+*worse* (`struct_film_chem_splitstruct`, +0.354 against +0.369 — see
+[docs/ARCHITECTURES.md §Family F](docs/ARCHITECTURES.md#family-f--injecting-where-a-mutation-sits-relative-to-the-binding-site)),
+so the model that ships keeps the accidental, unsplit version.
 
-This is not a hypothetical. An earlier draft submitted a gated-fusion model that scored +0.300,
-and it turned out to be sharing one projection between the two encoders — its config requested
-a separate structure projection and the model silently ignored it. Fixing the bug and testing
-gating properly was flagged here as "a next step, not a result"; it has since been done.
+This is not the only such case. An earlier draft submitted a gated-fusion model that scored
++0.300, and it turned out to be sharing one projection between the two encoders — its config
+requested a separate structure projection and the model silently ignored it. Fixing the bug and
+testing gating properly was flagged here as "a next step, not a result"; it has since been done.
 **`gated_cg_clusterscale`, the corrected version, reaches +0.344** — ahead of plain
 concatenation's +0.293, and briefly the best network in the project before the FiLM sweep
-below found something better still. The lesson was not "gating doesn't help"; it was that the
-first measurement of it was measuring a bug.
+below found something better still. That fix helped; the structure-projection fix above did
+not. The lesson both times was the same — measure the fix, don't assume its direction — and it
+cut both ways.
 
 **Three representation decisions that matter more than the fusion does:**
 
@@ -532,26 +609,44 @@ make align                               # verify each mutation is where we inde
 make test                                # split-integrity and harness tests
 ```
 
-**To train the submitted model, `struct_film_chem`.** The neural runs are driven separately,
-from `experiments/protattba_repro/`, on a GPU box rather than the dev machine — a Colab T4 for
-the earlier 45-configuration sweep, an EC2 g4dn.xlarge (also a T4) for `struct_film_chem` and
-the structural-injection sweep that found it, since Colab's session limits made the longer
-sweep impractical. The command:
+**To train the submitted model, `struct_film_chem_kendall`.** The neural runs are driven
+separately, from `experiments/protattba_repro/`, on a GPU box rather than the dev machine — a
+Colab T4 for the earlier 45-configuration sweep, EC2 g4dn.xlarge instances (also T4s) for
+`struct_film_chem` and everything after it, since Colab's session limits made the longer sweeps
+impractical. The command (identical architecture to `struct_film_chem` — same 50,497
+parameters — plus the `kendall_soft` ranking-loss addition selected in
+[docs/ARCHITECTURES.md §G.2](docs/ARCHITECTURES.md#g2-ten-ranking-methods-at-a-fixed-weight-and-a-re-measurement-that-mattered),
+`--rank-method kendall_soft --rank-weight 1.0`):
 
 ```bash
-python _perturb_v2_colab.py --exp struct_film_chem --arch sitetok \
+python _perturb_v2_colab.py --exp struct_film_chem_kendall --arch sitetok \
   --folds 0 1 2 3 4 --seeds 0 1 2 --wd 0.1 --grad-clip 10 --clip 4 --select-on per_complex \
-  --patience 15 \
+  --patience 15 --rank-method kendall_soft --rank-weight 1.0 \
   --overrides '{"pca_dim": 128, "proj": 64, "hidden": 128, "layers": 1, "dropout": 0.35, "input_noise": 0.0, "feature_dropout": 0.0, "chem_dim": 39, "split_proj": true, "n_heads": 2, "mut_pair_ffn": true, "mut_pair_op": "sub", "mut_pair_act": true, "mut_pair_struct_inject": "film_site"}'
 ```
 
-with `CHEM_TABLE=chem_perturb_v2` in the environment (the 39-column chem/geometry/zero-shot
-table; `scripts/build_perturb_features.py` builds it). It writes `out/struct_film_chem_results.
-csv` and per-row predictions, collected into `results/oof/struct_film_chem.csv`, then published
-into `reports/perturb_struct_film_chem/` via `python -m src.perturb.publish struct_film_chem
---name perturb_struct_film_chem --model perturb_v3` — the format every table and every
-error-analysis script in this repository reads. Re-running is safe: a configuration with five
-folds already on disk is skipped rather than retrained.
+with `CHEM_TABLE=chem_perturb_v2` and `PERTURB_ROOT=<path to the VM's data/cache directory>` in
+the environment (the 39-column chem/geometry/zero-shot table; `scripts/build_perturb_features.py`
+builds it). It writes `out/struct_film_chem_kendall_results.csv` and per-row predictions,
+collected into `results/oof/struct_film_chem_kendall.csv`, then published into
+`reports/perturb_struct_film_chem_kendall/` via `python -m src.perturb.publish
+struct_film_chem_kendall --name perturb_struct_film_chem_kendall --model perturb_v3` — the
+format every table and every error-analysis script in this repository reads. Re-running is
+safe: a configuration with five folds already on disk is skipped rather than retrained. Dropping
+`--rank-method`/`--rank-weight` trains the plain-MSE `struct_film_chem` predecessor instead
+(architecture-only ablations in this README and `docs/ARCHITECTURES.md` were measured against
+that variant, before the ranking-loss addition — see §G.2 for why both are worth keeping on
+disk).
+
+An **antigen/antibody-focused sweep** (11 variants: per-side identity embeddings, extra
+projection depth, antigen-row oversampling, and a per-side structure-PCA fix — see
+[docs/ARCHITECTURES.md §H](docs/ARCHITECTURES.md#h-the-antigenantibody-gap-an-11-variant-sweep))
+tried and failed to close the antigen/antibody performance gap (antibody ρ +0.629, antigen ρ
++0.252 on `struct_film_chem`); none is adopted into the submitted recipe above. A separate,
+verified **structure-input limitation** for the reverse-mutation augmentation (§I) was
+implemented, checked, and found to have no usable signal for the same reason: ProteinMPNN's
+per-residue representation is backbone-geometry-only, and FoldX's `BuildModel` (as run here)
+does not move the backbone between mutations of the same complex.
 
 `scripts/final_table.py` produces the results table above; it defaults `SUBMITTED` to
 `struct_film_chem`. `scripts/error_drivers.py`, which contributes to Part III of the error

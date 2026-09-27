@@ -9,7 +9,7 @@ must not see the test complexes.
 
     python _perturb_v2_colab.py --exp v2_full --folds 0 1 2 3 4 --seeds 0
 """
-import argparse, json, os, pickle, time
+import argparse, json, os, pickle, re, time
 from pathlib import Path
 
 import joblib
@@ -61,6 +61,17 @@ AA_INDEX = {a: i for i, a in enumerate(AA)}
 # ran on that, and validation Pearson barely tracked test Pearson (fold 2: val +0.245 ->
 # test +0.461; fold 1: val +0.641 -> test +0.266). 0.20 roughly doubles it.
 BATCH, LR, WD, PATIENCE, VAL_FRACTION = 32, 3e-4, 1e-2, 10, 0.20
+#: Weight on pairwise_rank_loss, added to the regression loss: MSE + RANK_WEIGHT * rank.
+#: 0 (default) is plain regression, matching every run before this option existed.
+RANK_WEIGHT = 0.0
+#: "none" keeps RANK_WEIGHT driving the original pairwise_rank_loss (unchanged, already
+#: verified against a weight=0 control). Any other value routes RANK_WEIGHT through
+#: rank_term(RANK_METHOD, ...) instead -- see rank_term's own docstring for the 10 methods.
+RANK_METHOD = "none"
+RANK_MARGIN = 0.5      # kcal/mol; pairs closer than this are dropped, see pairwise_rank_loss
+#: Weight on within_group_corr_loss, added the same way RANK_WEIGHT is. 0 (default) is off.
+CORR_WEIGHT = 0.0
+CORR_MIN_GROUP = 3
 #: Gradient-norm clip. It sat at 5.0 while the measured norm was 5.0-5.3, so about
 #: half of all steps were rescaled and half were not -- the most intermittent
 #: setting available, and the one where clipping distorts AdamW's m/sqrt(v) most.
@@ -71,6 +82,22 @@ GRAD_CLIP = 5.0
 #: Epochs over which the antibody-antigen share of a batch rises from 50% to
 #: 100%. 0 disables the curriculum and samples uniformly.
 CURRICULUM = 0
+#: Relative sampling weight for a training row whose mutation is on the antigen side (or
+#: both sides) against one on the antibody side alone -- 0 (default) samples uniformly, 2.0
+#: makes an antigen-side row twice as likely to be drawn per epoch as an antibody-side one.
+#: Motivated the same way CURRICULUM is (rebalancing which rows the gradient spends its time
+#: on), but for the antibody/antigen SCORE gap (pooled r +0.647 vs +0.236,
+#: struct_film_chem_kendall) rather than the antibody/general-PPI one. Derived from
+#: sites_ab/sites_ag directly (non-empty means that side has a mutated residue this row), not
+#: a stored mut_side column, matching PerturbSiteToken's own _mut_side_idx convention.
+OVERSAMPLE_AG = 0.0
+#: Reverse-mutation augmentation swaps wt/mt, so the true mutant plays the "reference"
+#: structure role for a swapped row -- but struct_ab/struct_ag has always been read from the
+#: per-COMPLEX wild-type-only cache regardless of swap, an unmodelled per-complex constant
+#: blind to which mutation occurred. When True, a swapped row instead reads a per-ROW cache
+#: built from that row's FoldX BuildModel mutant structure (extract_mutant_struct.py). Set
+#: from --mutant-struct.
+MUTANT_STRUCT = False
 #: Which training rows the fold-local PCA is FITTED on. "all" uses everything in the
 #: training folds; "abag" fits on the antibody-antigen rows alone and then applies that
 #: basis to every row.
@@ -131,6 +158,11 @@ def blosum62():
         for j, b in enumerate(AA):
             out[i, j] = m[a, b]
     return out / 4.0
+
+
+def row_safe_name(row_id: str) -> str:
+    """Matches extract_mutant_struct.py's / foldx_repair_build_sharded.py's own sanitizing."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", row_id)
 
 
 class Cache:
@@ -203,6 +235,16 @@ class Cache:
             self._mpnn[key] = (z["h_ab"].astype(np.float32), z["h_ag"].astype(np.float32))
         return self._mpnn[key]
 
+    def mpnn_mutant(self, row_id):
+        """The per-ROW cache from that row's own FoldX mutant structure (see MUTANT_STRUCT)."""
+        if not hasattr(self, "_mpnn_mut"):
+            self._mpnn_mut = {}
+        if row_id not in self._mpnn_mut:
+            z = np.load(ROOT / "mpnn_per_residue_mutant" / f"{row_safe_name(row_id)}.npz",
+                       allow_pickle=False)
+            self._mpnn_mut[row_id] = (z["h_ab"].astype(np.float32), z["h_ag"].astype(np.float32))
+        return self._mpnn_mut[row_id]
+
     def crop(self, row_id):
         g = lambda f: self.crops[f"{row_id}|{f}"]
         return dict(ab_idx=g("ab_idx"), ag_idx=g("ag_idx"), ab_chain=g("ab_chain"),
@@ -238,6 +280,13 @@ def fold_pca(rows, fold, cache, dim, seed=0):
     honest default even for ESM -- antibody variable domains and antigens are different
     distributions, and one basis over both spends its components on telling them apart.
 
+    The structure side used to share ONE PCA fit across ab and ag (pooling both sides' tokens
+    into a single basis) -- an inconsistency with the sequence side's own reasoning above, and
+    one plausible contributor to the antigen/antibody performance gap: an antigen-only basis
+    spends all `dim` components resolving antigen structural diversity, instead of splitting
+    that budget with antibody paratopes it doesn't need to distinguish. Fit separately, same as
+    sequence.
+
     The cache file name carries the encoder, so switching encoders cannot silently reuse a
     basis fitted for the other one.
     """
@@ -250,13 +299,15 @@ def fold_pca(rows, fold, cache, dim, seed=0):
         w_st = cache.mpnn(r0.complex_key)[0].shape[1]
         print(f"  fold {fold}: NO PCA -- raw widths ab {w_ab}, ag {w_ag}, struct {w_st}",
               flush=True)
-        return Identity(w_ab), Identity(w_ag), Identity(w_st)
+        return Identity(w_ab), Identity(w_ag), Identity(w_st), Identity(w_st)
     PCA_DIR.mkdir(parents=True, exist_ok=True)
     # STRUCT_DIR in the key: a cached fit from ProteinMPNN's 128-d features is invalid for
     # ESM-IF1's 512-d ones, and sklearn's error for that (n_features mismatch) fires at
-    # transform time deep in training, not here where the mistake actually is
+    # transform time deep in training, not here where the mistake actually is.
+    # "_sepstruct" in the key: bumps the cache format so old pooled-struct-PCA fits (a 3-tuple)
+    # are never silently loaded and unpacked into this function's new 4-tuple.
     struct_tag = os.environ.get("STRUCT_DIR", "mpnn_per_residue")
-    f = PCA_DIR / f"fold{fold}_pca{dim}_{SEQ_AB}_{PCA_ROWS}_{struct_tag}.joblib"
+    f = PCA_DIR / f"fold{fold}_pca{dim}_{SEQ_AB}_{PCA_ROWS}_{struct_tag}_sepstruct.joblib"
     if f.exists():
         return joblib.load(f)
     from sklearn.decomposition import PCA
@@ -266,7 +317,7 @@ def fold_pca(rows, fold, cache, dim, seed=0):
         print(f"  fold {fold}: PCA fitted on the {len(tr)} AB/AG training rows only",
               flush=True)
     rng = np.random.default_rng(seed)
-    per_side, str_rows = {"ab": [], "ag": []}, []
+    per_side, str_rows = {"ab": [], "ag": []}, {"ab": [], "ag": []}
     for r in tr.itertuples():
         c = cache.crop(r.row_id)
         for side, col in (("ab", r.ab_wt), ("ag", r.ag_wt)):
@@ -277,10 +328,11 @@ def fold_pca(rows, fold, cache, dim, seed=0):
                 per_side[side].append(
                     t[take][rng.choice(len(take), min(len(take), 24), replace=False)])
         h_ab, h_ag = cache.mpnn(r.complex_key)
-        for h, idx in ((h_ab, c["ab_idx"]), (h_ag, c["ag_idx"])):
+        for side, h, idx in (("ab", h_ab, c["ab_idx"]), ("ag", h_ag, c["ag_idx"])):
             take = idx[idx < len(h)]
             if len(take):
-                str_rows.append(h[take][rng.choice(len(take), min(len(take), 24), replace=False)])
+                str_rows[side].append(
+                    h[take][rng.choice(len(take), min(len(take), 24), replace=False)])
 
     fits = {}
     for side in ("ab", "ag"):
@@ -288,11 +340,13 @@ def fold_pca(rows, fold, cache, dim, seed=0):
         fits[side] = PCA(n_components=min(dim, X.shape[1]), random_state=seed).fit(X)
         print(f"  fold {fold}: PCA seq[{side}] {X.shape} -> {fits[side].n_components_} "
               f"({fits[side].explained_variance_ratio_.sum():.0%})", flush=True)
-    Xt = np.concatenate(str_rows)
-    p_str = PCA(n_components=min(dim, Xt.shape[1]), random_state=seed).fit(Xt)
-    print(f"  fold {fold}: PCA struct {Xt.shape} -> {p_str.n_components_} "
-          f"({p_str.explained_variance_ratio_.sum():.0%})", flush=True)
-    out = (fits["ab"], fits["ag"], p_str)
+    str_fits = {}
+    for side in ("ab", "ag"):
+        Xt = np.concatenate(str_rows[side])
+        str_fits[side] = PCA(n_components=min(dim, Xt.shape[1]), random_state=seed).fit(Xt)
+        print(f"  fold {fold}: PCA struct[{side}] {Xt.shape} -> {str_fits[side].n_components_} "
+              f"({str_fits[side].explained_variance_ratio_.sum():.0%})", flush=True)
+    out = (fits["ab"], fits["ag"], str_fits["ab"], str_fits["ag"])
     joblib.dump(out, f)
     return out
 
@@ -301,7 +355,7 @@ class DS(Dataset):
     def __init__(self, frame, pcas, cache, cfg, augment, seed, memo=None, chem=None,
                  chem_rev=None):
         self.f = frame.reset_index(drop=True)
-        self.p_ab, self.p_ag, self.p_str = pcas
+        self.p_ab, self.p_ag, self.p_str_ab, self.p_str_ag = pcas
         self.c, self.cfg = cache, cfg
         self.augment, self.rng = augment, np.random.default_rng(seed)
         self.bl = blosum62()
@@ -338,11 +392,19 @@ class DS(Dataset):
         s_ag_wt = self.seq_at(ag_wt, c["ag_idx"], "ag")
         s_ag_mt = self.seq_at(ag_mt, c["ag_idx"], "ag")
 
-        h_ab, h_ag = self.c.mpnn(r.complex_key)
-        key = (r.complex_key, "str")
+        # MUTANT_STRUCT: a swapped (reverse-augmented) row's reference structure should be the
+        # true mutant's, not the wild-type complex's -- reusing the wild-type complex for every
+        # mutation of it is a per-complex constant blind to which mutation occurred. Keyed by
+        # row_id (not complex_key): unlike the wild-type cache, this genuinely differs per row.
+        if swap and MUTANT_STRUCT:
+            h_ab, h_ag = self.c.mpnn_mutant(r.row_id)
+            key = (r.row_id, "str_mut")
+        else:
+            h_ab, h_ag = self.c.mpnn(r.complex_key)
+            key = (r.complex_key, "str")
         if key not in self.memo:
-            self.memo[key] = (self.p_str.transform(h_ab).astype(np.float32),
-                              self.p_str.transform(h_ag).astype(np.float32))
+            self.memo[key] = (self.p_str_ab.transform(h_ab).astype(np.float32),
+                              self.p_str_ag.transform(h_ag).astype(np.float32))
         p_ab, p_ag = self.memo[key]
         t_ab = p_ab[np.clip(c["ab_idx"], 0, len(p_ab) - 1)]
         t_ag = p_ag[np.clip(c["ag_idx"], 0, len(p_ag) - 1)]
@@ -366,6 +428,19 @@ class DS(Dataset):
         src = self.chem_rev if (swap and self.chem_rev is not None) else self.chem
         chem = (src.loc[r.row_id].values.astype(np.float32)
                 if src is not None else np.zeros(0, np.float32))
+        # Censored-affinity recovery (README "censored rows"): mut_is_bound means the row's own
+        # `y` is a LOWER bound on the true ddG (only penalise predicting BELOW it); wt_is_bound
+        # means an UPPER bound (only penalise predicting ABOVE it). Absent for ordinary rows --
+        # getattr keeps this backward compatible with any perturb_rows.parquet built before this
+        # existed. Swapping wt/mt for the reverse-mutation augmentation swaps WHICH bound applies
+        # (the same treatment as the chem block's own SWAP columns): the mutation whose affinity
+        # was too weak to measure is now playing the "wt" role, not the "mut" role, but which
+        # DIRECTION the surviving y bounds the truth in is unchanged by relabelling roles, so no
+        # sign logic is needed here beyond the swap itself.
+        mut_is_bound = bool(getattr(r, "mut_is_bound", False))
+        wt_is_bound = bool(getattr(r, "wt_is_bound", False))
+        if swap:
+            mut_is_bound, wt_is_bound = wt_is_bound, mut_is_bound
         return dict(chem=chem,
                     seq_ab_wt=s_ab_wt, seq_ab_mt=s_ab_mt, seq_ag_wt=s_ag_wt, seq_ag_mt=s_ag_mt,
                     struct_ab=t_ab, struct_ag=t_ag,
@@ -375,7 +450,8 @@ class DS(Dataset):
                     chain_ab=c["ab_chain"].astype(np.int64),
                     chain_ag=c["ag_chain"].astype(np.int64),
                     res_ab=c["ab_res"].astype(np.int64), res_ag=c["ag_res"].astype(np.int64),
-                    dist=c["dist"], y=np.float32(y), row_id=r.row_id)
+                    dist=c["dist"], y=np.float32(y), row_id=r.row_id,
+                    mut_is_bound=mut_is_bound, wt_is_bound=wt_is_bound)
 
 
 def collate(items):
@@ -412,6 +488,8 @@ def collate(items):
         out["chem"] = torch.from_numpy(np.stack([x["chem"] for x in items]))
     out["y"] = torch.tensor([x["y"] for x in items])
     out["row_id"] = [x["row_id"] for x in items]
+    out["mut_is_bound"] = torch.tensor([x["mut_is_bound"] for x in items])
+    out["wt_is_bound"] = torch.tensor([x["wt_is_bound"] for x in items])
     return out
 
 
@@ -494,6 +572,231 @@ def pear(a, b):
     return float(np.corrcoef(a, b)[0, 1])
 
 
+def pairwise_rank_loss(pred, y, groups, margin_sd=0.5):
+    """Within-complex pairwise logistic loss (AbRank-style; ported from
+    src/fusion_v2.py::pairwise_rank_loss, which this project measured once already --
+    JUSTIFICATIONS.md sA1b -- and rejected as a training objective on the pre-correction
+    997-row set with an older backbone. Only pairs inside a complex are compared, which is
+    what per-complex Pearson measures; pairs closer than margin_sd kcal/mol are dropped,
+    since measurement noise is around 0.5 and their ordering is close to random.
+    """
+    total, n = pred.new_zeros(()), 0
+    for gid in torch.unique(groups):
+        m = groups == gid
+        if m.sum() < 2:
+            continue
+        p, t = pred[m], y[m]
+        dp = p.unsqueeze(0) - p.unsqueeze(1)
+        dt = t.unsqueeze(0) - t.unsqueeze(1)
+        keep = dt.abs() > margin_sd
+        if not keep.any():
+            continue
+        total = total + torch.nn.functional.softplus(-torch.sign(dt[keep]) * dp[keep]).sum()
+        n += int(keep.sum())
+    if n == 0:
+        return pred.sum() * 0.0        # keeps the graph attached; see fusion_v2's own note
+    return total / n
+
+
+def within_group_corr_loss(pred, y, groups, min_group=3):
+    """1 - Pearson correlation, computed WITHIN each group and averaged, rather than
+    pairwise_rank_loss's pairwise logistic term -- a direct differentiable surrogate for the
+    per-complex correlation this project reports as its headline metric, instead of a
+    ranking-margin objective. `groups` is deliberately generic: the ideal grouping is the
+    17 homology CLUSTERS (data/cluster_folds.csv's own source), not the 53 complexes, since a
+    cluster is the unit that actually shares structural similarity and a correlation the model
+    can already exploit within one complex says less about generalisation than one that holds
+    across a whole cluster. Building the raw cluster id needs SKEMPI2_PDBs.tgz (sequence
+    identity for clustering), which is not present in this environment -- callers pass
+    complex-level groups (group_ids) here instead, same grouping pairwise_rank_loss uses.
+    Like the rank loss, this constrains shape/order only, never scale: added to the regression
+    loss, never used alone.
+    """
+    total, n = pred.new_zeros(()), 0
+    for gid in torch.unique(groups):
+        m = groups == gid
+        if int(m.sum()) < min_group:
+            continue
+        p, t = pred[m], y[m]
+        pc, tc = p - p.mean(), t - t.mean()
+        denom = pc.norm() * tc.norm()
+        if denom < 1e-6:
+            continue
+        total = total + (1.0 - (pc * tc).sum() / denom)
+        n += 1
+    if n == 0:
+        return pred.sum() * 0.0
+    return total / n
+
+
+#: The 5 relation bins classification-style ranking methods discretise dt = t_i - t_j into.
+#: "<<"/"<"/"="/">"/">>" at +-0.5 and +-1.5 kcal/mol -- 0.5 matches pairwise_rank_loss's own
+#: noise-floor margin, 1.5 is roughly the label's own sd (1.79), so "large" means a gap
+#: comparable to the spread of ddG itself, not an arbitrary round number.
+RANK_EDGES = (-1.5, -0.5, 0.5, 1.5)
+
+
+def _pairs(pred, y, gid_mask):
+    p, t = pred[gid_mask], y[gid_mask]
+    return p.unsqueeze(0) - p.unsqueeze(1), t.unsqueeze(0) - t.unsqueeze(1)
+
+
+def rank_term(method, pred, y, groups, weight_by_severity=False):
+    """Dispatch across 10 within-group ranking methods, all pure functions of
+    (pred, y, groups) -- no extra learned parameters, so every one drops into the training
+    loop the same way pairwise_rank_loss and within_group_corr_loss already do: added to the
+    regression loss, weighted by --rank-weight, never replacing it. `method` selects one of:
+
+    binary        pairwise_rank_loss itself (AbRank-style logistic), the existing baseline.
+    hinge         the same pairs, a HINGE margin (max(0, 0.5 - sign(dt)*dp)) instead of the
+                  softplus logistic -- a different loss SHAPE, same pair selection.
+    severity      binary's logistic loss, weighted by |dt| so large true gaps count for more
+                  than barely-significant ones -- emphasises getting the big calls right.
+    equal_attract binary's loss on the ORDERED pairs (|dt| > 0.5), PLUS an attraction term on
+                  the "=" pairs (|dt| <= 0.5) that penalises |dp| directly -- the only method
+                  that gives the "=" bin its own loss term rather than just excluding it.
+    kendall_soft  tanh(dp / margin) * sign(dt), averaged and negated -- a smooth concordance
+                  measure (soft Kendall-tau-b) rather than a logistic surrogate.
+    class5_ord    the classification-labels-as-ranking-metric method: dt binned into 5 ordinal
+                  classes at RANK_EDGES, BCE on 4 cumulative thresholds applied directly to dp
+                  (same cumulative-threshold construction model_simple.py's own ordinal head
+                  uses, just for a PAIR's relation instead of one row's class).
+    class5_ce     the same 5 bins, but a parameter-free RBF-style softmax over 5 fixed
+                  prototype centres (-2,-1,0,1,2) compared to dp, cross-entropy against the
+                  true bin -- a genuinely different classifier shape than class5_ord's ordinal
+                  one, both answering "does the classification label predict the ranking".
+    spearman_soft 1 - a soft-rank Spearman correlation within each group (soft-argsort via a
+                  temperature-scaled pairwise sigmoid), rather than within_group_corr_loss's
+                  Pearson -- robust to the outlier ddG values Pearson is not.
+    listmle       ListMLE: negative log-likelihood of the group's true descending order under
+                  a Plackett-Luce model built from predicted scores -- listwise, not pairwise.
+    triplet       per group: the most-stabilising and most-destabilising row as a fixed pair,
+                  every other row the third point of a margin triplet against whichever of the
+                  two it is truly closer to -- a listwise-via-triplets compromise between
+                  pairwise cost and ListMLE's full permutation.
+    """
+    total, n = pred.new_zeros(()), 0
+    for gid in torch.unique(groups):
+        m = groups == gid
+        gn = int(m.sum())
+        if gn < 2:
+            continue
+        p, t = pred[m], y[m]
+
+        if method in ("binary", "hinge", "severity", "equal_attract", "kendall_soft",
+                     "class5_ord", "class5_ce"):
+            dp, dt = _pairs(pred, y, m)
+            iu = torch.triu_indices(gn, gn, offset=1, device=pred.device)
+            dp, dt = dp[iu[0], iu[1]], dt[iu[0], iu[1]]
+            if dp.numel() == 0:
+                continue
+            ordered = dt.abs() > 0.5
+
+            if method == "binary":
+                if not ordered.any():
+                    continue
+                term = torch.nn.functional.softplus(-torch.sign(dt[ordered]) * dp[ordered])
+                total = total + term.sum(); n += int(ordered.sum())
+
+            elif method == "hinge":
+                if not ordered.any():
+                    continue
+                term = (0.5 - torch.sign(dt[ordered]) * dp[ordered]).clamp(min=0)
+                total = total + term.sum(); n += int(ordered.sum())
+
+            elif method == "severity":
+                if not ordered.any():
+                    continue
+                term = (torch.nn.functional.softplus(-torch.sign(dt[ordered]) * dp[ordered])
+                        * dt[ordered].abs())
+                total = total + term.sum(); n += int(ordered.sum())
+
+            elif method == "equal_attract":
+                parts = []
+                if ordered.any():
+                    parts.append(torch.nn.functional.softplus(
+                        -torch.sign(dt[ordered]) * dp[ordered]))
+                eq = ~ordered
+                if eq.any():
+                    parts.append(dp[eq].abs())
+                if not parts:
+                    continue
+                term = torch.cat(parts)
+                total = total + term.sum(); n += int(term.numel())
+
+            elif method == "kendall_soft":
+                if not ordered.any():
+                    continue
+                term = 1.0 - torch.tanh(dp[ordered] / 0.5) * torch.sign(dt[ordered])
+                total = total + term.sum(); n += int(ordered.sum())
+
+            elif method == "class5_ord":
+                edges = torch.tensor(RANK_EDGES, device=pred.device)
+                targets = (dt.unsqueeze(-1) > edges).float()          # (P, 4) cumulative
+                logits = dp.unsqueeze(-1) - edges
+                term = torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits, targets, reduction="none").sum(-1)
+                total = total + term.sum(); n += int(term.numel())
+
+            elif method == "class5_ce":
+                centres = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], device=pred.device)
+                bins = torch.bucketize(dt, torch.tensor(RANK_EDGES, device=pred.device))
+                logits = -((dp.unsqueeze(-1) - centres) ** 2) / 2.0    # (P, 5) RBF logits
+                term = torch.nn.functional.cross_entropy(logits, bins, reduction="none")
+                total = total + term.sum(); n += int(term.numel())
+
+        elif method == "spearman_soft":
+            # soft rank: rank(x)_i ~= sum_j sigmoid((x_i - x_j) / tau) -- a smooth stand-in for
+            # argsort's hard rank, differentiable everywhere.
+            tau = 0.1
+            rp = torch.sigmoid((p.unsqueeze(0) - p.unsqueeze(1)) / tau).sum(-1)
+            rt = torch.sigmoid((t.unsqueeze(0) - t.unsqueeze(1)) / tau).sum(-1)
+            rpc, rtc = rp - rp.mean(), rt - rt.mean()
+            denom = rpc.norm() * rtc.norm()
+            if denom < 1e-6:
+                continue
+            total = total + (1.0 - (rpc * rtc).sum() / denom); n += 1
+
+        elif method == "listmle":
+            order = torch.argsort(t, descending=True)
+            p_ord = p[order]
+            # log-sum-exp of the suffix, subtracted running-max for stability -- standard
+            # ListMLE: -sum_i [ s_i - logsumexp(s_i, s_{i+1}, ..., s_last) ]
+            rev = torch.flip(p_ord, dims=[0])
+            lse_rev = torch.logcumsumexp(rev, dim=0)
+            lse = torch.flip(lse_rev, dims=[0])
+            total = total + (lse - p_ord).sum(); n += gn
+
+        elif method == "triplet":
+            # The group's two true extremes anchor a hinge margin against every other row:
+            # p_max should exceed p_i, and p_i should exceed p_min, by >= 0.5 each -- the
+            # true order max > i > min is known for free (i is neither extreme), so this
+            # is two clean hinge terms per middle row rather than a same/other-side branch.
+            i_max, i_min = int(torch.argmax(t)), int(torch.argmin(t))
+            if i_max == i_min:
+                continue
+            p_max, p_min = p[i_max], p[i_min]
+            for i in range(gn):
+                if i in (i_max, i_min):
+                    continue
+                total = total + (0.5 - (p_max - p[i])).clamp(min=0)
+                total = total + (0.5 - (p[i] - p_min)).clamp(min=0)
+                n += 2
+        else:
+            raise ValueError(f"unknown rank method: {method!r}")
+
+    if n == 0:
+        return pred.sum() * 0.0
+    return total / n
+
+
+def group_ids(row_ids: list[str]) -> torch.Tensor:
+    """Integer complex-id per row, for pairwise_rank_loss's `groups` argument."""
+    keys = [r.rsplit("|", 1)[0] for r in row_ids]
+    uniq = {k: i for i, k in enumerate(sorted(set(keys)))}
+    return torch.tensor([uniq[k] for k in keys], dtype=torch.long)
+
+
 def history(exp, row):
     p = OUT / f"perturb_{exp}" / "history.csv"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -522,10 +825,18 @@ def sweep_row(exp, note, params=None):
 
 
 def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True,
-             select_on="per_complex", make_model=PerturbV2):
+             select_on="per_complex", make_model=PerturbV2, init_ckpt=None,
+             save_ckpt=None, val_restrict_abag=True):
     torch.manual_seed(seed); np.random.seed(seed)
     pcas = fold_pca(rows, fold, cache, cfg.pca_dim, seed=0)
-    test = rows[rows.fold == fold]
+    # Censored rows (recovered SKEMPI ">"/"<" affinities, README "censored rows") carry a
+    # BOUND, not a point label -- they train fine under the one-sided loss above, but must
+    # never be scored: per-complex Pearson against a label that is not the true value would be
+    # measuring against the wrong number. Excluded from every scored split (test AND the
+    # early-stopping val), kept only in `train`, where the one-sided loss reads it correctly.
+    is_censored = (rows.get("mut_is_bound", False) | rows.get("wt_is_bound", False)) \
+        if "mut_is_bound" in rows.columns else pd.Series(False, index=rows.index)
+    test = rows[(rows.fold == fold) & ~is_censored]
     tr_all = rows[rows.fold != fold]
     # Hold out complexes until the ROW target is met, not a fixed count of complexes.
     # Complexes run from 2 to 87 rows, so taking 20% of them took 311 of 752 rows on the
@@ -539,20 +850,32 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
     # 92% protein-protein: the reported per-complex score would describe a different
     # population, and -- the part that actually breaks the run -- early stopping would pick
     # the checkpoint that is best on protein-protein complexes and then test it on
-    # antibodies. Candidates are restricted to AB/AG whenever the corpus has any.
-    cand = tr_all[tr_all.is_abag] if "is_abag" in tr_all.columns else tr_all
+    # antibodies. Candidates are restricted to AB/AG whenever the corpus has any -- unless
+    # val_restrict_abag is False, which a full-SKEMPI PRETRAIN stage sets on purpose: there
+    # the "test" population for THIS run is a checkpoint, not a metric, so validation should
+    # represent the general protein-protein task the pretrain is actually fit to.
+    cand = (tr_all[tr_all.is_abag]
+            if val_restrict_abag and "is_abag" in tr_all.columns else tr_all)
     if len(cand) and cand.complex_key.nunique() > 1:
         sizes = cand.complex_key.value_counts()
         cx = list(sizes.index)
         rng_v = np.random.default_rng(seed)
         rng_v.shuffle(cx)
-    target, taken, val_cx = VAL_FRACTION * len(cand), 0, set()
+    # A general-val pretrain's candidate pool is the whole non-held-out corpus (~5,560
+    # rows), ~7x the AB/AG-restricted pool (~750) -- at the same VAL_FRACTION that is a
+    # ~1,100-row validation set instead of ~150, and every epoch pays for scoring it.
+    # Capped to the AB/AG-restricted pool's usual size so a general-val run costs the same
+    # per epoch as every other run in this project, not so it can see less of the corpus --
+    # it still trains on all of it; only the validation-carving budget is capped.
+    GENERAL_VAL_CAP = 750
+    denom = len(cand) if val_restrict_abag else min(len(cand), GENERAL_VAL_CAP)
+    target, taken, val_cx = VAL_FRACTION * denom, 0, set()
     for c in cx:
         if taken >= target or len(val_cx) >= len(cx) - 1:
             break
         val_cx.add(c); taken += int(sizes[c])
     train = tr_all[~tr_all.complex_key.isin(val_cx)]
-    val = tr_all[tr_all.complex_key.isin(val_cx)]
+    val = tr_all[tr_all.complex_key.isin(val_cx) & ~is_censored.loc[tr_all.index]]
 
     memo = {}                                  # one PCA cache shared by all three splits
     chem = chem_rev = None
@@ -628,6 +951,16 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
         every row stays reachable at every epoch and only its probability changes.
         """
         if CURRICULUM <= 0:
+            if OVERSAMPLE_AG > 0:
+                # Same WeightedRandomSampler mechanism as the curriculum above, but static
+                # across epochs (the antigen/antibody imbalance is not something to anneal
+                # away from, unlike the AB/AG-vs-general-PPI one CURRICULUM handles).
+                has_ag = (frame["sites_ag"].astype(str) != "").to_numpy()
+                w = np.where(has_ag, OVERSAMPLE_AG, 1.0)
+                sampler = torch.utils.data.WeightedRandomSampler(
+                    torch.as_tensor(w, dtype=torch.double), num_samples=len(frame),
+                    replacement=True)
+                return mk(frame, True, sampler)
             return mk(frame, True)
         p = min(1.0, 0.5 + 0.5 * epoch / max(CURRICULUM, 1))
         is_ab = frame["is_abag"].to_numpy() if "is_abag" in frame.columns             else np.ones(len(frame), bool)
@@ -651,6 +984,22 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
               f"struct {cfg.in_str} -> {cfg.in_str // cfg.group_reduce * cfg.group_out}",
               flush=True)
     model = make_model(cfg).to(device)
+    if init_ckpt:
+        # Transfer from a full-SKEMPI pretrain checkpoint. Loaded by NAME AND SHAPE, not
+        # strict: the pretrain config has chem_dim=0 (full-SKEMPI's cache only has the 21
+        # base chem columns, not the AB/AG-specific 33/39-col enriched table), so the head's
+        # first Linear -- the only layer chem touches, since chem is concatenated onto the
+        # FiLM output right before the head -- has a different input width here than in the
+        # checkpoint and is left randomly initialised. Every other tensor (the sequence and
+        # structure FiLM backbone, chem-agnostic by construction) transfers exactly.
+        ckpt = torch.load(init_ckpt, map_location=device)
+        own = model.state_dict()
+        matched = {k: v for k, v in ckpt.items() if k in own and own[k].shape == v.shape}
+        fresh = [k for k in own if k not in matched]
+        model.load_state_dict(matched, strict=False)
+        print(f"  fold {fold} seed {seed}: init from {init_ckpt} -- "
+              f"{len(matched)}/{len(own)} tensors transferred, "
+              f"{len(fresh)} fresh: {fresh}", flush=True)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)  # WD/LR set from argv
     if getattr(cfg, "ordinal", 0):
@@ -678,7 +1027,39 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
         gstat = {}
         for b in tr:
             x = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
-            loss = lf(model(x), b["y"].to(device))
+            y_dev = b["y"].to(device)
+            z = model(x)
+            if getattr(cfg, "ordinal", 0):
+                loss = lf(z, y_dev)
+            else:
+                # Censored-affinity recovery: mut_is_bound/wt_is_bound are False for every row
+                # of the original 940-row table (DS.__getitem__'s getattr default), so this is
+                # torch.nn.MSELoss()'s own mean-of-squared-error exactly whenever neither flag
+                # is ever set -- the one-sided clamp only changes anything for rows recovered
+                # from SKEMPI's censored (">"/"<") affinities, where the label is a bound, not
+                # a point value, and squared-erroring against it as if it were exact teaches
+                # the model a number nobody measured (README, "censored rows").
+                err = z - y_dev
+                sq = err.pow(2)
+                mut_bound = b["mut_is_bound"].to(device)
+                wt_bound = b["wt_is_bound"].to(device)
+                sq = torch.where(mut_bound, err.clamp(max=0.0).pow(2), sq)   # y is a LOWER bound
+                sq = torch.where(wt_bound, err.clamp(min=0.0).pow(2), sq)    # y is an UPPER bound
+                loss = sq.mean()
+            if RANK_WEIGHT > 0:
+                # MSE (or the ordinal loss) is the only anchor on output SCALE; the rank
+                # term constrains order only, so it is ADDED to the regression loss, never
+                # used alone -- pure ranking was measured (JUSTIFICATIONS.md sA1b) to let the
+                # model drift anywhere order-preserving, RMSE 4.20 against ~1.5.
+                groups = group_ids(b["row_id"]).to(device)
+                if RANK_METHOD == "none":
+                    loss = loss + RANK_WEIGHT * pairwise_rank_loss(z, y_dev, groups, RANK_MARGIN)
+                else:
+                    loss = loss + RANK_WEIGHT * rank_term(RANK_METHOD, z, y_dev, groups)
+            if CORR_WEIGHT > 0:
+                groups = group_ids(b["row_id"]).to(device)
+                loss = loss + CORR_WEIGHT * within_group_corr_loss(z, y_dev, groups,
+                                                                    CORR_MIN_GROUP)
             opt.zero_grad(); loss.backward()
             for gk, gv in grad_report(model, GRAD_CLIP).items():
                 gstat[gk] = gstat.get(gk, 0.0) + gv
@@ -728,6 +1109,10 @@ def run_fold(rows, fold, seed, cfg, cache, exp, device, max_epochs, augment=True
                 break
     if state:
         model.load_state_dict(state)
+    if save_ckpt:
+        Path(save_ckpt).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), save_ckpt)
+        print(f"  fold {fold} seed {seed}: saved checkpoint to {save_ckpt}", flush=True)
     model.eval(); ids, yp, yt = [], [], []
     with torch.no_grad():
         for b in te:
@@ -766,6 +1151,13 @@ def main():
                     help="fit the fold-local PCA on all training rows, or AB/AG only")
     ap.add_argument("--curriculum", type=int, default=0,
                     help="epochs to anneal the AB/AG batch share 50%% -> 100%%")
+    ap.add_argument("--oversample-ag", type=float, default=0.0,
+                    help="relative sampling weight for antigen-side training rows against "
+                         "antibody-side ones; 0 (default) samples uniformly")
+    ap.add_argument("--mutant-struct", action="store_true",
+                    help="reverse-augmented rows read structure from the FoldX mutant "
+                         "structure (mpnn_per_residue_mutant/) instead of the wild-type "
+                         "per-complex cache")
     ap.add_argument("--chem-scale", default="fold", choices=["fold", "cluster"],
                     help="standardise the chem block globally or within homology cluster")
     ap.add_argument("--clusters", default=None,
@@ -776,6 +1168,37 @@ def main():
                     help="AdamW weight decay; the ladder has always used 1e-2")
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--patience", type=int, default=None)
+    ap.add_argument("--init-ckpt-dir", default=None,
+                    help="load f{fold}_s{seed}.pt from this dir before training each fold "
+                         "-- a pretrain->finetune transfer. Config must match exactly.")
+    ap.add_argument("--save-ckpt-dir", default=None,
+                    help="save f{fold}_s{seed}.pt to this dir after each fold's early "
+                         "stopping -- pairs with a later --init-ckpt-dir run elsewhere.")
+    ap.add_argument("--general-val", action="store_true",
+                    help="do not restrict early-stopping validation to is_abag rows -- for "
+                         "a full-SKEMPI pretrain stage, where the point is the general task")
+    ap.add_argument("--rank-weight", type=float, default=0.0,
+                    help="weight on an AbRank-style within-complex pairwise rank loss, "
+                         "ADDED to the regression loss (never replacing it -- rank alone has "
+                         "no anchor on output scale). 0 (default) is plain regression.")
+    ap.add_argument("--rank-margin", type=float, default=0.5,
+                    help="kcal/mol; pairs closer than this in true ddG are dropped from the "
+                         "rank loss, since measurement noise is ~0.5 and their order is close "
+                         "to random")
+    ap.add_argument("--corr-weight", type=float, default=0.0,
+                    help="weight on a within-group (1 - Pearson correlation) loss, ADDED to "
+                         "the regression loss like --rank-weight. Grouped by COMPLEX -- the "
+                         "ideal grouping is the homology CLUSTER, but that needs "
+                         "SKEMPI2_PDBs.tgz to build, not present in this environment.")
+    ap.add_argument("--corr-min-group", type=int, default=3,
+                    help="a group scores 0 correlation terms below this size within a batch")
+    ap.add_argument("--rank-method", default="none",
+                    choices=["none", "binary", "hinge", "severity", "equal_attract",
+                            "kendall_soft", "class5_ord", "class5_ce", "spearman_soft",
+                            "listmle", "triplet"],
+                    help="which of rank_term's 10 within-group ranking methods --rank-weight "
+                         "drives; 'none' keeps --rank-weight on the original "
+                         "pairwise_rank_loss unchanged")
     ap.add_argument("--clip", type=float, default=4.0,
                     help="clip |ddG| to this, in training and in scoring; 0 disables")
     a = ap.parse_args()
@@ -830,6 +1253,13 @@ def main():
         print(f"clipped |ddG| to {a.clip}: {n} of {len(rows)} rows "
               f"({100 * n / len(rows):.1f}%)", flush=True)
     global LR, WD, PATIENCE, GRAD_CLIP, CHEM_SCALE, CLUSTER_OF, CURRICULUM, PCA_ROWS
+    global OVERSAMPLE_AG, MUTANT_STRUCT
+    global RANK_WEIGHT, RANK_MARGIN, CORR_WEIGHT, CORR_MIN_GROUP, RANK_METHOD
+    RANK_WEIGHT = a.rank_weight
+    RANK_MARGIN = a.rank_margin
+    CORR_WEIGHT = a.corr_weight
+    CORR_MIN_GROUP = a.corr_min_group
+    RANK_METHOD = a.rank_method
     if a.wd is not None:
         WD = a.wd
     if a.lr is not None:
@@ -846,6 +1276,8 @@ def main():
         CLUSTER_OF = cl.set_index("row_id")["cluster"]
         print(f"  clusters: {CLUSTER_OF.nunique()} over {len(CLUSTER_OF)} rows", flush=True)
     CURRICULUM = a.curriculum
+    OVERSAMPLE_AG = a.oversample_ag
+    MUTANT_STRUCT = a.mutant_struct
     PCA_ROWS = a.pca_rows
     print(f"  optim: lr {LR}, weight_decay {WD}, patience {PATIENCE}, "
           f"grad_clip {GRAD_CLIP}", flush=True)
@@ -879,9 +1311,15 @@ def main():
         for seed in a.seeds:
             if (fold, seed) in done:
                 print(f"  fold {fold} seed {seed}: reused", flush=True); continue
+            init_ckpt = (str(Path(a.init_ckpt_dir) / f"f{fold}_s{seed}.pt")
+                        if a.init_ckpt_dir else None)
+            save_ckpt = (str(Path(a.save_ckpt_dir) / f"f{fold}_s{seed}.pt")
+                        if a.save_ckpt_dir else None)
             ids, yt, yp, eps, mins, npar = run_fold(rows, fold, seed, cfg, cache, a.exp,
                                                     device, a.max_epochs, augment,
-                                                    a.select_on, model_cls)
+                                                    a.select_on, model_cls,
+                                                    init_ckpt=init_ckpt, save_ckpt=save_ckpt,
+                                                    val_restrict_abag=not a.general_val)
             recs.append(dict(exp=a.exp, split="frozen5", fold=fold, seed=seed,
                              n_train=int((rows.fold != fold).sum()), n_test=len(ids),
                              pearson=pear(yp, yt),

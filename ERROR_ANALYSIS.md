@@ -1275,3 +1275,91 @@ seconds, and still degrades least under the homology split. Part IV does not ove
 conclusion that architecture was never the binding constraint. It says the forest's win is
 narrower than it looks, concentrated in alanine scanning, and absent exactly where antibody
 engineering needs a model most.
+
+# Part V — the training objective changed (kendall_soft), and the failures mostly didn't
+
+`struct_film_chem` was superseded by **`struct_film_chem_kendall`** — same architecture,
+unchanged, with a soft-Kendall-tau ranking term added to the MSE loss (DETAILS.md's
+`struct_film_chem` section, ARCHITECTURES.md §G.2). It is a training-objective change, not an
+architecture change, and the question this Part answers is whether that distinction shows up in
+the failure analysis or only in the headline number. All three tools were rerun against it —
+`scripts/bias_analysis.py --run perturb_struct_film_chem_kendall`, `scripts/class_separation.py`,
+`scripts/error_drivers.py` — with `film_kendall` now the model those scripts' own `MODELS` dicts
+name as submitted, so this is no longer a once-off number quoted in a paragraph.
+
+## 32. The two models fail on the same rows, almost exactly
+
+Spearman between per-row |error|, extending §30's table:
+
+| | forest | `film_kendall` | `film_chem` | `film_esmif` | `gated_cg` | `seq_only` | `cat128` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `film_kendall` | 0.481 | 1.000 | **0.950** | 0.854 | 0.688 | 0.843 | 0.748 |
+
+**0.950 is the highest correlation between any two models in this whole table** — higher than
+`film_chem`/`film_esmif` (0.862, two different structure encoders on the same backbone). The
+ranking-loss addition changes 0.01 of ensemble Pearson (README §1) by reweighting gradients on
+the *same* architecture reading the *same* features; it was never going to fail on different
+rows, and it doesn't. Anyone expecting the training-objective change to fix a specific failure
+mode from Parts I–IV should not: this number says it mostly can't have.
+
+## 33. Class separation moves in different directions on different metrics — no clean win
+
+`scripts/class_separation.py`, threshold-free AUC:
+
+| | pooled stab\|dest | pooled macro AUC | within-complex stab\|dest |
+| --- | --- | --- | --- |
+| `film_chem` | **0.841** | **0.755** | 0.758 |
+| `film_kendall` | 0.831 | 0.745 | **0.770** |
+
+Pooled separation is slightly worse; within-complex separation — the harder, identity-free cut
+§26/§31 treat as the real test — is slightly better. Both movements are consistent with what
+`kendall_soft` actually optimises: a *within-group* pairwise ranking term, so a small
+within-complex gain and no particular reason to expect the pooled number to move the same way.
+Neither movement is large. On the within-complex cut specifically, `film_kendall` (0.770) still
+trails `film_esmif` (0.810) and the forest (0.789) — the ranking-loss addition does not close
+the gap §31 measured, it sits inside it.
+
+## 34. The geometry bias from §29 is unchanged to slightly worse, not dampened
+
+An earlier informal readout of this comparison (still in README §1 at the time of writing)
+described the geometry-descriptor bias as "dampened" under `kendall_soft`, citing one column.
+Rerun through `scripts/error_drivers.py` properly, on all three columns §29 uses, the honest
+picture is mixed and mostly not smaller:
+
+| descriptor | `film_chem` | `film_kendall` | direction |
+| --- | --- | --- | --- |
+| `rsasa_bound` (signed) | 0.279 | **0.331** | worse |
+| `min_dist_partner` (signed) | 0.267 | **0.283** | worse |
+| `n_contacts` (signed) | −0.339 | −0.331 | marginally smaller |
+
+Two of three geometry-bias correlations got slightly *larger* under the ranking-loss addition,
+not smaller. The one that improved (`n_contacts`) is a small enough move (0.008) to be inside
+run-to-run noise on 940 rows. §29's conclusion — the fix is geometry entering the FiLM gate, not
+the tail concatenation — is unaffected either way; the training-objective change was never
+positioned to touch this axis, and on this evidence it plainly didn't. Where `kendall_soft` does
+show a small, real improvement is on absolute error for large-effect rows (Spearman of `abs_ddg`
+against |error|: 0.648 vs 0.658; `true_ddg`: 0.340 vs 0.363) — consistent with a ranking term
+sharpening the tails a little, independent of the geometry axis.
+
+## 35. Label and mutation imbalance — same shape, same magnitude
+
+`scripts/bias_analysis.py`: stabilising rows still pulled up (+1.328 kcal/mol, `film_kendall`),
+destabilising rows still pulled down (−1.124) — regression to the mean, unchanged from Part I's
+mechanism, on a model whose only difference is a ranking term added to that same MSE. Alanine
+scanning is still 46% of rows and the X→A / other split still shows the same bias magnitude in
+both buckets (−0.394 / −0.322). Nothing here is a new finding; it is the same finding, run
+against the model that is actually submitted now rather than the one that was submitted when
+Parts I–IV were written.
+
+## 36. What this Part settles
+
+`kendall_soft` is a small, real edge on the metric it was chosen for (README §1's 8-seed
+table: +0.379 ens against +0.368) and it is not a different model underneath — 0.950 error
+correlation with its own predecessor is as close to "the same failures" as two distinct runs on
+this dataset get. It buys a small within-complex classification gain (§33) and a small
+large-effect precision gain (§34) at the cost of a small pooled-classification and geometry-bias
+regression, none of them larger than the seed-to-seed noise this project has learned to distrust
+(§9). Parts I–IV's diagnosis of what limits this model — compression to the mean, the antibody
+side, alanine dominance, the geometry-bias-at-the-tail-concat mechanism — describes
+`struct_film_chem_kendall` exactly as it described `struct_film_chem`, because for every
+question these three tools ask, it is close enough to the same model to return the same answer.

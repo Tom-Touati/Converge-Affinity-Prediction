@@ -11,8 +11,20 @@ in the table.
 
 > **Families A–D are the first 45 runs. [Family E](#family-e--the-site-pair-ladder-and-how-the-submitted-model-changed)
 > covers a later phase** (~30 further 3-seed configurations plus a 200-trial single-seed
-> screen) which produced the current submitted model, `struct_film_chem`. Where the two
-> disagree, E is the later measurement and says so explicitly.
+> screen) which produced `struct_film_chem`, still the submitted model.
+> **[Family F](#family-f--injecting-where-a-mutation-sits-relative-to-the-binding-site) covers
+> a later phase still** — checkpoint transfer from full SKEMPI, and a sweep of features
+> describing a mutation's own position relative to the binding site — all of it negative once
+> measured correctly, including a real confound (§F.4) caught in the process of checking an
+> apparent win. **[Family G](#family-g--training-objectives-and-a-factorial-sweep-of-the-leaders-own-architecture)
+> covers a later phase still** — ranking-loss objectives, a depth × fusion-mechanism factorial
+> sweep on the leader's own two branches, and an early/mid/late fusion-stage ablation. The
+> leader's own FiLM-at-the-end design beats every alternative fusion timing and every simpler
+> combining rule tried; a depth-2 architecture change and a tied-init fix for `split_mutwt`
+> both looked promising at 3 seeds and did NOT survive an 8-seed re-measurement (§G.2). One
+> training-objective change did survive it — a soft-Kendall-tau ranking term added to the
+> regression loss — and is now part of the submitted recipe (DETAILS.md). Where families
+> disagree, the later one is the later measurement and says so explicitly.
 
 > **Read every gap against the seed spread.** Measured at **0.028 to 0.117** depending on
 > configuration (ERROR_ANALYSIS §9). Most rows in this document are separated by less than
@@ -347,3 +359,532 @@ Structure-free, chem-free, deliberately naive:
 All at or below zero. Worth keeping because they price the rest: the fusion mechanisms in
 family C and E.2 are doing real work, and a naive interaction term is not a cheap substitute
 for any of them.
+
+---
+
+## Family F — injecting where a mutation sits relative to the binding site
+
+A later phase again, following two questions in sequence: does the ~300 non-antibody complexes
+in the rest of SKEMPI transfer anything to the AB/AG task, and can the model be told directly
+where a mutation sits relative to the interface, rather than leaving it to infer that from
+pooled structure. Both were tried on the real 940-row AB/AG set, 5 folds × 3 seeds unless noted.
+
+### F.1 Splitting the mutant/wild-type projection — a real regression
+
+`mut_pair_ffn`'s subtraction, `LN(mt) − LN(wt)`, projects both sides through the SAME map
+(`tok_proj`) before the LayerNorm. This project's own rule — never share the first linear layer
+between modalities — argues for splitting it, exactly as it argued for splitting ab/ag and
+structure. Tried directly: mutant and wild-type each get their own `Linear(128 → 64)`, 4 total
+(ab_mt, ab_wt, ag_mt, ag_wt) instead of 2.
+
+| run | per-cx r | seed spread | negative complexes |
+| --- | --- | --- | --- |
+| `struct_film_chem` (shared mt/wt projection) | **+0.369** | 0.092 | 3 |
+| `split_mutwt` (separate mt/wt projection) | +0.294 | **0.237** | 4 |
+
+The sharpest instability measured anywhere in this project — seed spread more than doubles.
+Unlike ab/ag or sequence/structure, mutant and wild-type are not two different modalities to
+keep apart; they are the same modality at two time points, and the subtraction only means
+anything if both land in the identical learned space. Splitting the projection lets them drift
+apart across training, so `LN(mt) − LN(wt)` increasingly compares two different bases rather
+than measuring what changed. The "don't share weights across modalities" rule has a real
+exception, and this is it.
+
+### F.2 Ten ways to add whole-crop binding-site context — none beat the leader
+
+Ten mechanisms added ON TOP of `struct_film_chem`'s existing site-pooled FiLM gate, each
+injecting binding-site context pooled over the WHOLE crop rather than just the mutated residue
+— concatenation, a second FiLM stage, a learned gate, cross-attention, distance-weighted
+pooling, standard deviation of the local embedding, the nearest-neighbour structural
+difference, and three pure-geometry scalars (crop size, tightest contact anywhere in the crop,
+mean contact distance). Full 15-combo runs each:
+
+| mechanism | per-cx r | ens | negative complexes |
+| --- | --- | --- | --- |
+| `struct_film_chem` (no addition) | +0.314 | **+0.369** | 3 |
+| `mean_dist_crop` (pure geometry) | +0.296 | +0.361 | 3 |
+| `crop_concat` | +0.269 | +0.360 | 3 |
+| `crop_std` | +0.276 | +0.347 | 2 |
+| `nn_diff_crop` | +0.267 | +0.343 | 3 |
+| `min_dist_crop` (pure geometry) | +0.311 | +0.341 | 3 |
+| `crop_gate` | +0.285 | +0.338 | 5 |
+| `crop_film2` | +0.271 | +0.335 | 3 |
+| `crop_wpool` | +0.266 | +0.327 | 5 |
+| `crop_size` (pure geometry) | +0.267 | +0.318 | 4 |
+| `crop_xattn` | +0.272 | +0.303 | 6 |
+
+None improve on the leader. The closest is pure geometry with no learned structure at all
+(`mean_dist_crop`, a scalar), matching this project's recurring finding that what reaches the
+model matters more than how elaborately it is fused. `crop_xattn` is worst — attention loses
+again, the same pattern in every fusion sweep this project has run. Read together with F.3
+below: whole-crop context added AFTER the backbone does not help, but a per-residue feature
+added INTO the mutation's own representation does.
+
+### F.3 Ten features encoding a mutation's position relative to the binding site
+
+A different injection point: instead of pooling structure over the crop and concatenating it
+after `mut_pair_ffn` runs (F.2's approach), compute one feature PER MUTATED RESIDUE from
+tensors already in the batch — the crop's own Cα distance matrix, site/mask flags, residue
+indices, no new precomputation — and add it directly to the mutant projection `p_mt`, before
+the LayerNorm and the mt−wt subtraction:
+
+```
+p_mt = p_mt + sigmoid(gate) * Linear(1 -> 64)(feature)      # gate initialised at sigmoid(-4) = 0.018
+```
+
+The gate is a single learned scalar, starting closed so a brand-new signal does not perturb an
+otherwise-working representation before there is any gradient evidence it helps — the model
+starts at approximately the ungated baseline and only opens the gate if the feature earns it.
+
+Ten features tried, all through the same mechanism: the mutated residue's own minimum distance
+to the nearest partner-chain residue, a hard- and a soft-cutoff local contact count, its
+fractional position along its own chain, the percentile rank of its own interface distance
+among all same-side crop residues, its distance relative to the crop's own mean, a
+sequence-local density count, the actual structural embedding of its single nearest partner
+residue, a smooth interface indicator, and the row's own mutation count. Full 15-combo runs:
+
+| mechanism | per-cx r | ens | negative complexes | wc s\|d |
+| --- | --- | --- | --- | --- |
+| `burial_rank` | +0.311 | **+0.370** | 3 | **0.795** |
+| `struct_film_chem` (no addition) | +0.314 | +0.369 | 3 | 0.758 |
+| `nearest_partner_struct` | +0.306 | +0.366 | 5 | 0.794 |
+| `rel_seq_pos` | +0.311 | +0.365 | 3 | 0.786 |
+| `is_at_interface` | +0.311 | +0.364 | 3 | 0.790 |
+| `contacts_soft` | +0.299 | +0.362 | 2 | 0.792 |
+| `n_mut_row` | +0.304 | +0.359 | 4 | 0.779 |
+| `contacts_8a` | +0.308 | +0.355 | 5 | 0.792 |
+| `local_seq_density` | +0.295 | +0.346 | 4 | 0.790 |
+| `dist_to_site` | +0.287 | +0.343 | 4 | 0.777 |
+| `dist_delta_mean` | +0.271 | +0.340 | 4 | **0.165 spread** |
+
+`wc s|d` is the within-complex AUC ranking a stabilising mutation above a destabilising one of
+the SAME complex — identity-free, prevalence-free, the hardest of this project's ranking
+metrics. **Every mode except `local_seq_density` and `dist_delta_mean` improves it over the
+leader** in this table, several by a wide margin, even where ensemble Pearson is roughly
+level — but §F.4 below found that this table's own baseline was wrong, and the improvement
+does not survive the correction. `dist_delta_mean` is the clearest failure regardless: worst
+ensemble score and, at 0.165, the widest seed spread of anything in this table.
+
+Raw distance (`dist_to_site`) underperforms its own normalised form (`burial_rank`) by 0.027
+ens here. Complexes vary enormously in interface size and packing, so a fixed distance means
+different things in different complexes — 6 Å is buried in a tight, small interface and
+essentially the contact surface in a large, loose one. Converting to a percentile rank within
+the crop's own residues removes that confound, and is the single largest difference between
+any two of the ten modes — though, again, see §F.4 for why this ranking should not be trusted
+without the correction below.
+
+### F.4 A confound found while running F.3 — and why the apparent win did not survive it
+
+Every run in F.2 and F.3 above used `split_proj=true`, this project's own standing convention
+for `struct_film_chem`. That flag was believed to control only sequence's per-side projection —
+but the fix in E that gave structure its own per-side map (§E.2's own history) reused the SAME
+flag rather than adding a new one, so `split_proj=true` has been silently splitting structure's
+projection too, in every run since that fix landed. `struct_film_chem`'s own 50,497 parameters
+are only reachable with structure's projection SHARED; `split_proj=true` under the current code
+produces a 58,689-parameter model with structure split — the same architecture separately
+measured in E.2 as `struct_film_chem_splitstruct`, **+0.354 ens, a 0.015 regression** against
+the true leader.
+
+Every number in F.2 and F.3 was therefore measured on a base architecture already 0.015 worse
+than `struct_film_chem`, without that being visible in the tables above — they read as
+comparisons against the leader, but the actual comparison was against a handicapped variant of
+it. Fixed with a new `split_struct` field (`SiteTokenConfig`) that decouples the two: `None`
+defers to `split_proj` exactly as before, so every existing config and every number in E and in
+F.1–F.3 above is unaffected as a *record*; an explicit `True`/`False` overrides structure's
+projection independently of sequence's. Re-running `burial_rank`, the best of F.3's ten, on the
+TRUE `struct_film_chem` base (`split_struct: false`):
+
+| run | params | per-cx r | ens | seed spread |
+| --- | --- | --- | --- | --- |
+| `struct_film_chem` (true base, no addition) | 50,497 | +0.314 | **+0.369** | 0.092 |
+| `burial_rank` on the SPLIT-STRUCT base (F.3's number) | 58,818 | +0.311 | +0.370 | 0.087 |
+| `burial_rank` on the TRUE base (`split_struct: false`) | 50,626 | +0.292 | +0.335 | **0.147** |
+
+**The apparent tie was an artefact of the wrong baseline, not a real improvement.** On the
+architecture `struct_film_chem` actually is, `burial_rank` is a clear regression — 0.034 ens
+below the leader, with the widest seed spread measured for any variant of this backbone in the
+project. It was not improving the real model; it was compensating for an unrelated regression
+(split structure) that it happened to be measured on top of, landing at roughly the split
+architecture's score by coincidence of two effects working in opposite directions on two
+different problems. **`struct_film_chem` remains the submitted model.** None of the other nine
+modes in F.3 has been re-verified on the true base, but the mechanism that seemed most promising
+did not survive the correction, and the confound applies identically to all ten — the F.3 table
+should be read as measuring a different (weaker) base architecture than the one it appears to
+compare against, not retried in the hope a different mode fares better.
+
+**Worth keeping regardless of the negative result:** the `split_proj`/`split_struct` coupling
+was a real bug affecting every run in this project since structure's split was added in Family E
+— not just this sweep — and the decoupling is a genuine fix, independent of whether any feature
+in F.3 turns out to help. It is also a second instance of this project's most persistent lesson:
+comparing a promising result against the wrong baseline is easy to do by accident, and checking
+which exact architecture a number was measured against is not optional.
+
+### F.5 Checkpoint transfer from full SKEMPI — two ways tried, both short of training on AB/AG alone
+
+Separately from F.1–F.4: does pretraining on the ~300 non-antibody SKEMPI complexes help,
+either mixed into every batch or as initialisation before fine-tuning on AB/AG. Full-SKEMPI
+infrastructure (5,748 rows, 343 complexes) built earlier in the project made both cheap to try.
+
+| approach | ens | note |
+| --- | --- | --- |
+| `struct_film_chem` (AB/AG only, with chem) | **+0.369** | the leader |
+| pretrain (backbone) → fine-tune with chem (partial load) | +0.362 | ties the leader; see below |
+| `control_nochem` (AB/AG only, no chem, matched architecture) | +0.304 | the fair baseline for the two below |
+| pretrain (backbone, no chem) → fine-tune, no chem | +0.272 | below its own matched baseline |
+| batch-mixing curriculum (AB/AG share annealed 50%→100%) | +0.241 | worst of the three |
+
+Pretraining excludes each AB/AG fold's own held-out rows from the pretrain pool (a `--fold-map`
+assigning AB/AG rows their real CV fold and every other SKEMPI row a sentinel that never
+matches), so the fine-tune test fold is never seen during pretraining. Checkpoint transfer uses
+`--init-ckpt-dir`/`--save-ckpt-dir`, added to `_perturb_v2_colab.py` for this.
+
+The first pretrain→fine-tune attempt (+0.272) looked like a clean negative result — pretraining
+hurt. It was really about chemistry: full SKEMPI's cache only has the 21 base chemistry columns
+computed for all 5,748 rows, not the 33/39-column enriched table AB/AG's own cache has, so a
+checkpoint trained with chemistry there cannot be loaded into a model expecting AB/AG's richer
+block — the two head widths differ. Restoring chemistry via a name-and-shape PARTIAL load (chem
+only touches the head's first Linear, which necessarily differs in width and re-initialises;
+every backbone tensor — the part chemistry never touches — transfers exactly) reaches +0.362,
+tying the leader and improving `wc s|d` (0.799 vs 0.758). The batch-mixing curriculum, tried
+first and independently, scores lowest of the three and was not worth revisiting with the same
+fix, since it mixes the two populations throughout training rather than sequencing them —
+there is no separate "backbone" stage to protect from the chemistry mismatch.
+
+---
+
+## Family G — training objectives, and a factorial sweep of the leader's own architecture
+
+A later phase again, on the true `struct_film_chem` base (`split_struct: false`) throughout.
+Two questions: does the LOSS the leader is trained with matter as much as its architecture,
+and does deepening or re-fusing the architecture itself — not adding a new feature, just
+changing how the existing two branches combine — beat it.
+
+### G.1 An AbRank-style ranking loss, mixed in at several weights
+
+This project already measured a within-complex pairwise ranking loss once (JUSTIFICATIONS.md
+§A1b) and rejected it — on the pre-correction 997-row dataset, with the OLDER `fusion_v2`
+backbone, not the current leader. Re-measured on `struct_film_chem` itself, `MSE + λ ·
+pairwise_rank_loss` (softplus logistic on pairs with |Δtrue| > 0.5 kcal/mol, never replacing
+the regression term — pure ranking has no anchor on output scale, the same finding as before):
+
+| weight λ | ens | seed spread |
+| --- | --- | --- |
+| 0 (control, reproduces the leader exactly) | +0.369 | 0.092 |
+| 0.2 | +0.365 | 0.095 |
+| 0.5 | +0.358 | 0.102 |
+| **1.0** | **+0.371** | 0.125 |
+
+Non-monotonic: 0.2 and 0.5 both underperform the control, 1.0 edges above it. The same
+non-monotonic pattern (a low mixing weight hurting more than a high one) appeared in the
+original AbRank measurement too. A parallel sweep of `1 - Pearson correlation` within each
+complex (`--corr-weight`, a direct differentiable surrogate for the headline metric instead of
+a ranking-margin term) is monotonically WORSE as its weight increases (+0.363, +0.352, +0.350
+at 0.2/0.5/1.0) — correlation-as-loss does not help at any weight tried.
+
+### G.2 Ten ranking methods at a fixed weight, and a re-measurement that mattered
+
+Ten formulations of "make correct relative order more likely," all mixed at λ=1.0, replacing
+just the pairwise term above: a hinge margin instead of the logistic; the logistic weighted by
+|Δtrue| ("severity"); an "equal-pairs attract" term giving the |Δtrue| ≤ 0.5 bin its own loss
+instead of excluding it; a smooth (tanh-based) Kendall-tau-style concordance; the classification-
+labels-as-ranking-metric idea directly — 5 ordinal bins (≪, <, ≈, >, ≫ at ±0.5/±1.5 kcal/mol)
+via both a cumulative-threshold BCE and an RBF-softmax cross-entropy; a soft-rank Spearman
+correlation; ListMLE (Plackett-Luce negative log-likelihood of the group's true order); and a
+triplet hinge anchored on each complex's own most-stabilising and most-destabilising row.
+
+| method | ens | per-seed mean | seed spread |
+| --- | --- | --- | --- |
+| `class5_ce` (RBF softmax, 5 bins) | **+0.401** | +0.310 | 0.150 |
+| `kendall_soft` | +0.391 | **+0.326** | 0.087 |
+| `class5_ord` (cumulative BCE, 5 bins) | +0.389 | +0.304 | 0.149 |
+| `severity` | +0.388 | +0.299 | 0.154 |
+| `spearman_soft` | +0.382 | +0.325 | 0.116 |
+| `equal_attract` | +0.373 | +0.312 | 0.101 |
+| `triplet` | +0.373 | +0.312 | 0.115 |
+| `binary` (= G.1's λ=1.0) | +0.371 | +0.315 | 0.125 |
+| `hinge` | +0.370 | +0.309 | 0.123 |
+| `struct_film_chem` (no addition) | +0.369 | +0.314 | 0.092 |
+| `listmle` | +0.369 | +0.310 | 0.089 |
+
+Every one of the ten ties or beats the leader on ensemble at 3 seeds. `kendall_soft` looked
+like the one worth trusting — best per-seed mean, and the only method with a TIGHTER seed
+spread than the leader's own. **An 8-seed rerun, `kendall_soft` against the leader on the
+identical 8 seeds, found the tight spread did not survive:**
+
+| run | seeds | ens | per-seed mean | seed spread |
+| --- | --- | --- | --- | --- |
+| `kendall_soft` | 8 | **+0.379** | **+0.290** | 0.217 |
+| `struct_film_chem` | 8 | +0.368 | +0.281 | 0.217 |
+
+Both land at the SAME spread once measured on enough seeds — 0.087 was itself a lucky draw of
+3 seeds, not a property of the method, and the leader's own true spread (0.217) is more than
+double what its 3-seed table (0.092) suggested throughout every OTHER comparison in this
+document. What survives: a small, consistent +0.01 edge on both ensemble and per-seed mean, on
+the same 8 seeds — real, but a modest finding, not the standout it looked like at 3 seeds. The
+lesson generalises past this one method: **a 3-seed spread this project has quoted everywhere
+is a floor on the true variability, not an estimate of it**, and a result that depends on being
+in the tail of that floor should be re-measured at more seeds before being trusted.
+
+**Applying that lesson to the two other candidates this sweep produced** (§G.3's best depth
+config, §G.5's `split_mutwt_tied_init`): both re-measured at 8 seeds, matched against the
+plain leader on the identical seeds.
+
+| run | seeds | ens | per-seed mean | seed spread |
+| --- | --- | --- | --- | --- |
+| `kendall_soft` | 8 | **+0.379** | **+0.290** | 0.217 |
+| `struct_film_chem` (plain regression) | 8 | +0.368 | +0.281 | 0.217 |
+| both-branches-depth-2 (§G.3) | 8 | +0.359 | +0.298 | **0.148** |
+| `split_mutwt_tied_init` (§G.5) | 8 | +0.353 | +0.250 | 0.247 |
+
+Neither survives as an ensemble improvement — both land BELOW the plain leader once matched
+on 8 seeds, not just inside its noise. The depth-2 config's profile is genuinely different
+(highest per-seed mean of the four, tightest spread by a wide margin) but its ensemble is
+lower, and this project ships the ensemble (README's own `ens` vs `per seed` distinction) —
+by that standard it is a worse choice, an interesting reliability/ensemble trade-off rather
+than a candidate. `split_mutwt_tied_init` is worse on every column. **`kendall_soft` is the
+only one of the three that beats the leader on the metric that matters, is now part of the
+submitted training recipe** (DETAILS.md's `struct_film_chem` section), and the other two are
+recorded here as negative results, the same way §Family F's confound was.
+
+### G.3 Depth × fusion, a factorial sweep on the leader's two branches
+
+Two structural questions, crossed: does making the sequence-delta MLP (`pair_ffn`) or the
+structure MLP deeper help, and does FiLM's gate beat simpler ways to combine the two branches
+once both are fully pooled. `seq_mlp_depth`/`struct_mlp_depth` ∈ {1 (leader), 2, 3}; `fuse_mode`
+∈ {film (leader), multiply, add, concat}. Full 15-combo runs:
+
+| config | ens | seed spread | wc s\|d |
+| --- | --- | --- | --- |
+| **both depth 2, FiLM** | **+0.372** | 0.103 | **0.795** |
+| `struct_film_chem` (both depth 1, FiLM) | +0.369 | 0.092 | 0.758 |
+| struct depth 2, FiLM | +0.367 | 0.086 | 0.801 |
+| seq depth 2, FiLM | +0.360 | 0.098 | 0.755 |
+| struct depth 2, multiply | +0.359 | 0.129 | 0.812 |
+| both depth 3, FiLM | +0.353 | 0.130 | 0.758 |
+| both depth 2, multiply | +0.339 | 0.101 | 0.760 |
+| seq depth 3, FiLM | +0.338 | 0.100 | 0.775 |
+| seq depth 2, multiply | +0.321 | 0.137 | 0.776 |
+| both depth 1, multiply | +0.263 | 0.129 | 0.760 |
+
+Separately, `fuse_mode` alone (both branches at depth 1, matching the leader exactly except
+the combining rule): **FiLM +0.369 > concat +0.351 > add +0.337 > multiply +0.263** — the same
+ordering holds throughout the depth sweep above (every multiply row is well below its FiLM
+counterpart at the same depth), confirming this is about the mechanism, not an interaction with
+depth. FiLM's combined multiplicative-and-additive gate is doing real work no single simpler
+rule reproduces.
+
+**Depth 2 on both branches together is the best single configuration measured in this
+project** (+0.372 ens) and also has the best `wc s|d` of anything in this table (0.795,
+struct-depth-2-alone reaches 0.801, the single highest). Depth 3 reverses the gain on both
+axes — 752 training rows per fold cannot support a third layer on top of the frozen encoders.
+The improvement is inside the seed-spread floor established in §G.2 (0.217, not the 0.09ish
+these 3-seed numbers show), so it is reported as a candidate worth an 8-seed confirmation, not
+a settled win.
+
+### G.4 Early vs mid vs late fusion — WHEN structure enters, not just how
+
+A different axis: at what point does structure enter the sequence computation, relative to the
+per-residue mutant/wild-type delta. **Late** (`struct_film_chem` itself, unchanged): the
+sequence branch — LN(mt) − LN(wt) → pair_ffn → sum over sites — never sees structure at all;
+FiLM combines the two only after BOTH are fully pooled into one vector each. **Early**: the
+wild-type structure embedding at each residue is added to both p_mt and p_wt BEFORE LayerNorm
+and the subtraction — structure shapes what "the same residue" means before any delta exists.
+**Mid**: structure is added to the per-residue delta AFTER the subtraction and `pair_ffn`, but
+before summing over the mutated sites — reweighting an already-computed "what changed" signal,
+one residue at a time.
+
+| fusion stage | ens | seed spread | neg | wc s\|d |
+| --- | --- | --- | --- | --- |
+| **late** (`struct_film_chem`) | **+0.369** | 0.092 | 3 | 0.758 |
+| mid | +0.312 | 0.126 | 6 | 0.772 |
+| early | +0.302 | 0.176 | 3 | 0.741 |
+
+Late fusion wins clearly, and mid beats early. The ordering makes sense in hindsight: late
+fusion lets the sequence branch finish computing an already-meaningful "what changed" signal
+before structure conditions the final decision. Mid fusion perturbs that signal after it exists
+— a smaller intervention. Early fusion perturbs BOTH p_mt and p_wt with the identical
+wild-type structure embedding before their SEPARATE LayerNorms; because LayerNorm normalises
+each vector by its own mean and variance, adding an identical vector to two different inputs
+does not cancel in the subtraction the way it might if this were linear, and empirically this
+is the most damaging place to introduce structure of the three tried. **The leader's own design
+— fuse only after both branches are fully formed — is not an arbitrary choice among these
+three; it is the best of the three by a wide margin, wider than any other single ablation in
+this document moved the leader.**
+
+### G.5 Two smaller checks: a wild-type binding-strength feature, and concat instead of subtract
+
+`struct_bind_feat`: the wild-type complex's own ProteinMPNN log-probability (`mpnn__logp_wt_
+complex`, a proxy for how strong the wild-type binding already is), concatenated onto z_st
+before FiLM rather than left in the tail chem block. **+0.335 ens** — a regression, and with a
+wide seed spread (0.171). Structure's own pooled representation does not benefit from a scalar
+that chemistry already carries at the tail.
+
+`mut_pair_op="concat"`: replace the fixed LN(mt) − LN(wt) subtraction with [LN(mt); LN(wt)],
+2w-wide, reduced back to w by `pair_ffn`'s own first layer instead of a rule fixed in advance.
+**+0.368 ens** — ties the leader (within noise), at the cost of 4,096 more parameters for the
+wider first layer. Letting the network learn how to combine mt and wt does not beat simply
+subtracting them; the fixed rule was not leaving anything on the table.
+
+`split_mutwt_tied_init`: revisits §F.1's regression (giving mt/wt separate projections cost
+0.075 ens and doubled the seed spread) by initialising the two projections IDENTICAL per side
+(copying one to the other, then perturbing each with independent noise, std 0.02) instead of
+independently random, so the split architecture starts at approximately the shared-weight
+leader's own computation and only diverges from there. **+0.375 ens** — recovers past the
+leader's own score, and reaches the best `wc s|d` measured in this project (0.819). But the
+per-seed mean (+0.261) and seed spread (0.229) are barely improved from the untied version
+(+0.260, 0.237) — the ensemble recovery looks like averaging out continued per-run instability,
+not fixing it. Tied initialisation fixes the SYMPTOM the earlier ablation measured (the
+ensemble number) more than the CAUSE (mt and wt still drift into different spaces over
+training); worth the second look, not yet worth trusting as a replacement for the shared
+projection.
+
+### G.6 The submitted recipe under the homology-cluster split, and a seq-depth-2 variant that loses on both splits
+
+Two follow-ups on `kendall_soft` (the training-objective addition selected in §G.2):
+does its generalisation gap under the harder homology-cluster split match the plain
+leader's, and does giving the sequence branch its own extra pre-fuse layer
+(`seq_mlp_depth=2`, §G.3's `arch_seq2_film` but now trained WITH the ranking-loss
+addition) help once combined with it. Both checks run on the same 4-fold cluster split
+used throughout this document (`data/cluster_folds.csv`), 3 seeds/fold:
+
+| run | ens (cluster) | ens (standard split) | retention |
+| --- | --- | --- | --- |
+| `struct_film_chem` (plain MSE) | +0.272 | +0.369 | 74% |
+| `struct_film_chem_kendall` (`kendall_soft` addition) | +0.258 | +0.391 | 66% |
+| `+seq_mlp_depth=2` on top of `kendall_soft` | +0.215 | +0.354 | 61% |
+
+The plain-MSE leader's cluster number reproduces its historical +0.272 exactly on the
+current, decoupled architecture (`split_struct` refactor confirmed neutral). Against that,
+`kendall_soft` retains less of its own standard-split gain under the cluster split (66%
+vs. 74%) — a modest generalisation cost that comes with the ranking-loss addition,
+disclosed honestly in [DETAILS.md](DETAILS.md#struct_film_chem) rather than left out.
+Adding a second sequence-branch layer on top makes both numbers worse, not just the
+cluster one — it loses on the standard split alone (+0.354 vs. `kendall_soft`'s +0.391,
+consistent with §G.3's `arch_seq2_film` losing to the depth-1 leader there too) and
+loses by a wider margin under the cluster split (+0.215, worst of the three, and the
+lowest retention). Extra sequence-branch depth does not help this model on either split;
+not pursued further.
+
+---
+
+## H. The antigen/antibody gap: an 11-variant sweep
+
+`struct_film_chem`'s pooled Spearman (`scripts/mut_side_split.py`, matching Part I §2's original
+methodology) splits sharply by which side carries the mutation: antibody ρ **+0.629** (539 rows,
+35 complexes) against antigen ρ **+0.252** (320 rows, 26 complexes) — the same architecture,
+same weights, same training run, reading two different distributions through the identical
+`pair_ffn`. Eleven variants were tried against this gap specifically, each scored on the same
+antigen-only split rather than the pooled metric, since the pooled `ens` number can improve
+while antigen itself gets worse (and did, for several of these):
+
+| variant | mechanism | antigen ρ | antibody ρ | ens |
+| --- | --- | --- | --- | --- |
+| `struct_film_chem` (baseline) | — | +0.252 | +0.629 | +0.369 |
+| `mut_side_embed` | learned 3-way (ab/ag/both) category embedding added to the pooled sum | +0.208 | — | — |
+| `mut_side_gate` | FiLM-style per-side gate on the pooled sum, `1+delta` (not sigmoid) | +0.169 | — | — |
+| `proj_depth_ag` | independent depth-2 projection, antigen side only | +0.201 | — | — |
+| `proj_depth_both` | independent depth-2 projection, both sides (matched control) | +0.141 | +0.570 | +0.353 |
+| `side_tag_add` | per-side (ab=0/ag=1) identity added inside `pair_ffn`'s own computation | +0.165 | +0.556 | +0.374 |
+| `side_tag_concat` | same, concatenated instead of added (wider `pair_ffn` input) | +0.142 | +0.649 | +0.349 |
+| `oversample_ag2` | `WeightedRandomSampler`, antigen-side rows at 2× weight | +0.227 | +0.575 | +0.355 |
+| `oversample_ag3` | same, 3× weight | +0.186 | +0.483 | +0.332 |
+| `projag_oversample` | `proj_depth_ag` + 2× oversampling | +0.214 | +0.585 | +0.358 |
+| `sidetagadd_oversample` | `side_tag_add` + 2× oversampling | **+0.258** | +0.598 | +0.372 |
+| `sep_struct_pca` (see below) | per-side structure PCA instead of one pooled fit | +0.211 / **+0.264**\* | +0.549 / +0.566\* | +0.365 |
+| `stack_sidetag_oversample_pca` | `side_tag_add` + 2× oversampling + `sep_struct_pca`, 5 seeds | +0.232 | +0.535 | +0.350 |
+
+\* `sep_struct_pca` was first measured at 3 seeds (+0.211); a 5-seed re-measurement of the
+identical config (`baseline_newpca`) landed at +0.264 — a 0.05 swing on the SAME configuration,
+which is the antigen split's own seed noise (n=320 rows, 26 complexes) rather than a real
+effect, and a concrete illustration of why this document scores an antigen-only split at more
+than one seed count before trusting it.
+
+**10 of 11 variants made antigen prediction worse**, most by more than the antigen split's own
+seed-to-seed spread. The one exception, `sidetagadd_oversample`, gained **+0.006** over
+baseline — and its antibody score fell by **−0.031**, about five times the size of the antigen
+gain, in the opposite direction. Every variant that moved antigen moved antibody too, mostly by
+more: the mechanisms tried all act on the SAME shared `pair_ffn` weights antigen and antibody
+both pass through, so a change that helps one side's harder distribution generally taxes the
+other side's easier one.
+
+**A twelfth check settles whether that one exception was real**: stacking `sidetagadd_oversample`
+with the `sep_struct_pca` fix, at 5 seeds, does not compound the gain — it reverses it. Antigen
+falls to +0.232 (below baseline AND below `sidetagadd_oversample` alone), antibody falls to
++0.535 (its worst value in the whole sweep), and `ens` falls to +0.350 (worst in the sweep).
+Combined with `sep_struct_pca`'s own 3-seed-vs-5-seed disagreement (+0.211 vs +0.264 on the
+identical config) this closes the question: **the one apparent win in this sweep does not
+survive a second look, and none of the twelve variants is adopted.** The antigen/antibody gap
+is real, reproducible, and — on every mechanism tried here (side-identity signal, extra
+capacity, oversampling, and a real structure-PCA inconsistency fix, alone or stacked) — not
+closeable without giving up antibody performance at a worse exchange rate than any antigen gain
+was worth, when the antigen gain survived scrutiny at all.
+
+`sep_struct_pca` is worth separating from the other ten: it is not a speculative architecture
+addition but a genuine inconsistency fix. `fold_pca` fit ONE sequence PCA per side (antibody and
+antigen bases fit separately, correctly, because the two are different distributions) but ONE
+POOLED structure PCA shared across both sides — the exact mistake the sequence side's own
+fitting code argued against. Fitting the structure PCA per side too (same code path, same
+`_regression_check.py`-style before/after verification) is the more consistent, more honest
+default regardless of its antigen effect. Measured effect on the primary metric: **neutral to
+slightly negative** (+0.365 ens vs. baseline's +0.369, both at their respective seed counts,
+well inside the ~0.09 seed spread this metric carries) — implemented and verified, not adopted
+as the new default, kept available (no CLI flag currently gates it; reverting requires reverting
+`fold_pca`'s struct-fitting loop in `_perturb_v2_colab.py`).
+
+---
+
+## I. A verified structure-input limitation for the reverse-mutation augmentation
+
+The reverse-mutation augmentation (`DS.__getitem__`'s `swap` branch, `_perturb_v2_colab.py`)
+swaps wild-type/mutant sequences, BLOSUM rows, and negates the label — but `struct_ab`/
+`struct_ag` was read from `Cache.mpnn(complex_key)`, a per-COMPLEX cache built once from the
+wild-type structure, **identically regardless of swap**. Every mutation of a complex, forward or
+reversed, saw the same structural input: a per-complex constant blind to which mutation was in
+play (`docs/FUTURE_WORK.md` item 9b/6).
+
+**Built and wired** (not merely proposed): a per-ROW ProteinMPNN structural-embedding cache
+(`experiments/protattba_repro/extract_mutant_struct.py`), reusing `encoder_h_V`'s exact
+extraction logic (`src/features/mpnn_repr.py`) pointed at each row's own FoldX `BuildModel`
+mutant structure (`data_mutants/<row_safe_name>.pdb`, 940/940 extracted, 81s on a T4) instead of
+the wild-type complex PDB. `Cache.mpnn_mutant(row_id)` and a `--mutant-struct` flag route a
+swapped row's `struct_ab`/`struct_ag` through this cache instead of the wild-type one; the
+forward direction is provably untouched (`_check_mutant_struct.py`, a direct before/after
+comparison on real rows rather than a synthetic batch, since this is a data-loading change, not
+a model change).
+
+**Verified, before training anything, that this cannot show a per-mutation effect.** ProteinMPNN's
+`encoder_h_V` is computed from backbone coordinates alone (N, CA, C, O — no side chain, no
+sequence identity; `src/features/mpnn_repr.py`'s own docstring: *"h_V comes from backbone
+geometry alone... it cannot distinguish two substitutions at the same position"*). FoldX's
+`BuildModel`, run the way it was for this project's mutant-structure extraction (one run, no
+explicit backbone relaxation), repacks side-chain rotamers only — the backbone it outputs is
+**bitwise identical** across every mutation of a complex. Checked directly, not assumed: parsing
+raw backbone coordinates for every row, **0 of 887 within-complex row pairs differ at all**
+(`np.array_equal`, max diff exactly 0.0, across the full dataset). The two facts compound: the
+one feature this fix touches is mathematically incapable of reflecting the one thing FoldX
+changed. This is a different situation from the tabular-geometry analogue
+(`src/features/geometry_mutant.py`'s rSASA/contacts), which DOES depend on side-chain atoms and
+genuinely differs by mutation — that fix is real; this one, for `struct_ab`/`struct_ag`
+specifically, is not.
+
+A real fix would need the backbone itself to move between mutations — either FoldX run with
+explicit backbone flexibility/relaxation enabled, or a different mutant-structure predictor
+entirely (e.g. a full-atom, backbone-flexible model). Neither is in scope here.
+
+**Trained anyway, 3 seeds/fold, matched control (`--mutant-struct` on vs. off, otherwise
+identical config)** — the training comparison this project's own discipline calls for even when
+a null result is expected, not assumed from the backbone check alone:
+
+| run | ens | per-cx | spread | neg | wc s\|d | antigen ρ | antibody ρ |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `mutant_struct_off` (control) | +0.365 | +0.293 | 0.079 | 5 | 0.778 | +0.211 | +0.549 |
+| `mutant_struct_on` | +0.365 | +0.293 | 0.079 | 5 | 0.778 | +0.211 | +0.549 |
+
+**Every metric matches to the last reported digit.** Not "close" — identical, confirming the
+backbone-invariance check directly: the tiny residual difference between a FoldX-repaired
+structure and the original wild-type PDB (RepairPDB's one-time fixup, ~0.002 max per-feature
+difference, itself unrelated to any specific mutation) has no measurable effect on this
+architecture's predictions once trained. `--mutant-struct` is left in the codebase, off by
+default, as verified-inert groundwork for a future backbone-flexible structure source rather
+than reverted — the wiring, cache, and regression check are correct and reusable; only the
+current FoldX extraction's rigid backbone makes today's result a null one.
