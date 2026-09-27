@@ -609,26 +609,44 @@ make align                               # verify each mutation is where we inde
 make test                                # split-integrity and harness tests
 ```
 
-**To train the submitted model, `struct_film_chem`.** The neural runs are driven separately,
-from `experiments/protattba_repro/`, on a GPU box rather than the dev machine — a Colab T4 for
-the earlier 45-configuration sweep, an EC2 g4dn.xlarge (also a T4) for `struct_film_chem` and
-the structural-injection sweep that found it, since Colab's session limits made the longer
-sweep impractical. The command:
+**To train the submitted model, `struct_film_chem_kendall`.** The neural runs are driven
+separately, from `experiments/protattba_repro/`, on a GPU box rather than the dev machine — a
+Colab T4 for the earlier 45-configuration sweep, EC2 g4dn.xlarge instances (also T4s) for
+`struct_film_chem` and everything after it, since Colab's session limits made the longer sweeps
+impractical. The command (identical architecture to `struct_film_chem` — same 50,497
+parameters — plus the `kendall_soft` ranking-loss addition selected in
+[docs/ARCHITECTURES.md §G.2](docs/ARCHITECTURES.md#g2-ten-ranking-methods-at-a-fixed-weight-and-a-re-measurement-that-mattered),
+`--rank-method kendall_soft --rank-weight 1.0`):
 
 ```bash
-python _perturb_v2_colab.py --exp struct_film_chem --arch sitetok \
+python _perturb_v2_colab.py --exp struct_film_chem_kendall --arch sitetok \
   --folds 0 1 2 3 4 --seeds 0 1 2 --wd 0.1 --grad-clip 10 --clip 4 --select-on per_complex \
-  --patience 15 \
+  --patience 15 --rank-method kendall_soft --rank-weight 1.0 \
   --overrides '{"pca_dim": 128, "proj": 64, "hidden": 128, "layers": 1, "dropout": 0.35, "input_noise": 0.0, "feature_dropout": 0.0, "chem_dim": 39, "split_proj": true, "n_heads": 2, "mut_pair_ffn": true, "mut_pair_op": "sub", "mut_pair_act": true, "mut_pair_struct_inject": "film_site"}'
 ```
 
-with `CHEM_TABLE=chem_perturb_v2` in the environment (the 39-column chem/geometry/zero-shot
-table; `scripts/build_perturb_features.py` builds it). It writes `out/struct_film_chem_results.
-csv` and per-row predictions, collected into `results/oof/struct_film_chem.csv`, then published
-into `reports/perturb_struct_film_chem/` via `python -m src.perturb.publish struct_film_chem
---name perturb_struct_film_chem --model perturb_v3` — the format every table and every
-error-analysis script in this repository reads. Re-running is safe: a configuration with five
-folds already on disk is skipped rather than retrained.
+with `CHEM_TABLE=chem_perturb_v2` and `PERTURB_ROOT=<path to the VM's data/cache directory>` in
+the environment (the 39-column chem/geometry/zero-shot table; `scripts/build_perturb_features.py`
+builds it). It writes `out/struct_film_chem_kendall_results.csv` and per-row predictions,
+collected into `results/oof/struct_film_chem_kendall.csv`, then published into
+`reports/perturb_struct_film_chem_kendall/` via `python -m src.perturb.publish
+struct_film_chem_kendall --name perturb_struct_film_chem_kendall --model perturb_v3` — the
+format every table and every error-analysis script in this repository reads. Re-running is
+safe: a configuration with five folds already on disk is skipped rather than retrained. Dropping
+`--rank-method`/`--rank-weight` trains the plain-MSE `struct_film_chem` predecessor instead
+(architecture-only ablations in this README and `docs/ARCHITECTURES.md` were measured against
+that variant, before the ranking-loss addition — see §G.2 for why both are worth keeping on
+disk).
+
+An **antigen/antibody-focused sweep** (11 variants: per-side identity embeddings, extra
+projection depth, antigen-row oversampling, and a per-side structure-PCA fix — see
+[docs/ARCHITECTURES.md §H](docs/ARCHITECTURES.md#h-the-antigenantibody-gap-an-11-variant-sweep))
+tried and failed to close the antigen/antibody performance gap (antibody ρ +0.629, antigen ρ
++0.252 on `struct_film_chem`); none is adopted into the submitted recipe above. A separate,
+verified **structure-input limitation** for the reverse-mutation augmentation (§I) was
+implemented, checked, and found to have no usable signal for the same reason: ProteinMPNN's
+per-residue representation is backbone-geometry-only, and FoldX's `BuildModel` (as run here)
+does not move the backbone between mutations of the same complex.
 
 `scripts/final_table.py` produces the results table above; it defaults `SUBMITTED` to
 `struct_film_chem`. `scripts/error_drivers.py`, which contributes to Part III of the error

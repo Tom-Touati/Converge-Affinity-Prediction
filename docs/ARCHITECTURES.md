@@ -764,3 +764,109 @@ consistent with §G.3's `arch_seq2_film` losing to the depth-1 leader there too)
 loses by a wider margin under the cluster split (+0.215, worst of the three, and the
 lowest retention). Extra sequence-branch depth does not help this model on either split;
 not pursued further.
+
+---
+
+## H. The antigen/antibody gap: an 11-variant sweep
+
+`struct_film_chem`'s pooled Spearman (`scripts/mut_side_split.py`, matching Part I §2's original
+methodology) splits sharply by which side carries the mutation: antibody ρ **+0.629** (539 rows,
+35 complexes) against antigen ρ **+0.252** (320 rows, 26 complexes) — the same architecture,
+same weights, same training run, reading two different distributions through the identical
+`pair_ffn`. Eleven variants were tried against this gap specifically, each scored on the same
+antigen-only split rather than the pooled metric, since the pooled `ens` number can improve
+while antigen itself gets worse (and did, for several of these):
+
+| variant | mechanism | antigen ρ | antibody ρ | ens |
+| --- | --- | --- | --- | --- |
+| `struct_film_chem` (baseline) | — | +0.252 | +0.629 | +0.369 |
+| `mut_side_embed` | learned 3-way (ab/ag/both) category embedding added to the pooled sum | +0.208 | — | — |
+| `mut_side_gate` | FiLM-style per-side gate on the pooled sum, `1+delta` (not sigmoid) | +0.169 | — | — |
+| `proj_depth_ag` | independent depth-2 projection, antigen side only | +0.201 | — | — |
+| `proj_depth_both` | independent depth-2 projection, both sides (matched control) | +0.141 | +0.570 | +0.353 |
+| `side_tag_add` | per-side (ab=0/ag=1) identity added inside `pair_ffn`'s own computation | +0.165 | +0.556 | +0.374 |
+| `side_tag_concat` | same, concatenated instead of added (wider `pair_ffn` input) | +0.142 | +0.649 | +0.349 |
+| `oversample_ag2` | `WeightedRandomSampler`, antigen-side rows at 2× weight | +0.227 | +0.575 | +0.355 |
+| `oversample_ag3` | same, 3× weight | +0.186 | +0.483 | +0.332 |
+| `projag_oversample` | `proj_depth_ag` + 2× oversampling | +0.214 | +0.585 | +0.358 |
+| `sidetagadd_oversample` | `side_tag_add` + 2× oversampling | **+0.258** | +0.598 | +0.372 |
+| `sep_struct_pca` (see below) | per-side structure PCA instead of one pooled fit | +0.211 / **+0.264**\* | +0.549 / +0.566\* | +0.365 |
+| `stack_sidetag_oversample_pca` | `side_tag_add` + 2× oversampling + `sep_struct_pca`, 5 seeds | +0.232 | +0.535 | +0.350 |
+
+\* `sep_struct_pca` was first measured at 3 seeds (+0.211); a 5-seed re-measurement of the
+identical config (`baseline_newpca`) landed at +0.264 — a 0.05 swing on the SAME configuration,
+which is the antigen split's own seed noise (n=320 rows, 26 complexes) rather than a real
+effect, and a concrete illustration of why this document scores an antigen-only split at more
+than one seed count before trusting it.
+
+**10 of 11 variants made antigen prediction worse**, most by more than the antigen split's own
+seed-to-seed spread. The one exception, `sidetagadd_oversample`, gained **+0.006** over
+baseline — and its antibody score fell by **−0.031**, about five times the size of the antigen
+gain, in the opposite direction. Every variant that moved antigen moved antibody too, mostly by
+more: the mechanisms tried all act on the SAME shared `pair_ffn` weights antigen and antibody
+both pass through, so a change that helps one side's harder distribution generally taxes the
+other side's easier one.
+
+**A twelfth check settles whether that one exception was real**: stacking `sidetagadd_oversample`
+with the `sep_struct_pca` fix, at 5 seeds, does not compound the gain — it reverses it. Antigen
+falls to +0.232 (below baseline AND below `sidetagadd_oversample` alone), antibody falls to
++0.535 (its worst value in the whole sweep), and `ens` falls to +0.350 (worst in the sweep).
+Combined with `sep_struct_pca`'s own 3-seed-vs-5-seed disagreement (+0.211 vs +0.264 on the
+identical config) this closes the question: **the one apparent win in this sweep does not
+survive a second look, and none of the twelve variants is adopted.** The antigen/antibody gap
+is real, reproducible, and — on every mechanism tried here (side-identity signal, extra
+capacity, oversampling, and a real structure-PCA inconsistency fix, alone or stacked) — not
+closeable without giving up antibody performance at a worse exchange rate than any antigen gain
+was worth, when the antigen gain survived scrutiny at all.
+
+`sep_struct_pca` is worth separating from the other ten: it is not a speculative architecture
+addition but a genuine inconsistency fix. `fold_pca` fit ONE sequence PCA per side (antibody and
+antigen bases fit separately, correctly, because the two are different distributions) but ONE
+POOLED structure PCA shared across both sides — the exact mistake the sequence side's own
+fitting code argued against. Fitting the structure PCA per side too (same code path, same
+`_regression_check.py`-style before/after verification) is the more consistent, more honest
+default regardless of its antigen effect. Measured effect on the primary metric: **neutral to
+slightly negative** (+0.365 ens vs. baseline's +0.369, both at their respective seed counts,
+well inside the ~0.09 seed spread this metric carries) — implemented and verified, not adopted
+as the new default, kept available (no CLI flag currently gates it; reverting requires reverting
+`fold_pca`'s struct-fitting loop in `_perturb_v2_colab.py`).
+
+---
+
+## I. A verified structure-input limitation for the reverse-mutation augmentation
+
+The reverse-mutation augmentation (`DS.__getitem__`'s `swap` branch, `_perturb_v2_colab.py`)
+swaps wild-type/mutant sequences, BLOSUM rows, and negates the label — but `struct_ab`/
+`struct_ag` was read from `Cache.mpnn(complex_key)`, a per-COMPLEX cache built once from the
+wild-type structure, **identically regardless of swap**. Every mutation of a complex, forward or
+reversed, saw the same structural input: a per-complex constant blind to which mutation was in
+play (`docs/FUTURE_WORK.md` item 9b/6).
+
+**Built and wired** (not merely proposed): a per-ROW ProteinMPNN structural-embedding cache
+(`experiments/protattba_repro/extract_mutant_struct.py`), reusing `encoder_h_V`'s exact
+extraction logic (`src/features/mpnn_repr.py`) pointed at each row's own FoldX `BuildModel`
+mutant structure (`data_mutants/<row_safe_name>.pdb`, 940/940 extracted, 81s on a T4) instead of
+the wild-type complex PDB. `Cache.mpnn_mutant(row_id)` and a `--mutant-struct` flag route a
+swapped row's `struct_ab`/`struct_ag` through this cache instead of the wild-type one; the
+forward direction is provably untouched (`_check_mutant_struct.py`, a direct before/after
+comparison on real rows rather than a synthetic batch, since this is a data-loading change, not
+a model change).
+
+**Verified, before training anything, that this cannot show a per-mutation effect.** ProteinMPNN's
+`encoder_h_V` is computed from backbone coordinates alone (N, CA, C, O — no side chain, no
+sequence identity; `src/features/mpnn_repr.py`'s own docstring: *"h_V comes from backbone
+geometry alone... it cannot distinguish two substitutions at the same position"*). FoldX's
+`BuildModel`, run the way it was for this project's mutant-structure extraction (one run, no
+explicit backbone relaxation), repacks side-chain rotamers only — the backbone it outputs is
+**bitwise identical** across every mutation of a complex. Checked directly, not assumed: parsing
+raw backbone coordinates for every row, **0 of 887 within-complex row pairs differ at all**
+(`np.array_equal`, max diff exactly 0.0, across the full dataset). The two facts compound: the
+one feature this fix touches is mathematically incapable of reflecting the one thing FoldX
+changed. This is a different situation from the tabular-geometry analogue
+(`src/features/geometry_mutant.py`'s rSASA/contacts), which DOES depend on side-chain atoms and
+genuinely differs by mutation — that fix is real; this one, for `struct_ab`/`struct_ag`
+specifically, is not.
+
+A real fix would need the backbone itself to move between mutations — either FoldX run with
+explicit backbone flexibility/relaxation enabled, or a different mutant-structure predictor
+entirely (e.g. a full-atom, backbone-flexible model). Neither is in scope here.
