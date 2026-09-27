@@ -565,3 +565,14 @@ see
 [ARCHITECTURES.md §Family F](ARCHITECTURES.md#family-f--injecting-where-a-mutation-sits-relative-to-the-binding-site)
 for the full account). `struct_film_chem` (now trained with the ranking-loss addition)
 remains the submitted model.
+
+A still later, 12-variant sweep targeting the model's own antigen/antibody performance gap
+(antibody ρ +0.629 vs. antigen ρ +0.252, pooled Spearman within side) — per-side identity
+signals, extra projection depth, antigen-row oversampling, a genuine structure-PCA
+inconsistency fix, and combinations of these — found nothing that survives scrutiny; see
+[ARCHITECTURES.md §H](ARCHITECTURES.md#h-the-antigenantibody-gap-an-11-variant-sweep). A
+separate, verified limitation in the reverse-mutation augmentation's structural input (it
+cannot reflect FoldX's mutant structures, since ProteinMPNN's encoder reads backbone
+geometry only and FoldX leaves the backbone unchanged across mutations of a complex) is
+documented in [ARCHITECTURES.md §I](ARCHITECTURES.md#i-a-verified-structure-input-limitation-for-the-reverse-mutation-augmentation).
+Neither changes the architecture or training objective above.
