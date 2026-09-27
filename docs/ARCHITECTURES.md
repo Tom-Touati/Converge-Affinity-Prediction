@@ -870,3 +870,21 @@ specifically, is not.
 A real fix would need the backbone itself to move between mutations — either FoldX run with
 explicit backbone flexibility/relaxation enabled, or a different mutant-structure predictor
 entirely (e.g. a full-atom, backbone-flexible model). Neither is in scope here.
+
+**Trained anyway, 3 seeds/fold, matched control (`--mutant-struct` on vs. off, otherwise
+identical config)** — the training comparison this project's own discipline calls for even when
+a null result is expected, not assumed from the backbone check alone:
+
+| run | ens | per-cx | spread | neg | wc s\|d | antigen ρ | antibody ρ |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `mutant_struct_off` (control) | +0.365 | +0.293 | 0.079 | 5 | 0.778 | +0.211 | +0.549 |
+| `mutant_struct_on` | +0.365 | +0.293 | 0.079 | 5 | 0.778 | +0.211 | +0.549 |
+
+**Every metric matches to the last reported digit.** Not "close" — identical, confirming the
+backbone-invariance check directly: the tiny residual difference between a FoldX-repaired
+structure and the original wild-type PDB (RepairPDB's one-time fixup, ~0.002 max per-feature
+difference, itself unrelated to any specific mutation) has no measurable effect on this
+architecture's predictions once trained. `--mutant-struct` is left in the codebase, off by
+default, as verified-inert groundwork for a future backbone-flexible structure source rather
+than reverted — the wiring, cache, and regression check are correct and reusable; only the
+current FoldX extraction's rigid backbone makes today's result a null one.
