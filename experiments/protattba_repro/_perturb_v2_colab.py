@@ -9,7 +9,7 @@ must not see the test complexes.
 
     python _perturb_v2_colab.py --exp v2_full --folds 0 1 2 3 4 --seeds 0
 """
-import argparse, json, os, pickle, time
+import argparse, json, os, pickle, re, time
 from pathlib import Path
 
 import joblib
@@ -91,6 +91,13 @@ CURRICULUM = 0
 #: sites_ab/sites_ag directly (non-empty means that side has a mutated residue this row), not
 #: a stored mut_side column, matching PerturbSiteToken's own _mut_side_idx convention.
 OVERSAMPLE_AG = 0.0
+#: Reverse-mutation augmentation swaps wt/mt, so the true mutant plays the "reference"
+#: structure role for a swapped row -- but struct_ab/struct_ag has always been read from the
+#: per-COMPLEX wild-type-only cache regardless of swap, an unmodelled per-complex constant
+#: blind to which mutation occurred. When True, a swapped row instead reads a per-ROW cache
+#: built from that row's FoldX BuildModel mutant structure (extract_mutant_struct.py). Set
+#: from --mutant-struct.
+MUTANT_STRUCT = False
 #: Which training rows the fold-local PCA is FITTED on. "all" uses everything in the
 #: training folds; "abag" fits on the antibody-antigen rows alone and then applies that
 #: basis to every row.
@@ -151,6 +158,11 @@ def blosum62():
         for j, b in enumerate(AA):
             out[i, j] = m[a, b]
     return out / 4.0
+
+
+def row_safe_name(row_id: str) -> str:
+    """Matches extract_mutant_struct.py's / foldx_repair_build_sharded.py's own sanitizing."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", row_id)
 
 
 class Cache:
@@ -223,6 +235,16 @@ class Cache:
             self._mpnn[key] = (z["h_ab"].astype(np.float32), z["h_ag"].astype(np.float32))
         return self._mpnn[key]
 
+    def mpnn_mutant(self, row_id):
+        """The per-ROW cache from that row's own FoldX mutant structure (see MUTANT_STRUCT)."""
+        if not hasattr(self, "_mpnn_mut"):
+            self._mpnn_mut = {}
+        if row_id not in self._mpnn_mut:
+            z = np.load(ROOT / "mpnn_per_residue_mutant" / f"{row_safe_name(row_id)}.npz",
+                       allow_pickle=False)
+            self._mpnn_mut[row_id] = (z["h_ab"].astype(np.float32), z["h_ag"].astype(np.float32))
+        return self._mpnn_mut[row_id]
+
     def crop(self, row_id):
         g = lambda f: self.crops[f"{row_id}|{f}"]
         return dict(ab_idx=g("ab_idx"), ag_idx=g("ag_idx"), ab_chain=g("ab_chain"),
@@ -258,6 +280,13 @@ def fold_pca(rows, fold, cache, dim, seed=0):
     honest default even for ESM -- antibody variable domains and antigens are different
     distributions, and one basis over both spends its components on telling them apart.
 
+    The structure side used to share ONE PCA fit across ab and ag (pooling both sides' tokens
+    into a single basis) -- an inconsistency with the sequence side's own reasoning above, and
+    one plausible contributor to the antigen/antibody performance gap: an antigen-only basis
+    spends all `dim` components resolving antigen structural diversity, instead of splitting
+    that budget with antibody paratopes it doesn't need to distinguish. Fit separately, same as
+    sequence.
+
     The cache file name carries the encoder, so switching encoders cannot silently reuse a
     basis fitted for the other one.
     """
@@ -270,13 +299,15 @@ def fold_pca(rows, fold, cache, dim, seed=0):
         w_st = cache.mpnn(r0.complex_key)[0].shape[1]
         print(f"  fold {fold}: NO PCA -- raw widths ab {w_ab}, ag {w_ag}, struct {w_st}",
               flush=True)
-        return Identity(w_ab), Identity(w_ag), Identity(w_st)
+        return Identity(w_ab), Identity(w_ag), Identity(w_st), Identity(w_st)
     PCA_DIR.mkdir(parents=True, exist_ok=True)
     # STRUCT_DIR in the key: a cached fit from ProteinMPNN's 128-d features is invalid for
     # ESM-IF1's 512-d ones, and sklearn's error for that (n_features mismatch) fires at
-    # transform time deep in training, not here where the mistake actually is
+    # transform time deep in training, not here where the mistake actually is.
+    # "_sepstruct" in the key: bumps the cache format so old pooled-struct-PCA fits (a 3-tuple)
+    # are never silently loaded and unpacked into this function's new 4-tuple.
     struct_tag = os.environ.get("STRUCT_DIR", "mpnn_per_residue")
-    f = PCA_DIR / f"fold{fold}_pca{dim}_{SEQ_AB}_{PCA_ROWS}_{struct_tag}.joblib"
+    f = PCA_DIR / f"fold{fold}_pca{dim}_{SEQ_AB}_{PCA_ROWS}_{struct_tag}_sepstruct.joblib"
     if f.exists():
         return joblib.load(f)
     from sklearn.decomposition import PCA
@@ -286,7 +317,7 @@ def fold_pca(rows, fold, cache, dim, seed=0):
         print(f"  fold {fold}: PCA fitted on the {len(tr)} AB/AG training rows only",
               flush=True)
     rng = np.random.default_rng(seed)
-    per_side, str_rows = {"ab": [], "ag": []}, []
+    per_side, str_rows = {"ab": [], "ag": []}, {"ab": [], "ag": []}
     for r in tr.itertuples():
         c = cache.crop(r.row_id)
         for side, col in (("ab", r.ab_wt), ("ag", r.ag_wt)):
@@ -297,10 +328,11 @@ def fold_pca(rows, fold, cache, dim, seed=0):
                 per_side[side].append(
                     t[take][rng.choice(len(take), min(len(take), 24), replace=False)])
         h_ab, h_ag = cache.mpnn(r.complex_key)
-        for h, idx in ((h_ab, c["ab_idx"]), (h_ag, c["ag_idx"])):
+        for side, h, idx in (("ab", h_ab, c["ab_idx"]), ("ag", h_ag, c["ag_idx"])):
             take = idx[idx < len(h)]
             if len(take):
-                str_rows.append(h[take][rng.choice(len(take), min(len(take), 24), replace=False)])
+                str_rows[side].append(
+                    h[take][rng.choice(len(take), min(len(take), 24), replace=False)])
 
     fits = {}
     for side in ("ab", "ag"):
@@ -308,11 +340,13 @@ def fold_pca(rows, fold, cache, dim, seed=0):
         fits[side] = PCA(n_components=min(dim, X.shape[1]), random_state=seed).fit(X)
         print(f"  fold {fold}: PCA seq[{side}] {X.shape} -> {fits[side].n_components_} "
               f"({fits[side].explained_variance_ratio_.sum():.0%})", flush=True)
-    Xt = np.concatenate(str_rows)
-    p_str = PCA(n_components=min(dim, Xt.shape[1]), random_state=seed).fit(Xt)
-    print(f"  fold {fold}: PCA struct {Xt.shape} -> {p_str.n_components_} "
-          f"({p_str.explained_variance_ratio_.sum():.0%})", flush=True)
-    out = (fits["ab"], fits["ag"], p_str)
+    str_fits = {}
+    for side in ("ab", "ag"):
+        Xt = np.concatenate(str_rows[side])
+        str_fits[side] = PCA(n_components=min(dim, Xt.shape[1]), random_state=seed).fit(Xt)
+        print(f"  fold {fold}: PCA struct[{side}] {Xt.shape} -> {str_fits[side].n_components_} "
+              f"({str_fits[side].explained_variance_ratio_.sum():.0%})", flush=True)
+    out = (fits["ab"], fits["ag"], str_fits["ab"], str_fits["ag"])
     joblib.dump(out, f)
     return out
 
@@ -321,7 +355,7 @@ class DS(Dataset):
     def __init__(self, frame, pcas, cache, cfg, augment, seed, memo=None, chem=None,
                  chem_rev=None):
         self.f = frame.reset_index(drop=True)
-        self.p_ab, self.p_ag, self.p_str = pcas
+        self.p_ab, self.p_ag, self.p_str_ab, self.p_str_ag = pcas
         self.c, self.cfg = cache, cfg
         self.augment, self.rng = augment, np.random.default_rng(seed)
         self.bl = blosum62()
@@ -358,11 +392,19 @@ class DS(Dataset):
         s_ag_wt = self.seq_at(ag_wt, c["ag_idx"], "ag")
         s_ag_mt = self.seq_at(ag_mt, c["ag_idx"], "ag")
 
-        h_ab, h_ag = self.c.mpnn(r.complex_key)
-        key = (r.complex_key, "str")
+        # MUTANT_STRUCT: a swapped (reverse-augmented) row's reference structure should be the
+        # true mutant's, not the wild-type complex's -- reusing the wild-type complex for every
+        # mutation of it is a per-complex constant blind to which mutation occurred. Keyed by
+        # row_id (not complex_key): unlike the wild-type cache, this genuinely differs per row.
+        if swap and MUTANT_STRUCT:
+            h_ab, h_ag = self.c.mpnn_mutant(r.row_id)
+            key = (r.row_id, "str_mut")
+        else:
+            h_ab, h_ag = self.c.mpnn(r.complex_key)
+            key = (r.complex_key, "str")
         if key not in self.memo:
-            self.memo[key] = (self.p_str.transform(h_ab).astype(np.float32),
-                              self.p_str.transform(h_ag).astype(np.float32))
+            self.memo[key] = (self.p_str_ab.transform(h_ab).astype(np.float32),
+                              self.p_str_ag.transform(h_ag).astype(np.float32))
         p_ab, p_ag = self.memo[key]
         t_ab = p_ab[np.clip(c["ab_idx"], 0, len(p_ab) - 1)]
         t_ag = p_ag[np.clip(c["ag_idx"], 0, len(p_ag) - 1)]
@@ -1112,6 +1154,10 @@ def main():
     ap.add_argument("--oversample-ag", type=float, default=0.0,
                     help="relative sampling weight for antigen-side training rows against "
                          "antibody-side ones; 0 (default) samples uniformly")
+    ap.add_argument("--mutant-struct", action="store_true",
+                    help="reverse-augmented rows read structure from the FoldX mutant "
+                         "structure (mpnn_per_residue_mutant/) instead of the wild-type "
+                         "per-complex cache")
     ap.add_argument("--chem-scale", default="fold", choices=["fold", "cluster"],
                     help="standardise the chem block globally or within homology cluster")
     ap.add_argument("--clusters", default=None,
@@ -1207,7 +1253,7 @@ def main():
         print(f"clipped |ddG| to {a.clip}: {n} of {len(rows)} rows "
               f"({100 * n / len(rows):.1f}%)", flush=True)
     global LR, WD, PATIENCE, GRAD_CLIP, CHEM_SCALE, CLUSTER_OF, CURRICULUM, PCA_ROWS
-    global OVERSAMPLE_AG
+    global OVERSAMPLE_AG, MUTANT_STRUCT
     global RANK_WEIGHT, RANK_MARGIN, CORR_WEIGHT, CORR_MIN_GROUP, RANK_METHOD
     RANK_WEIGHT = a.rank_weight
     RANK_MARGIN = a.rank_margin
@@ -1231,6 +1277,7 @@ def main():
         print(f"  clusters: {CLUSTER_OF.nunique()} over {len(CLUSTER_OF)} rows", flush=True)
     CURRICULUM = a.curriculum
     OVERSAMPLE_AG = a.oversample_ag
+    MUTANT_STRUCT = a.mutant_struct
     PCA_ROWS = a.pca_rows
     print(f"  optim: lr {LR}, weight_decay {WD}, patience {PATIENCE}, "
           f"grad_clip {GRAD_CLIP}", flush=True)
